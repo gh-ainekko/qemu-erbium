@@ -1,0 +1,33 @@
+From 1a63a762d5985af178e9e1763ddbf98655810ecc Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Tue, 29 Sep 2026 23:02:44 +0000
+Subject: [PATCH 1/4] sw-sysemu: fix -Werror=unused-result build break in
+ ShaktiUart::drain_tx_fifo
+
+glibc declares write() warn_unused_result; a (void) cast does not silence
+the warning with GCC 13, so assign the result instead.
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ sw-sysemu/devices/shakti_uart.h | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/sw-sysemu/devices/shakti_uart.h b/sw-sysemu/devices/shakti_uart.h
+index 724be4e..87deb2a 100644
+--- a/sw-sysemu/devices/shakti_uart.h
++++ b/sw-sysemu/devices/shakti_uart.h
+@@ -249,7 +249,10 @@ private:
+         uint8_t byte = tx_fifo[tx_fifo_head];
+         tx_fifo_head = (tx_fifo_head + 1) % FIFO_DEPTH;
+         --tx_fifo_count;
+-        (void)::write(tx_fd, &byte, 1);
++        // glibc marks write() warn_unused_result and a (void) cast does not
++        // silence it under -Werror; a UART TX drop is not an error we care about.
++        ssize_t rv = ::write(tx_fd, &byte, 1);
++        (void) rv;
+     }
+ 
+     bool rx_fifo_push(uint8_t value) {
+-- 
+2.43.0
+

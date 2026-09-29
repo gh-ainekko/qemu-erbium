@@ -1,0 +1,503 @@
+From 9699a2f151cc51754b1f6862e77e4ae3e1393690 Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Tue, 29 Sep 2026 23:25:01 +0000
+Subject: [PATCH 4/5] tests/qtest: erbium-xspi-test via Versal OSPI
+ (STIG/DAC/indirect); ospi: accumulate full frames for indirect writes
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ hw/ssi/xlnx-versal-ospi.c      |  14 ++
+ tests/qtest/erbium-xspi-test.c | 443 +++++++++++++++++++++++++++++++++
+ tests/qtest/meson.build        |   1 +
+ 3 files changed, 458 insertions(+)
+ create mode 100644 tests/qtest/erbium-xspi-test.c
+
+diff --git a/hw/ssi/xlnx-versal-ospi.c b/hw/ssi/xlnx-versal-ospi.c
+index 9b59107..8a551db 100644
+--- a/hw/ssi/xlnx-versal-ospi.c
++++ b/hw/ssi/xlnx-versal-ospi.c
+@@ -1049,6 +1049,20 @@ static void ospi_do_indirect_write(XlnxVersalOspi *s)
+     /* Write out tx_fifo in maximum page sz chunks */
+     while (!ospi_ind_op_completed(op) && fifo8_num_used(&s->tx_sram) > 0) {
+         next_b = ind_op_next_byte(op);
++
++        /*
++         * Real hardware keeps CS# asserted and stalls SCLK until the SRAM
++         * delivers more data; the guest typically feeds it a word at a
++         * time.  With faithful framing, wait until a whole page (or the
++         * rest of the op) is available so the peripheral sees one frame.
++         */
++        if (s->faithful_frames) {
++            uint32_t want = MIN(op->num_bytes - op->done_bytes,
++                                pagesz - (next_b & ~page_mask));
++            if (fifo8_num_used(&s->tx_sram) < want) {
++                break;
++            }
++        }
+         end_b = next_b +  MIN(fifo8_num_used(&s->tx_sram), pagesz);
+ 
+         /* Dont cross page boundary */
+diff --git a/tests/qtest/erbium-xspi-test.c b/tests/qtest/erbium-xspi-test.c
+new file mode 100644
+index 0000000..728916a
+--- /dev/null
++++ b/tests/qtest/erbium-xspi-test.c
+@@ -0,0 +1,443 @@
++/*
++ * QTest for the Erbium xSPI target model, driven through the Versal OSPI
++ * controller (STIG for command/register ops, DAC/indirect for memory).
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bswap.h"
++#include "qemu/bitops.h"
++#include "libqtest-single.h"
++
++#define OSPI_BASE       0xf1010000ULL
++#define OSPI_DAC        0xc0000000ULL
++#define SLCR_MUX        0xf1060504ULL   /* OSPI_QSPI_IOU_AXI_MUX_SEL */
++
++#define R_CONFIG        0x00
++#define R_RD_CONFIG     0x04
++#define R_WR_CONFIG     0x08
++#define R_DEV_SIZE      0x14
++#define R_IND_TRIGGER   0x1c
++#define R_IND_RD_CTRL   0x60
++#define R_IND_RD_START  0x68
++#define R_IND_RD_NBYTES 0x6c
++#define R_IND_WR_CTRL   0x70
++#define R_IND_WR_START  0x78
++#define R_IND_WR_NBYTES 0x7c
++#define R_IND_RANGE     0x80
++#define R_STIG_CTRL     0x90
++#define R_STIG_ADDR     0x94
++#define R_STIG_RD_LO    0xa0
++#define R_STIG_RD_HI    0xa4
++#define R_STIG_WR_LO    0xa8
++#define R_STIG_WR_HI    0xac
++#define R_OPCODE_EXT_LO 0xe0
++
++/* CONFIG_REG bits */
++#define CFG_ENB_SPI         BIT(0)
++#define CFG_ENB_DAC         BIT(7)
++#define CFG_CS0             (0xe << 10)
++#define CFG_DTR             BIT(24)
++#define CFG_DUAL_OPCODE     BIT(30)
++
++/* Erbium */
++#define ERB_OP_WRITE_MEM    0x02
++#define ERB_OP_READ_MEM     0x0B
++#define ERB_OP_SET_RATE     0x52
++#define ERB_OP_READ_SFDP    0x5A
++#define ERB_OP_READ_REG     0x65
++#define ERB_OP_WRITE_REG    0x71
++#define ERB_OP_RESET        0x99
++#define SCCR_ID0            0x00
++#define SCCR_CFG            0x10
++#define SCCR_STATUS         0x18
++#define SCCR_RATES          0x28
++#define SCCR_INT            0x30
++#define CFG_RESET_VAL       0x318A
++#define LATENCY_CYCLES      16      /* 8 + InitialLatency(8) */
++
++#define XSPI_MAILBOX0       0x40000068
++#define XSPI_SCCR_MEM       0x4000F000
++
++typedef struct {
++    QTestState *qts;
++    char *mram_path;
++    unsigned lanes;     /* 1 or 8 */
++    bool dtr;
++} ErbTest;
++
++static uint32_t ospi_readl(ErbTest *t, unsigned off)
++{
++    return qtest_readl(t->qts, OSPI_BASE + off);
++}
++
++static void ospi_writel(ErbTest *t, unsigned off, uint32_t v)
++{
++    qtest_writel(t->qts, OSPI_BASE + off, v);
++}
++
++static unsigned xfer_type(ErbTest *t)
++{
++    return t->lanes == 8 ? 3 : 0;
++}
++
++/* Program the controller for the current lane/DTR mode */
++static void ospi_setup(ErbTest *t)
++{
++    uint32_t cfg = CFG_ENB_SPI | CFG_ENB_DAC | CFG_CS0;
++    unsigned xt = xfer_type(t);
++
++    if (t->lanes == 8) {
++        cfg |= CFG_DUAL_OPCODE;
++    }
++    if (t->dtr) {
++        cfg |= CFG_DTR;
++    }
++    ospi_writel(t, R_CONFIG, cfg);
++    /* 4 address bytes, 256-byte page, 64K subsector */
++    ospi_writel(t, R_DEV_SIZE, 3 | (256 << 4) | (16 << 16));
++    /* read: 0Bh, latency, lane types */
++    ospi_writel(t, R_RD_CONFIG, ERB_OP_READ_MEM | (xt << 8) | (xt << 12) |
++                (xt << 16) | (LATENCY_CYCLES << 24) | (t->dtr ? BIT(10) : 0));
++    /* write: 02h, WEL_DIS, lane types */
++    ospi_writel(t, R_WR_CONFIG, ERB_OP_WRITE_MEM | BIT(8) | (xt << 12) |
++                (xt << 16));
++    /* opcode extensions = repeat of opcode (Erbium ignores the value) */
++    ospi_writel(t, R_OPCODE_EXT_LO, (ERB_OP_READ_MEM << 24) |
++                (ERB_OP_WRITE_MEM << 16));
++    /* indirect trigger window at DAC base, 2^4 = 16 bytes range */
++    ospi_writel(t, R_IND_TRIGGER, OSPI_DAC);
++    ospi_writel(t, R_IND_RANGE, 4);
++    /* enable the OSPI->DAC mux */
++    qtest_writel(t->qts, SLCR_MUX, 0x3);
++}
++
++/*
++ * STIG: opcode [+ext] [+addr] [+dummy] then up to 8 bytes read or write.
++ */
++static void stig(ErbTest *t, uint8_t op, int addr_bytes, uint32_t addr,
++                 unsigned dummy_cycles, const uint8_t *wr, unsigned wr_len,
++                 uint8_t *rd, unsigned rd_len)
++{
++    uint32_t ctrl = (uint32_t)op << 24;
++
++    g_assert(wr_len <= 8 && rd_len <= 8);
++
++    if (t->lanes == 8) {
++        uint32_t ext = ospi_readl(t, R_OPCODE_EXT_LO) & ~0xffu;
++        ospi_writel(t, R_OPCODE_EXT_LO, ext | op);
++    }
++    if (addr_bytes) {
++        ctrl |= BIT(19) | ((addr_bytes - 1) << 16);
++        ospi_writel(t, R_STIG_ADDR, addr);
++    }
++    ctrl |= (dummy_cycles & 0x1f) << 7;
++    if (wr_len) {
++        uint64_t v = 0;
++        for (unsigned i = 0; i < wr_len; i++) {
++            v |= (uint64_t)wr[i] << (8 * i);
++        }
++        ctrl |= BIT(15) | ((wr_len - 1) << 12);
++        ospi_writel(t, R_STIG_WR_LO, v);
++        ospi_writel(t, R_STIG_WR_HI, v >> 32);
++    }
++    if (rd_len) {
++        ctrl |= BIT(23) | ((rd_len - 1) << 20);
++    }
++    ospi_writel(t, R_STIG_CTRL, ctrl | BIT(0));
++    if (rd_len) {
++        uint64_t v = ospi_readl(t, R_STIG_RD_LO) |
++                     ((uint64_t)ospi_readl(t, R_STIG_RD_HI) << 32);
++        for (unsigned i = 0; i < rd_len; i++) {
++            rd[i] = v >> (8 * i);
++        }
++    }
++}
++
++static int reg_addr_bytes(ErbTest *t)
++{
++    return t->lanes == 1 ? 3 : 4;
++}
++
++static uint32_t sccr_read(ErbTest *t, unsigned off)
++{
++    uint8_t b[4];
++    stig(t, ERB_OP_READ_REG, reg_addr_bytes(t), off, LATENCY_CYCLES,
++         NULL, 0, b, 4);
++    return ldl_le_p(b);
++}
++
++static void sccr_write(ErbTest *t, unsigned off, uint32_t val)
++{
++    uint8_t b[4];
++    stl_le_p(b, val);
++    stig(t, ERB_OP_WRITE_REG, reg_addr_bytes(t), off, 0, b, 4, NULL, 0);
++}
++
++static void mem_write8(ErbTest *t, uint32_t addr, uint64_t val)
++{
++    uint8_t b[8];
++    stq_le_p(b, val);
++    stig(t, ERB_OP_WRITE_MEM, 4, addr, 0, b, 8, NULL, 0);
++}
++
++static uint64_t mem_read8(ErbTest *t, uint32_t addr)
++{
++    uint8_t b[8];
++    stig(t, ERB_OP_READ_MEM, 4, addr, LATENCY_CYCLES, NULL, 0, b, 8);
++    return ldq_le_p(b);
++}
++
++/* The model only routes the trigger window to INDAC while DAC is off */
++static void set_dac(ErbTest *t, bool on)
++{
++    uint32_t cfg = ospi_readl(t, R_CONFIG) & ~CFG_ENB_DAC;
++    ospi_writel(t, R_CONFIG, cfg | (on ? CFG_ENB_DAC : 0));
++}
++
++/* Indirect read of n bytes into buf (n <= 16 per trigger window read) */
++static void ind_read(ErbTest *t, uint32_t addr, uint8_t *buf, unsigned n)
++{
++    set_dac(t, false);
++    ospi_writel(t, R_IND_RD_START, addr);
++    ospi_writel(t, R_IND_RD_NBYTES, n);
++    ospi_writel(t, R_IND_RD_CTRL, BIT(0));
++    for (unsigned i = 0; i < n; i += 4) {
++        uint32_t v = qtest_readl(t->qts, OSPI_DAC + (i & 0xc));
++        memcpy(buf + i, &v, MIN(4u, n - i));
++    }
++    /* ack completion */
++    ospi_writel(t, R_IND_RD_CTRL, BIT(5));
++    set_dac(t, true);
++}
++
++static void ind_write(ErbTest *t, uint32_t addr, const uint8_t *buf, unsigned n)
++{
++    set_dac(t, false);
++    ospi_writel(t, R_IND_WR_START, addr);
++    ospi_writel(t, R_IND_WR_NBYTES, n);
++    ospi_writel(t, R_IND_WR_CTRL, BIT(0));
++    for (unsigned i = 0; i < n; i += 4) {
++        uint32_t v = 0;
++        memcpy(&v, buf + i, MIN(4u, n - i));
++        qtest_writel(t->qts, OSPI_DAC + (i & 0xc), v);
++    }
++    ospi_writel(t, R_IND_WR_CTRL, BIT(5));
++    set_dac(t, true);
++}
++
++/* ------------------------------------------------------------------ */
++
++static void test_reset_state(const void *data)
++{
++    ErbTest *t = (ErbTest *)data;
++
++    ospi_setup(t);
++    g_assert_cmphex(sccr_read(t, SCCR_ID0), ==, 0x2);
++    g_assert_cmphex(sccr_read(t, SCCR_CFG), ==, CFG_RESET_VAL);
++    g_assert_cmphex(sccr_read(t, SCCR_RATES), ==, 0);       /* S1/S1/S1 */
++    g_assert_cmphex(sccr_read(t, SCCR_STATUS), ==, 0);
++    g_assert_cmphex(sccr_read(t, SCCR_INT), ==, 0);
++    /* unpopulated offset reads 0; addr[5:0] decode */
++    g_assert_cmphex(sccr_read(t, 0x04), ==, 0);
++    g_assert_cmphex(sccr_read(t, 0x40 | SCCR_CFG), ==, CFG_RESET_VAL);
++}
++
++static void test_sfdp(const void *data)
++{
++    ErbTest *t = (ErbTest *)data;
++    uint8_t b[8];
++
++    ospi_setup(t);
++    stig(t, ERB_OP_READ_SFDP, reg_addr_bytes(t), 0, LATENCY_CYCLES,
++         NULL, 0, b, 8);
++    /* RTL quirk: each DWORD followed by 4 zero bytes */
++    g_assert_cmpmem(b, 8, "SFDP\0\0\0\0", 8);
++    stig(t, ERB_OP_READ_SFDP, reg_addr_bytes(t), 4, LATENCY_CYCLES,
++         NULL, 0, b, 8);
++    g_assert_cmphex(b[0], ==, 0x0c);     /* minor */
++    g_assert_cmphex(b[1], ==, 0x01);     /* major */
++    g_assert_cmphex(b[3], ==, 0xfa);     /* access protocol */
++    /* BFPT pointer at 0x0c */
++    stig(t, ERB_OP_READ_SFDP, reg_addr_bytes(t), 0x0c, LATENCY_CYCLES,
++         NULL, 0, b, 4);
++    g_assert_cmphex(ldl_le_p(b) & 0xffffff, ==, 0x400);
++    /* unaligned address reads 0 */
++    stig(t, ERB_OP_READ_SFDP, reg_addr_bytes(t), 1, LATENCY_CYCLES,
++         NULL, 0, b, 4);
++    g_assert_cmphex(ldl_le_p(b), ==, 0);
++}
++
++static void test_register_write(const void *data)
++{
++    ErbTest *t = (ErbTest *)data;
++
++    ospi_setup(t);
++    sccr_write(t, SCCR_CFG, CFG_RESET_VAL | BIT(16));      /* BurstEnable */
++    g_assert_cmphex(sccr_read(t, SCCR_CFG), ==, CFG_RESET_VAL | BIT(16));
++    /* read-only fields stick (keep InitialLatency=8 so our dummies match) */
++    sccr_write(t, SCCR_CFG, 0x80);
++    g_assert_cmphex(sccr_read(t, SCCR_CFG), ==, 0x3188);
++    sccr_write(t, SCCR_CFG, CFG_RESET_VAL);
++    /* status is read-only */
++    sccr_write(t, SCCR_STATUS, 1);
++    g_assert_cmphex(sccr_read(t, SCCR_STATUS), ==, 0);
++}
++
++static void test_mram_rw(const void *data)
++{
++    ErbTest *t = (ErbTest *)data;
++    uint8_t buf[16], exp[16];
++    int fd;
++
++    ospi_setup(t);
++    mem_write8(t, 0x1000, 0x1122334455667788ull);
++    g_assert_cmphex(mem_read8(t, 0x1000), ==, 0x1122334455667788ull);
++
++    /* DAC path: 8-byte access = one command */
++    qtest_writeq(t->qts, OSPI_DAC + 0x2000, 0xcafebabe12345678ull);
++    g_assert_cmphex(qtest_readq(t->qts, OSPI_DAC + 0x2000), ==,
++                    0xcafebabe12345678ull);
++    g_assert_cmphex(mem_read8(t, 0x2000), ==, 0xcafebabe12345678ull);
++
++    /* the shared file sees it */
++    fd = open(t->mram_path, O_RDONLY);
++    g_assert(fd >= 0);
++    g_assert_cmpint(pread(fd, buf, 8, 0x2000), ==, 8);
++    close(fd);
++    g_assert_cmphex(ldq_le_p(buf), ==, 0xcafebabe12345678ull);
++
++    /* 16-byte indirect write; default burst limits reads to 8 bytes */
++    for (int i = 0; i < 16; i++) {
++        exp[i] = 0xa0 + i;
++    }
++    ind_write(t, 0x3000, exp, 16);
++    g_assert_cmphex(mem_read8(t, 0x3000), ==, ldq_le_p(exp));
++    g_assert_cmphex(mem_read8(t, 0x3008), ==, ldq_le_p(exp + 8));
++
++    g_assert_cmphex(sccr_read(t, SCCR_INT), ==, 0);
++    ind_read(t, 0x3000, buf, 16);
++    g_assert_cmpmem(buf, 8, exp, 8);
++    g_assert_cmphex(ldq_le_p(buf + 8), ==, 0);      /* past the AXI burst */
++    g_assert_cmphex(sccr_read(t, SCCR_INT), ==, BIT(2)); /* read_underflow */
++    g_assert_cmphex(sccr_read(t, SCCR_INT), ==, 0);      /* rclr */
++
++    /* enable 64-byte bursts */
++    sccr_write(t, SCCR_CFG, (CFG_RESET_VAL & ~3) | 1 | BIT(16));
++    ind_read(t, 0x3000, buf, 16);
++    g_assert_cmpmem(buf, 16, exp, 16);
++    g_assert_cmphex(sccr_read(t, SCCR_INT), ==, 0);
++    sccr_write(t, SCCR_CFG, CFG_RESET_VAL);
++}
++
++static void test_write_contiguous(const void *data)
++{
++    ErbTest *t = (ErbTest *)data;
++    uint8_t buf[16];
++
++    ospi_setup(t);
++    /*
++     * The Erbium write address only increments within a 4 KiB page; the
++     * Versal controller model cannot frame a >4 KiB page (12-bit field),
++     * so just check a single 16-byte frame crossing a 256-byte boundary
++     * with a 2 KiB controller page is written contiguously.
++     */
++    ospi_writel(t, R_DEV_SIZE, 3 | (2048 << 4) | (16 << 16));
++    for (int i = 0; i < 16; i++) {
++        buf[i] = 0x50 + i;
++    }
++    ind_write(t, 0x47f8, buf, 16);
++    g_assert_cmphex(mem_read8(t, 0x47f8), ==, ldq_le_p(buf));
++    g_assert_cmphex(mem_read8(t, 0x4800), ==, ldq_le_p(buf + 8));
++    ospi_writel(t, R_DEV_SIZE, 3 | (256 << 4) | (16 << 16));
++}
++
++static void test_control_plane(const void *data)
++{
++    ErbTest *t = (ErbTest *)data;
++
++    ospi_setup(t);
++    /* system_registers.Mailbox0 through the built-in stub */
++    mem_write8(t, XSPI_MAILBOX0, 0x00000000deadbeefull);
++    g_assert_cmphex(mem_read8(t, XSPI_MAILBOX0), ==, 0x00000000deadbeefull);
++    g_assert_cmphex(sccr_read(t, SCCR_INT), ==, 0);
++
++    /* SCCR is also reachable as memory at 0x4000F000 */
++    g_assert_cmphex(mem_read8(t, XSPI_SCCR_MEM + SCCR_CFG), ==, CFG_RESET_VAL);
++
++    /* unmapped -> DECERR latched in interrupt_status.axi_resp */
++    (void)mem_read8(t, 0x40005000);
++    g_assert_cmphex(sccr_read(t, SCCR_INT) & 3, ==, 3);
++    g_assert_cmphex(sccr_read(t, SCCR_INT), ==, 0);
++}
++
++static void test_set_rate_octal_dtr(const void *data)
++{
++    ErbTest *t = (ErbTest *)data;
++    uint8_t rates[3] = { 7, 7, 7 };
++
++    ospi_setup(t);
++    mem_write8(t, 0x6000, 0x0123456789abcdefull);
++
++    /* 52h: rate bytes travel as "address" bytes */
++    stig(t, ERB_OP_SET_RATE, 3, (rates[0] << 16) | (rates[1] << 8) | rates[2],
++         0, NULL, 0, NULL, 0);
++
++    /* now speak 8D-8D-8D */
++    t->lanes = 8;
++    t->dtr = true;
++    ospi_setup(t);
++    g_assert_cmphex(sccr_read(t, SCCR_RATES), ==, 0x070707);
++    g_assert_cmphex(mem_read8(t, 0x6000), ==, 0x0123456789abcdefull);
++    mem_write8(t, 0x6008, 0xfedcba9876543210ull);
++    g_assert_cmphex(qtest_readq(t->qts, OSPI_DAC + 0x6008), ==,
++                    0xfedcba9876543210ull);
++
++    /* 99h resets the chip: back to strap default (S1) */
++    sccr_write(t, SCCR_CFG, CFG_RESET_VAL | BIT(16));
++    stig(t, ERB_OP_RESET, 0, 0, 0, NULL, 0, NULL, 0);
++    t->lanes = 1;
++    t->dtr = false;
++    ospi_setup(t);
++    g_assert_cmphex(sccr_read(t, SCCR_RATES), ==, 0);
++    g_assert_cmphex(sccr_read(t, SCCR_CFG), ==, CFG_RESET_VAL);
++    /* MRAM is non-volatile */
++    g_assert_cmphex(mem_read8(t, 0x6000), ==, 0x0123456789abcdefull);
++}
++
++int main(int argc, char **argv)
++{
++    ErbTest t = { .lanes = 1 };
++    int fd, ret;
++
++    g_test_init(&argc, &argv, NULL);
++
++    fd = g_file_open_tmp("erbium-mram-XXXXXX", &t.mram_path, NULL);
++    g_assert(fd >= 0);
++    g_assert_cmpint(ftruncate(fd, 16 * 1024 * 1024), ==, 0);
++    close(fd);
++
++    t.qts = qtest_initf("-machine xlnx-versal-virt,ospi-flash=erbium-xspi "
++                        "-object memory-backend-file,id=mram,size=16M,"
++                        "mem-path=%s,share=on "
++                        "-global erbium-xspi.memdev=mram "
++                        "-global driver=xlnx.versal-ospi,property=faithful-frames,value=on "
++                        "-global driver=xlnx.versal-ospi,property=max-tap-dly-suspend,value=off",
++                        t.mram_path);
++
++    qtest_add_data_func("/erbium-xspi/reset-state", &t, test_reset_state);
++    qtest_add_data_func("/erbium-xspi/sfdp", &t, test_sfdp);
++    qtest_add_data_func("/erbium-xspi/register-write", &t, test_register_write);
++    qtest_add_data_func("/erbium-xspi/mram-rw", &t, test_mram_rw);
++    qtest_add_data_func("/erbium-xspi/write-contiguous", &t, test_write_contiguous);
++    qtest_add_data_func("/erbium-xspi/control-plane", &t, test_control_plane);
++    qtest_add_data_func("/erbium-xspi/set-rate-octal-dtr", &t,
++                        test_set_rate_octal_dtr);
++
++    ret = g_test_run();
++    qtest_quit(t.qts);
++    unlink(t.mram_path);
++    g_free(t.mram_path);
++    return ret;
++}
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index 5d52b6d..bb14427 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -260,6 +260,7 @@ qtests_aarch64 = \
+     ['tpm-tis-device-test', 'tpm-tis-device-swtpm-test'] : []) +                                         \
+   (config_all_devices.has_key('CONFIG_XLNX_ZYNQMP_ARM') ? ['xlnx-can-test', 'fuzz-xlnx-dp-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XLNX_VERSAL') ? ['xlnx-canfd-test', 'xlnx-versal-trng-test'] : []) + \
++  (config_all_devices.has_key('CONFIG_ERBIUM_XSPI') and config_all_devices.has_key('CONFIG_XLNX_VERSAL') ? ['erbium-xspi-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_RASPI') ? ['bcm2835-dma-test', 'bcm2835-i2c-test'] : []) +  \
+   (config_all_accel.has_key('CONFIG_TCG') and                                            \
+    config_all_devices.has_key('CONFIG_TPM_TIS_I2C') ? ['tpm-tis-i2c-test'] : []) + \
+-- 
+2.43.0
+

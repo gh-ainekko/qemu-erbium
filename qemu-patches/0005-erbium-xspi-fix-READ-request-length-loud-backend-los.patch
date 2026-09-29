@@ -1,0 +1,193 @@
+From bba9b0592b30d84daf41dc226acfaa07e4278d50 Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Tue, 29 Sep 2026 23:26:37 +0000
+Subject: [PATCH 5/5] erbium-xspi: fix READ request length; loud backend loss;
+ qtest: optional end-to-end backend-mailbox test
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ hw/ssi/erbium-xspi.c           |   6 +-
+ tests/qtest/erbium-xspi-test.c | 107 ++++++++++++++++++++++++++++++---
+ 2 files changed, 100 insertions(+), 13 deletions(-)
+
+diff --git a/hw/ssi/erbium-xspi.c b/hw/ssi/erbium-xspi.c
+index 457dfa5..f61db6f 100644
+--- a/hw/ssi/erbium-xspi.c
++++ b/hw/ssi/erbium-xspi.c
+@@ -112,7 +112,7 @@ static int erbium_backend_xfer(ErbiumXSPI *s, uint16_t op, uint64_t addr,
+         .version = cpu_to_le16(ERB_MSG_VERSION),
+         .op = cpu_to_le16(op),
+         .status = 0,
+-        .len = cpu_to_le32(is_write ? len : 0),
++        .len = cpu_to_le32(len),    /* WRITE: payload size, READ: size */
+         .addr = cpu_to_le64(addr),
+     };
+     ErbMsgHdr rsp;
+@@ -159,8 +159,8 @@ static int erbium_backend_xfer(ErbiumXSPI *s, uint16_t op, uint64_t addr,
+     return status;
+ 
+ lost:
+-    qemu_log_mask(LOG_GUEST_ERROR,
+-                  "erbium-xspi: backend connection lost (op %u)\n", op);
++    error_report("erbium-xspi: backend connection lost (op %u); "
++                 "falling back to built-in stub", op);
+     s->backend_connected = false;
+     return ERB_ST_DECERR;
+ }
+diff --git a/tests/qtest/erbium-xspi-test.c b/tests/qtest/erbium-xspi-test.c
+index 728916a..6883411 100644
+--- a/tests/qtest/erbium-xspi-test.c
++++ b/tests/qtest/erbium-xspi-test.c
+@@ -58,6 +58,7 @@
+ #define LATENCY_CYCLES      16      /* 8 + InitialLatency(8) */
+ 
+ #define XSPI_MAILBOX0       0x40000068
++#define XSPI_SRAM           0x4000C000
+ #define XSPI_SCCR_MEM       0x4000F000
+ 
+ typedef struct {
+@@ -358,9 +359,9 @@ static void test_control_plane(const void *data)
+     ErbTest *t = (ErbTest *)data;
+ 
+     ospi_setup(t);
+-    /* system_registers.Mailbox0 through the built-in stub */
+-    mem_write8(t, XSPI_MAILBOX0, 0x00000000deadbeefull);
+-    g_assert_cmphex(mem_read8(t, XSPI_MAILBOX0), ==, 0x00000000deadbeefull);
++    /* SRAM through the NoC path (built-in stub or erbium_emu backend) */
++    mem_write8(t, XSPI_SRAM + 0x100, 0x0000beefdeadf00dull);
++    g_assert_cmphex(mem_read8(t, XSPI_SRAM + 0x100), ==, 0x0000beefdeadf00dull);
+     g_assert_cmphex(sccr_read(t, SCCR_INT), ==, 0);
+ 
+     /* SCCR is also reachable as memory at 0x4000F000 */
+@@ -406,25 +407,104 @@ static void test_set_rate_octal_dtr(const void *data)
+     g_assert_cmphex(mem_read8(t, 0x6000), ==, 0x0123456789abcdefull);
+ }
+ 
++/*
++ * End-to-end with erbium_emu (sw-sysemu) as the CPU-subsystem backend:
++ * set ERBIUM_BACKEND_SOCKET to the path of a running
++ *   erbium_emu -minions 0x1 -single_thread -elf mailbox_worker.elf \
++ *              --api-socket SOCK --mram-file MRAM
++ * and ERBIUM_MRAM_FILE to the same MRAM file.  The job is submitted and
++ * polled exclusively through xSPI commands, as a real host would.
++ */
++#define XSPI_MAILBOX1       0x40000070
++
++static uint32_t crc32_ref(const uint8_t *p, unsigned n)
++{
++    uint32_t crc = 0xFFFFFFFFu;
++    for (unsigned i = 0; i < n; ++i) {
++        crc ^= p[i];
++        for (int k = 0; k < 8; ++k) {
++            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
++        }
++    }
++    return ~crc;
++}
++
++static uint32_t mailbox1_wait(ErbTest *t, uint32_t not_value)
++{
++    for (int i = 0; i < 20000; i++) {
++        uint32_t v = mem_read8(t, XSPI_MAILBOX1);
++        if (v != not_value) {
++            return v;
++        }
++        g_usleep(1000);
++    }
++    g_assert_not_reached();
++}
++
++static void test_backend_mailbox(const void *data)
++{
++    ErbTest *t = (ErbTest *)data;
++    uint8_t pattern[4096];
++    uint32_t v;
++
++    ospi_setup(t);
++    /* worker announces itself */
++    v = mem_read8(t, XSPI_MAILBOX1);
++    g_assert(v == 0xC0FFEE00u || v == 1 || (v >> 24) == 0x7c || v != 0);
++
++    /* fill 4 KiB at MRAM+0x8000 with a known pattern via xSPI */
++    for (unsigned i = 0; i < sizeof(pattern); i++) {
++        pattern[i] = (uint8_t)(i * 7 + 3);
++    }
++    for (unsigned i = 0; i < sizeof(pattern); i += 8) {
++        qtest_writeq(t->qts, OSPI_DAC + 0x8000 + i, ldq_le_p(pattern + i));
++    }
++
++    /* opcode 1 = CRC32 of 4 KiB at offset 0x8000 (units of 256) */
++    mem_write8(t, XSPI_MAILBOX1, 0);
++    mem_write8(t, XSPI_MAILBOX0, (1u << 24) | (0x8000 / 256));
++    v = mailbox1_wait(t, 0);
++    g_assert_cmphex(v, ==, crc32_ref(pattern, sizeof(pattern)));
++
++    /* opcode 2 = minion fills 4 KiB at 0x9000 with 0x5a; host reads it */
++    mem_write8(t, XSPI_MAILBOX1, 0);
++    mem_write8(t, XSPI_MAILBOX0, (2u << 24) | (0x5a << 16) | (0x9000 / 256));
++    v = mailbox1_wait(t, 0);
++    g_assert_cmphex(v, ==, 1);
++    g_assert_cmphex(qtest_readq(t->qts, OSPI_DAC + 0x9000), ==,
++                    0x5a5a5a5a5a5a5a5aull);
++    g_assert_cmphex(mem_read8(t, 0x9ff8), ==, 0x5a5a5a5a5a5a5a5aull);
++}
++
+ int main(int argc, char **argv)
+ {
+     ErbTest t = { .lanes = 1 };
++    const char *backend = getenv("ERBIUM_BACKEND_SOCKET");
++    const char *mram_env = getenv("ERBIUM_MRAM_FILE");
+     int fd, ret;
+ 
+     g_test_init(&argc, &argv, NULL);
+ 
+-    fd = g_file_open_tmp("erbium-mram-XXXXXX", &t.mram_path, NULL);
+-    g_assert(fd >= 0);
+-    g_assert_cmpint(ftruncate(fd, 16 * 1024 * 1024), ==, 0);
+-    close(fd);
++    if (mram_env) {
++        t.mram_path = g_strdup(mram_env);
++    } else {
++        fd = g_file_open_tmp("erbium-mram-XXXXXX", &t.mram_path, NULL);
++        g_assert(fd >= 0);
++        g_assert_cmpint(ftruncate(fd, 16 * 1024 * 1024), ==, 0);
++        close(fd);
++    }
+ 
+     t.qts = qtest_initf("-machine xlnx-versal-virt,ospi-flash=erbium-xspi "
+                         "-object memory-backend-file,id=mram,size=16M,"
+                         "mem-path=%s,share=on "
+                         "-global erbium-xspi.memdev=mram "
+                         "-global driver=xlnx.versal-ospi,property=faithful-frames,value=on "
+-                        "-global driver=xlnx.versal-ospi,property=max-tap-dly-suspend,value=off",
+-                        t.mram_path);
++                        "-global driver=xlnx.versal-ospi,property=max-tap-dly-suspend,value=off "
++                        "%s%s%s",
++                        t.mram_path,
++                        backend ? "-chardev socket,id=erb,path=" : "",
++                        backend ? backend : "",
++                        backend ? " -global erbium-xspi.chardev=erb" : "");
+ 
+     qtest_add_data_func("/erbium-xspi/reset-state", &t, test_reset_state);
+     qtest_add_data_func("/erbium-xspi/sfdp", &t, test_sfdp);
+@@ -435,9 +515,16 @@ int main(int argc, char **argv)
+     qtest_add_data_func("/erbium-xspi/set-rate-octal-dtr", &t,
+                         test_set_rate_octal_dtr);
+ 
++    if (backend) {
++        qtest_add_data_func("/erbium-xspi/backend-mailbox", &t,
++                            test_backend_mailbox);
++    }
++
+     ret = g_test_run();
+     qtest_quit(t.qts);
+-    unlink(t.mram_path);
++    if (!mram_env) {
++        unlink(t.mram_path);
++    }
+     g_free(t.mram_path);
+     return ret;
+ }
+-- 
+2.43.0
+

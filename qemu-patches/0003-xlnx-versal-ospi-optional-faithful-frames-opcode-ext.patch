@@ -1,0 +1,210 @@
+From 4b67c786f553f1d2c6e697300f9d7881f9a6a42c Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Tue, 29 Sep 2026 23:21:11 +0000
+Subject: [PATCH 3/5] xlnx-versal-ospi: optional faithful-frames (opcode ext +
+ dummy bytes); erbium-xspi: ignore auto WREN/WRDI
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ hw/ssi/erbium-xspi.c              |  7 +++
+ hw/ssi/xlnx-versal-ospi.c         | 96 +++++++++++++++++++++++++++++--
+ include/hw/ssi/xlnx-versal-ospi.h |  2 +
+ 3 files changed, 100 insertions(+), 5 deletions(-)
+
+diff --git a/hw/ssi/erbium-xspi.c b/hw/ssi/erbium-xspi.c
+index 23375ab..457dfa5 100644
+--- a/hw/ssi/erbium-xspi.c
++++ b/hw/ssi/erbium-xspi.c
+@@ -588,6 +588,13 @@ static void erbium_begin_command(ErbiumXSPI *s)
+         s->after_ext = ERB_PHASE_ADDR;
+         break;
+     case ERB_OP_NOP:
++    case 0x06: /* WREN */
++    case 0x04: /* WRDI */
++        /*
++         * Not decoded by the RTL (no write-enable latch).  Host controllers
++         * such as the Cadence OSPI auto-insert WREN before writes, so stay
++         * quiet about these two.
++         */
+         s->after_ext = ERB_PHASE_DONE;
+         break;
+     default:
+diff --git a/hw/ssi/xlnx-versal-ospi.c b/hw/ssi/xlnx-versal-ospi.c
+index 34f1541..9b59107 100644
+--- a/hw/ssi/xlnx-versal-ospi.c
++++ b/hw/ssi/xlnx-versal-ospi.c
+@@ -368,6 +368,71 @@ static void ospi_update_irq_line(XlnxVersalOspi *s)
+                             s->regs[R_IRQ_MASK_REG]));
+ }
+ 
++/*
++ * Frame helpers.  The SSI bus only carries bytes, so lane width and DTR
++ * are folded into the *number* of bytes clocked during the dummy phase.
++ * Enabled by the "faithful-frames" property.
++ */
++static bool ospi_dual_byte_opcode(XlnxVersalOspi *s)
++{
++    return s->faithful_frames &&
++           ARRAY_FIELD_EX32(s->regs, CONFIG_REG, DUAL_BYTE_OPCODE_EN_FLD);
++}
++
++static unsigned int ospi_lanes(unsigned int xfer_type)
++{
++    return 1u << (xfer_type & 3);       /* 0:1, 1:2, 2:4, 3:8 lanes */
++}
++
++static unsigned int ospi_dummy_bytes(XlnxVersalOspi *s, unsigned int cycles,
++                                     unsigned int xfer_type)
++{
++    unsigned int bits;
++
++    if (!s->faithful_frames) {
++        return 0;
++    }
++    bits = cycles * ospi_lanes(xfer_type);
++    if (ARRAY_FIELD_EX32(s->regs, CONFIG_REG, ENABLE_DTR_PROTOCOL_FLD)) {
++        bits *= 2;
++    }
++    return bits / 8;
++}
++
++static void ospi_tx_fifo_push_dummy(XlnxVersalOspi *s, unsigned int n)
++{
++    while (n-- && !fifo8_is_full(&s->tx_fifo)) {
++        fifo8_push(&s->tx_fifo, 0);
++    }
++}
++
++static void ospi_tx_fifo_push_opcode(XlnxVersalOspi *s, uint8_t op,
++                                     uint8_t ext)
++{
++    fifo8_push(&s->tx_fifo, op);
++    if (ospi_dual_byte_opcode(s)) {
++        fifo8_push(&s->tx_fifo, ext);
++    }
++}
++
++static unsigned int ospi_rd_dummy_bytes(XlnxVersalOspi *s)
++{
++    return ospi_dummy_bytes(s,
++        ARRAY_FIELD_EX32(s->regs, DEV_INSTR_RD_CONFIG_REG,
++                         DUMMY_RD_CLK_CYCLES_FLD),
++        ARRAY_FIELD_EX32(s->regs, DEV_INSTR_RD_CONFIG_REG,
++                         DATA_XFER_TYPE_EXT_MODE_FLD));
++}
++
++static unsigned int ospi_wr_dummy_bytes(XlnxVersalOspi *s)
++{
++    return ospi_dummy_bytes(s,
++        ARRAY_FIELD_EX32(s->regs, DEV_INSTR_WR_CONFIG_REG,
++                         DUMMY_WR_CLK_CYCLES_FLD),
++        ARRAY_FIELD_EX32(s->regs, DEV_INSTR_WR_CONFIG_REG,
++                         DATA_XFER_TYPE_EXT_MODE_FLD));
++}
++
+ static uint8_t ospi_get_wr_opcode(XlnxVersalOspi *s)
+ {
+     return ARRAY_FIELD_EX32(s->regs,
+@@ -679,10 +744,14 @@ static void ospi_tx_fifo_push_rd_op_addr(XlnxVersalOspi *s, uint32_t flash_addr)
+     fifo8_reset(&s->tx_fifo);
+ 
+     /* Push read opcode */
+-    fifo8_push(&s->tx_fifo, inst_code);
++    ospi_tx_fifo_push_opcode(s, inst_code,
++        ARRAY_FIELD_EX32(s->regs, OPCODE_EXT_LOWER_REG, EXT_READ_OPCODE_FLD));
+ 
+     /* Push read address */
+     ospi_tx_fifo_push_address(s, flash_addr);
++
++    /* Dummy cycles, expressed as bytes */
++    ospi_tx_fifo_push_dummy(s, ospi_rd_dummy_bytes(s));
+ }
+ 
+ static void ospi_tx_fifo_push_stig_wr_data(XlnxVersalOspi *s)
+@@ -887,7 +956,10 @@ static void ospi_transmit_wel(XlnxVersalOspi *s, bool ahb_decoder_cs,
+                               hwaddr addr)
+ {
+     fifo8_reset(&s->tx_fifo);
+-    fifo8_push(&s->tx_fifo, WREN);
++    ospi_tx_fifo_push_opcode(s,
++        s->faithful_frames ? ARRAY_FIELD_EX32(s->regs, OPCODE_EXT_UPPER_REG,
++                                              WEL_OPCODE_FLD) : WREN,
++        ARRAY_FIELD_EX32(s->regs, OPCODE_EXT_UPPER_REG, EXT_WEL_OPCODE_FLD));
+ 
+     if (ahb_decoder_cs) {
+         ospi_ahb_decoder_enable_cs(s, addr);
+@@ -919,10 +991,12 @@ static void ospi_ind_write(XlnxVersalOspi *s, uint32_t flash_addr, uint32_t len)
+ 
+     /* Push write opcode */
+     inst_code = ospi_get_wr_opcode(s);
+-    fifo8_push(&s->tx_fifo, inst_code);
++    ospi_tx_fifo_push_opcode(s, inst_code,
++        ARRAY_FIELD_EX32(s->regs, OPCODE_EXT_LOWER_REG, EXT_WRITE_OPCODE_FLD));
+ 
+     /* Push write address */
+     ospi_tx_fifo_push_address(s, flash_addr);
++    ospi_tx_fifo_push_dummy(s, ospi_wr_dummy_bytes(s));
+ 
+     /* data */
+     for (i = 0; i < len; i++) {
+@@ -1045,12 +1119,20 @@ static void ospi_stig_cmd_exec(XlnxVersalOspi *s)
+ 
+     /* Push write opcode */
+     inst_code = ARRAY_FIELD_EX32(s->regs, FLASH_CMD_CTRL_REG, CMD_OPCODE_FLD);
+-    fifo8_push(&s->tx_fifo, inst_code);
++    ospi_tx_fifo_push_opcode(s, inst_code,
++        ARRAY_FIELD_EX32(s->regs, OPCODE_EXT_LOWER_REG, EXT_STIG_OPCODE_FLD));
+ 
+     /* Push address if enabled */
+     if (ARRAY_FIELD_EX32(s->regs, FLASH_CMD_CTRL_REG, ENB_COMD_ADDR_FLD)) {
+         ospi_tx_fifo_push_stig_addr(s);
+     }
++    /* STIG dummy cycles are clocked at the read-instruction data width */
++    if (!ARRAY_FIELD_EX32(s->regs, FLASH_CMD_CTRL_REG, ENB_WRITE_DATA_FLD)) {
++        ospi_tx_fifo_push_dummy(s, ospi_dummy_bytes(s,
++            ARRAY_FIELD_EX32(s->regs, FLASH_CMD_CTRL_REG, NUM_DUMMY_CYCLES_FLD),
++            ARRAY_FIELD_EX32(s->regs, DEV_INSTR_RD_CONFIG_REG,
++                             DATA_XFER_TYPE_EXT_MODE_FLD)));
++    }
+ 
+     /* Enable cs */
+     ospi_update_cs_lines(s);
+@@ -1214,10 +1296,12 @@ static void ospi_do_dac_write(void *opaque,
+ 
+     /* Push write opcode */
+     inst_code = ospi_get_wr_opcode(s);
+-    fifo8_push(&s->tx_fifo, inst_code);
++    ospi_tx_fifo_push_opcode(s, inst_code,
++        ARRAY_FIELD_EX32(s->regs, OPCODE_EXT_LOWER_REG, EXT_WRITE_OPCODE_FLD));
+ 
+     /* Push write address */
+     ospi_tx_fifo_push_address(s, addr);
++    ospi_tx_fifo_push_dummy(s, ospi_wr_dummy_bytes(s));
+ 
+     /* data */
+     for (i = 0; i < size; i++) {
+@@ -1869,6 +1953,8 @@ static const Property xlnx_versal_ospi_properties[] = {
+                      ind_write_disabled, false),
+     DEFINE_PROP_BOOL("max-tap-dly-suspend", XlnxVersalOspi,
+                     max_tap_dly_suspend, true),
++    DEFINE_PROP_BOOL("faithful-frames", XlnxVersalOspi,
++                     faithful_frames, false),
+ };
+ 
+ static void xlnx_versal_ospi_class_init(ObjectClass *klass, const void *data)
+diff --git a/include/hw/ssi/xlnx-versal-ospi.h b/include/hw/ssi/xlnx-versal-ospi.h
+index 8f8db82..15f7e65 100644
+--- a/include/hw/ssi/xlnx-versal-ospi.h
++++ b/include/hw/ssi/xlnx-versal-ospi.h
+@@ -98,6 +98,8 @@ struct XlnxVersalOspi {
+     bool dac_enable;
+     bool src_dma_inprog;
+     bool max_tap_dly_suspend;
++    /* Emit opcode-extension and dummy bytes on the SSI bus */
++    bool faithful_frames;
+ 
+     IndOp rd_ind_op[2];
+     IndOp wr_ind_op[2];
+-- 
+2.43.0
+

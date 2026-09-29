@@ -1,0 +1,939 @@
+From f457a13f003463139d98ff6b493bb7255a34413e Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Tue, 29 Sep 2026 23:19:59 +0000
+Subject: [PATCH 2/5] erbium-xspi: follow RTL semantics (latency 8+IL, AXI
+ burst limits, 4K write wrap, SCCR at 0x4000F000, SFDP pad quirk, chip reset)
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ hw/ssi/Kconfig               |   1 -
+ hw/ssi/erbium-xspi.c         | 465 +++++++++++++++++++++--------------
+ hw/ssi/trace-events          |   1 +
+ include/hw/ssi/erbium-xspi.h |  50 ++--
+ 4 files changed, 311 insertions(+), 206 deletions(-)
+
+diff --git a/hw/ssi/Kconfig b/hw/ssi/Kconfig
+index 830faef..bd204d2 100644
+--- a/hw/ssi/Kconfig
++++ b/hw/ssi/Kconfig
+@@ -40,5 +40,4 @@ config ALLWINNER_A10_SPI
+ config ERBIUM_XSPI
+     bool
+     default y
+-    depends on SSI
+     select SSI
+diff --git a/hw/ssi/erbium-xspi.c b/hw/ssi/erbium-xspi.c
+index c1de50d..23375ab 100644
+--- a/hw/ssi/erbium-xspi.c
++++ b/hw/ssi/erbium-xspi.c
+@@ -1,18 +1,27 @@
+ /*
+  * Erbium xSPI target interface model
+  *
+- * See include/hw/ssi/erbium-xspi.h and docs/erbium-qemu-review.md in the
+- * erbium-emu repository for the architecture.
+- *
+  * Physical wiring being modelled: the host's OSPI controller talks to the
+- * Erbium xSPI target IP over CS/DQ[7:0]/RWDS.  Inside the chip that IP owns
+- * the SCCR register block (reached with Read/Write Register commands) and is
+- * an AXI4 initiator on the NIC (Read/Write Memory commands).  Here:
++ * Erbium xSPI target IP over CS#/DQ[7:0]/RWDS.  Inside the chip that IP owns
++ * the SCCR register block (Read/Write Register commands, and memory ops at
++ * 0x4000F000) and is an AXI4 initiator on the NoC (Read/Write Memory
++ * commands).  Here:
+  *   - MRAM is a host memory backend (shared mmap file) so a co-running
+  *     erbium_emu CPU model sees the same bytes;
+- *   - non-MRAM memory accesses are forwarded over a chardev socket to
+- *     erbium_emu, which models the NIC and its targets (docs/protocol.md);
+- *     without a chardev, a small built-in stub answers instead.
++ *   - other NoC targets are reached over a chardev socket to erbium_emu
++ *     (docs/protocol.md); without a chardev a small built-in stub answers.
++ *
++ * Semantics follow the RTL (ip/xspi/bsv/xspi.bsv); the notable ones:
++ *   - latency for every read = 8 + CFG.InitialLatency SCK cycles;
++ *   - one AXI read burst per CS#: 8 bytes unless CFG.BurstEnable, then
++ *     128/64/16/32 bytes for BurstLength 0..3; further bytes read 0 and set
++ *     interrupt_status.read_underflow;
++ *   - writes are 8-byte single-beat AXI writes, address increments within
++ *     a 4 KiB page, trailing partial words are dropped;
++ *   - register ops are 32-bit at SCCR offset addr[5:0], never incremented;
++ *   - SFDP DWORDs are streamed with 4 zero pad bytes each (RTL quirk);
++ *   - the opcode extension byte is present in S4/D4/S8/D8 command rates and
++ *     its value is ignored; 99h is a whole-chip soft reset.
+  *
+  * This work is licensed under the terms of the GNU GPL, version 2 or later.
+  */
+@@ -26,45 +35,51 @@
+ #include "hw/qdev-properties-system.h"
+ #include "hw/ssi/erbium-xspi.h"
+ #include "migration/vmstate.h"
+-#include "exec/memory.h"
++#include "system/memory.h"
+ #include "trace.h"
+ 
+ extern const uint8_t erbium_sfdp_image[];
+ extern const unsigned erbium_sfdp_image_len;
+ 
+ /* ------------------------------------------------------------------ */
+-/* Address maps                                                        */
+-
+-/* xSPI-visible map (TRM "xSPI Memory Map") -> CPU map (erbium-hal top.h) */
+-typedef struct {
+-    uint64_t xspi_base;
+-    uint64_t size;
+-    uint64_t cpu_base;
+-    ErbiumTarget target;
+-} ErbiumMapEntry;
++/* Address maps (NoC rules, ip/erbium_noc/rtl/erbium_noc_top.sv)       */
+ 
+ #define ERB_CPU_SYSREGS_BASE    0x02000000ull
++#define ERB_CPU_ROMRAM_BASE     0x02008000ull   /* bootrom 8K, gap, SRAM 4K @ C000 */
+ #define ERB_CPU_SRAM_BASE       0x0200C000ull
++#define ERB_CPU_SCCR_BASE       0x0200F000ull
+ #define ERB_CPU_MRAM_BASE       0x40000000ull
+ #define ERB_CPU_CPUREGS_BASE    0x80000000ull
++#define ERB_CPU_GPV_BASE        0xFE000000ull
+ 
+-static const ErbiumMapEntry erbium_xspi_map[] = {
+-    { 0x00000000, ERBIUM_MRAM_SIZE, ERB_CPU_MRAM_BASE,      ERB_TGT_MRAM },
+-    { 0x0E000000, 0x00016000,       0xFE000000ull,          ERB_TGT_REMOTE }, /* NIC cfg */
+-    { 0x40000000, 0x00005000,       ERB_CPU_SYSREGS_BASE,   ERB_TGT_REMOTE }, /* sys/mram/i2c/qspi/uart regs */
+-    { 0x40005000, 0x00001000,       ERB_CPU_SRAM_BASE,      ERB_TGT_REMOTE }, /* SRAM */
+-    { 0x80000000, 0x01000000,       ERB_CPU_CPUREGS_BASE,   ERB_TGT_REMOTE }, /* CPU regs (ESR) */
+-};
++/* xSPI -> CPU address translation done by the NoC for initiator S_XSPI */
++static uint64_t erbium_xspi_to_cpu(uint32_t xaddr)
++{
++    if (xaddr < 0x40000000u) {
++        return (uint64_t)xaddr + 0x40000000ull;
++    }
++    if (xaddr < 0x80000000u) {
++        return (uint64_t)xaddr - 0x3E000000ull;
++    }
++    return xaddr;
++}
+ 
+-static const ErbiumMapEntry *erbium_map_lookup(uint64_t xaddr)
++/* CPU-map decode: which model handles the address */
++static ErbiumTarget erbium_cpu_target(uint64_t a)
+ {
+-    for (unsigned i = 0; i < ARRAY_SIZE(erbium_xspi_map); i++) {
+-        const ErbiumMapEntry *e = &erbium_xspi_map[i];
+-        if (xaddr >= e->xspi_base && xaddr < e->xspi_base + e->size) {
+-            return e;
+-        }
++    if (a >= ERB_CPU_MRAM_BASE && a < ERB_CPU_MRAM_BASE + 0x40000000ull) {
++        return ERB_TGT_MRAM;
+     }
+-    return NULL;
++    if (a >= ERB_CPU_SCCR_BASE && a < ERB_CPU_SCCR_BASE + 0x1000) {
++        return ERB_TGT_SCCR;
++    }
++    if ((a >= ERB_CPU_SYSREGS_BASE && a < ERB_CPU_SYSREGS_BASE + 0x5000) ||
++        (a >= ERB_CPU_ROMRAM_BASE && a < ERB_CPU_ROMRAM_BASE + 0x5000) ||
++        (a >= ERB_CPU_CPUREGS_BASE && a < ERB_CPU_CPUREGS_BASE + 0x40000000ull) ||
++        (a >= ERB_CPU_GPV_BASE && a < ERB_CPU_GPV_BASE + 0x16000)) {
++        return ERB_TGT_REMOTE;
++    }
++    return ERB_TGT_NONE;
+ }
+ 
+ /* ------------------------------------------------------------------ */
+@@ -129,7 +144,6 @@ static int erbium_backend_xfer(ErbiumXSPI *s, uint16_t op, uint64_t addr,
+                 goto lost;
+             }
+         } else {
+-            /* unexpected payload: drain */
+             g_autofree uint8_t *tmp = g_malloc(rlen);
+             if (qemu_chr_fe_read_all(&s->chr, tmp, rlen) != (int)rlen) {
+                 goto lost;
+@@ -192,7 +206,7 @@ static int erbium_remote_access(ErbiumXSPI *s, uint64_t cpu_addr, void *buf,
+ static const uint32_t erbium_sccr_reset[ERB_SCCR_NREGS] = {
+     [ERB_SCCR_ID0 / 8]          = 0x00000002,   /* mgf_id = 2 (TRM: TBD) */
+     [ERB_SCCR_ID1 / 8]          = 0x00000000,
+-    [ERB_SCCR_CFG / 8]          = 0x0000318A,   /* BurstLength=2, FixedLatency, InitialLatency=8, rsvd=1, DriveStrength=3 */
++    [ERB_SCCR_CFG / 8]          = 0x0000318A,   /* BL=2, FixedLat, IL=8, rsvd=1, DS=3 */
+     [ERB_SCCR_XSPI_STATUS / 8]  = 0,
+     [ERB_SCCR_XSPI_CONTROL / 8] = 0,
+     [ERB_SCCR_XSPI_RATES / 8]   = 0,
+@@ -202,7 +216,7 @@ static const uint32_t erbium_sccr_reset[ERB_SCCR_NREGS] = {
+ static const uint32_t erbium_sccr_wmask[ERB_SCCR_NREGS] = {
+     [ERB_SCCR_ID0 / 8]          = 0x0000ffff,
+     [ERB_SCCR_ID1 / 8]          = 0x0000ffff,
+-    [ERB_SCCR_CFG / 8]          = 0x000380f3,   /* rw: BurstLength, InitialLatency, DeepPD, BurstEnable, UltraDeepPD */
++    [ERB_SCCR_CFG / 8]          = 0x000380f3,
+     [ERB_SCCR_XSPI_STATUS / 8]  = 0,
+     [ERB_SCCR_XSPI_CONTROL / 8] = 0x00000003,
+     [ERB_SCCR_XSPI_RATES / 8]   = 0x00ffffff,
+@@ -211,12 +225,14 @@ static const uint32_t erbium_sccr_wmask[ERB_SCCR_NREGS] = {
+ 
+ uint32_t erbium_xspi_sccr_read(ErbiumXSPI *s, unsigned offset)
+ {
+-    unsigned idx = offset / 8;
++    unsigned idx;
+     uint32_t v;
+ 
++    offset &= ERB_SCCR_ADDR_MASK;
+     if (offset >= ERB_SCCR_SIZE || (offset & 7)) {
+         return 0;
+     }
++    idx = offset / 8;
+     v = s->sccr[idx];
+     if (idx == ERB_SCCR_INT_STATUS / 8) {
+         s->sccr[idx] = 0;   /* rclr */
+@@ -227,16 +243,23 @@ uint32_t erbium_xspi_sccr_read(ErbiumXSPI *s, unsigned offset)
+ 
+ void erbium_xspi_sccr_write(ErbiumXSPI *s, unsigned offset, uint32_t val)
+ {
+-    unsigned idx = offset / 8;
++    unsigned idx;
+ 
++    offset &= ERB_SCCR_ADDR_MASK;
+     if (offset >= ERB_SCCR_SIZE || (offset & 7)) {
+         return;
+     }
++    idx = offset / 8;
+     trace_erbium_xspi_sccr_write(offset, val);
+     s->sccr[idx] = (s->sccr[idx] & ~erbium_sccr_wmask[idx]) |
+                    (val & erbium_sccr_wmask[idx]);
+ }
+ 
++static void erbium_set_int_status(ErbiumXSPI *s, uint32_t bits)
++{
++    s->sccr[ERB_SCCR_INT_STATUS / 8] |= bits;
++}
++
+ static void erbium_set_axi_error(ErbiumXSPI *s, int status)
+ {
+     if (status == ERB_ST_OK) {
+@@ -255,6 +278,7 @@ static unsigned erbium_rate_lanes(uint8_t rate)
+ {
+     switch (rate) {
+     case ERB_RATE_S1: case ERB_RATE_D1: return 1;
++    case ERB_RATE_S2: case ERB_RATE_D2: return 2;
+     case ERB_RATE_S4: case ERB_RATE_D4: return 4;
+     default:                            return 8;
+     }
+@@ -262,7 +286,7 @@ static unsigned erbium_rate_lanes(uint8_t rate)
+ 
+ static bool erbium_rate_dtr(uint8_t rate)
+ {
+-    return rate == ERB_RATE_D1 || rate == ERB_RATE_D4 ||
++    return rate == ERB_RATE_D1 || rate == ERB_RATE_D2 || rate == ERB_RATE_D4 ||
+            rate == ERB_RATE_D8 || rate == ERB_RATE_HB;
+ }
+ 
+@@ -276,9 +300,11 @@ static bool erbium_rate_valid(uint8_t rate)
+     return false;
+ }
+ 
+-static bool erbium_is_spi_mode(ErbiumXSPI *s)
++/* Ext byte follows the opcode in these command rates (xspi.bsv:608-615) */
++static bool erbium_rate_has_ext(uint8_t rate)
+ {
+-    return s->cmd_rate == ERB_RATE_S1;
++    return rate == ERB_RATE_S4 || rate == ERB_RATE_D4 ||
++           rate == ERB_RATE_S8 || rate == ERB_RATE_D8;
+ }
+ 
+ static void erbium_apply_rates(ErbiumXSPI *s, uint8_t c, uint8_t a, uint8_t d)
+@@ -303,116 +329,193 @@ static void erbium_apply_default_mode(ErbiumXSPI *s)
+     erbium_apply_rates(s, r, r, r);
+ }
+ 
++/* latency SCK cycles = 8 + CFG.InitialLatency (hb_decode_latency) */
++static unsigned erbium_latency_cycles(ErbiumXSPI *s)
++{
++    return 8 + ((s->sccr[ERB_SCCR_CFG / 8] & ERB_CFG_INITIAL_LATENCY_MASK) >>
++                ERB_CFG_INITIAL_LATENCY_SHIFT);
++}
++
+ /*
+- * Number of SSI byte transfers that make up the latency phase of a read.
+- * Latency is counted in clock cycles (CFG.InitialLatency); the number of
+- * bytes clocked through in that time depends on lanes and DTR.
++ * Number of SSI byte transfers that make up the latency phase: the SSI
++ * transport carries no clock, so latency cycles are converted to the number
++ * of bytes the host controller would clock through at the data rate.
+  */
+ static unsigned erbium_latency_bytes(ErbiumXSPI *s)
+ {
+-    unsigned cycles, lanes, bits;
++    unsigned bits;
+ 
+     if (s->latency_bytes_override >= 0) {
+         return s->latency_bytes_override;
+     }
+-    cycles = (s->sccr[ERB_SCCR_CFG / 8] & ERB_CFG_INITIAL_LATENCY_MASK) >>
+-             ERB_CFG_INITIAL_LATENCY_SHIFT;
+-    lanes = erbium_rate_lanes(s->data_rate);
+-    bits = cycles * lanes * (erbium_rate_dtr(s->data_rate) ? 2 : 1);
++    bits = erbium_latency_cycles(s) * erbium_rate_lanes(s->data_rate) *
++           (erbium_rate_dtr(s->data_rate) ? 2 : 1);
+     return DIV_ROUND_UP(bits, 8);
+ }
+ 
++/* AXI read burst length in bytes (fn_hb_decode_len) */
++static unsigned erbium_read_burst_bytes(ErbiumXSPI *s)
++{
++    static const unsigned len[4] = { 128, 64, 16, 32 };
++    uint32_t cfg = s->sccr[ERB_SCCR_CFG / 8];
++
++    if (!(cfg & ERB_CFG_BURST_ENABLE)) {
++        return 8;
++    }
++    return len[cfg & ERB_CFG_BURST_LENGTH_MASK];
++}
++
+ /* ------------------------------------------------------------------ */
+-/* Data path helpers                                                   */
++/* Data path                                                           */
+ 
+-static void erbium_word_fetch(ErbiumXSPI *s)
++/* Fill the read burst buffer for memory reads (one AXI burst per CS#) */
++static void erbium_read_burst_fetch(ErbiumXSPI *s)
+ {
+     int st = ERB_ST_OK;
++    unsigned n = erbium_read_burst_bytes(s);
++    uint64_t cpu = erbium_xspi_to_cpu(s->cur_addr);
++
++    memset(s->burst, 0, sizeof(s->burst));
++    s->burst_len = n;
++    s->burst_pos = 0;
++    s->burst_valid = true;
+ 
+-    memset(s->word, 0xff, sizeof(s->word));
+     switch (s->target) {
+-    case ERB_TGT_MRAM:
+-        if (s->cur_addr + s->word_size <= ERBIUM_MRAM_SIZE) {
+-            memcpy(s->word, s->mram + s->cur_addr, s->word_size);
++    case ERB_TGT_MRAM: {
++        uint64_t off = cpu - ERB_CPU_MRAM_BASE;
++        if (off + n <= ERBIUM_MRAM_SIZE) {
++            memcpy(s->burst, s->mram + off, n);
+         } else {
+-            /* crossed out of MRAM: re-resolve */
+-            const ErbiumMapEntry *e = erbium_map_lookup(s->cur_addr);
+-            if (!e || e->target != ERB_TGT_MRAM) {
+-                st = ERB_ST_DECERR;
+-            }
++            st = ERB_ST_DECERR;
+         }
+         break;
++    }
+     case ERB_TGT_SCCR:
+-        stl_le_p(s->word, erbium_xspi_sccr_read(s, s->cur_addr));
+-        break;
+-    case ERB_TGT_SFDP:
+-        for (unsigned i = 0; i < s->word_size; i++) {
+-            uint64_t a = s->cur_addr + i;
+-            s->word[i] = a < erbium_sfdp_image_len ? erbium_sfdp_image[a] : 0xff;
++        for (unsigned i = 0; i < n; i += 8) {
++            stl_le_p(s->burst + i, erbium_xspi_sccr_read(s, cpu + i));
+         }
+         break;
+-    case ERB_TGT_REMOTE: {
+-        const ErbiumMapEntry *e = erbium_map_lookup(s->cur_addr);
+-        if (!e) {
+-            st = ERB_ST_DECERR;
+-        } else {
+-            st = erbium_remote_access(s, e->cpu_base + (s->cur_addr - e->xspi_base),
+-                                      s->word, s->word_size, false);
+-        }
++    case ERB_TGT_REMOTE:
++        st = erbium_remote_access(s, cpu, s->burst, n, false);
+         break;
+-    }
+     default:
+         st = ERB_ST_DECERR;
+     }
+     erbium_set_axi_error(s, st);
+-    s->word_valid = true;
+-    s->word_pos = 0;
++}
++
++static uint8_t erbium_read_byte(ErbiumXSPI *s)
++{
++    uint8_t b = 0;
++
++    switch (s->target) {
++    case ERB_TGT_SCCR:
++        if (s->is_reg) {
++            /* 65h: re-reads the same register every 4 bytes */
++            if (!s->burst_valid) {
++                stl_le_p(s->burst, erbium_xspi_sccr_read(s, s->cur_addr));
++                s->burst_len = 4;
++                s->burst_pos = 0;
++                s->burst_valid = true;
++            }
++            b = s->burst[s->burst_pos++];
++            if (s->burst_pos == s->burst_len) {
++                s->burst_valid = false;
++            }
++            return b;
++        }
++        /* fall through: memory-op view of SCCR */
++    case ERB_TGT_MRAM:
++    case ERB_TGT_REMOTE:
++    case ERB_TGT_NONE:
++        if (!s->burst_valid) {
++            erbium_read_burst_fetch(s);
++        }
++        if (s->burst_pos < s->burst_len) {
++            return s->burst[s->burst_pos++];
++        }
++        /* host reads past the AXI burst: zeros + underflow */
++        if (!(s->sccr[ERB_SCCR_INT_STATUS / 8] & ERB_INT_READ_UNDERFLOW)) {
++            trace_erbium_xspi_underflow(s->addr, s->burst_len);
++        }
++        erbium_set_int_status(s, ERB_INT_READ_UNDERFLOW);
++        return 0;
++
++    case ERB_TGT_SFDP:
++        if (!s->burst_valid) {
++            uint32_t a = s->cur_addr & ERB_SFDP_ADDR_MASK;
++            memset(s->burst, 0, 8);
++            if (!(a & 3)) {
++                for (unsigned i = 0; i < 4; i++) {
++                    if (a + i < erbium_sfdp_image_len) {
++                        s->burst[i] = erbium_sfdp_image[a + i];
++                    }
++                }
++            }
++            s->burst_len = s->sfdp_pad_quirk ? 8 : 4;
++            s->burst_pos = 0;
++            s->burst_valid = true;
++        }
++        b = s->burst[s->burst_pos++];
++        if (s->burst_pos == s->burst_len) {
++            s->burst_valid = false;
++            s->cur_addr = (s->cur_addr & ~ERB_SFDP_ADDR_MASK) |
++                          ((s->cur_addr + 4) & ERB_SFDP_ADDR_MASK);
++        }
++        return b;
++    }
++    return 0;
+ }
+ 
+ static void erbium_word_commit(ErbiumXSPI *s)
+ {
+     int st = ERB_ST_OK;
++    uint64_t cpu;
+ 
+-    if (s->word_pos == 0) {
++    if (s->word_pos < s->word_size) {
++        if (s->word_pos) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "erbium-xspi: dropping trailing %u bytes of op 0x%02x "
++                          "(data must be a multiple of %u bytes)\n",
++                          s->word_pos, s->opcode, s->word_size);
++        }
++        s->word_pos = 0;
+         return;
+     }
+-    if (s->word_pos != s->word_size) {
+-        qemu_log_mask(LOG_GUEST_ERROR,
+-                      "erbium-xspi: partial %u-byte word (%u bytes) at 0x%" PRIx64
+-                      " (data must be a multiple of %u bytes)\n",
+-                      s->word_size, s->word_pos, s->cur_addr, s->word_size);
+-        if (s->strict) {
+-            erbium_set_axi_error(s, ERB_ST_SLVERR);
+-            s->word_pos = 0;
+-            return;
+-        }
++    s->word_pos = 0;
++
++    if (s->is_reg) {
++        erbium_xspi_sccr_write(s, s->cur_addr, ldl_le_p(s->word));
++        return;             /* register ops never increment */
+     }
++
++    cpu = erbium_xspi_to_cpu(s->cur_addr);
++    s->sccr[ERB_SCCR_XSPI_STATUS / 8] |= ERB_STATUS_WIP;
+     switch (s->target) {
+-    case ERB_TGT_MRAM:
+-        if (s->cur_addr + s->word_pos <= ERBIUM_MRAM_SIZE) {
+-            memcpy(s->mram + s->cur_addr, s->word, s->word_pos);
++    case ERB_TGT_MRAM: {
++        uint64_t off = cpu - ERB_CPU_MRAM_BASE;
++        if (off + 8 <= ERBIUM_MRAM_SIZE) {
++            memcpy(s->mram + off, s->word, 8);
+         } else {
+             st = ERB_ST_DECERR;
+         }
+         break;
++    }
+     case ERB_TGT_SCCR:
+-        erbium_xspi_sccr_write(s, s->cur_addr, ldl_le_p(s->word));
++        erbium_xspi_sccr_write(s, cpu, ldl_le_p(s->word));
+         break;
+-    case ERB_TGT_REMOTE: {
+-        const ErbiumMapEntry *e = erbium_map_lookup(s->cur_addr);
+-        if (!e) {
+-            st = ERB_ST_DECERR;
+-        } else {
+-            st = erbium_remote_access(s, e->cpu_base + (s->cur_addr - e->xspi_base),
+-                                      s->word, s->word_pos, true);
+-        }
++    case ERB_TGT_REMOTE:
++        st = erbium_remote_access(s, cpu, s->word, 8, true);
+         break;
+-    }
+     default:
+-        st = ERB_ST_SLVERR;   /* write to SFDP etc. */
++        st = ERB_ST_DECERR;
+     }
++    /* AXI B response: WIP clears, error latched */
++    s->sccr[ERB_SCCR_XSPI_STATUS / 8] &= ~ERB_STATUS_WIP;
+     erbium_set_axi_error(s, st);
+-    s->word_pos = 0;
++
++    /* address increments within the 4 KiB page only (xspi.bsv:392) */
++    s->cur_addr = (s->cur_addr & ~0xfffull) | ((s->cur_addr + 8) & 0xfff);
+ }
+ 
+ /* ------------------------------------------------------------------ */
+@@ -420,82 +523,92 @@ static void erbium_word_commit(ErbiumXSPI *s)
+ 
+ static void erbium_begin_command(ErbiumXSPI *s)
+ {
+-    bool spi = erbium_is_spi_mode(s);
++    bool s1 = s->cmd_rate == ERB_RATE_S1;
+ 
+     s->target = ERB_TGT_NONE;
+     s->is_write = false;
++    s->is_reg = false;
+     s->addr_bytes = 0;
+     s->latency_bytes = 0;
+     s->word_size = 8;
++    s->addr = 0;
++    s->addr_got = 0;
++    s->latency_got = 0;
++    s->word_pos = 0;
++    s->burst_valid = false;
++    s->bytes_done = 0;
+ 
+-    switch (s->opcode) {
+-    case ERB_OP_NOP:
++    if (s->cmd_rate == ERB_RATE_HB) {
++        qemu_log_mask(LOG_UNIMP, "erbium-xspi: HyperBus mode not implemented\n");
+         s->phase = ERB_PHASE_DONE;
+         return;
++    }
++
++    switch (s->opcode) {
+     case ERB_OP_RESET:
+         s->reset_pending = true;
+-        s->phase = ERB_PHASE_DONE;
+-        return;
++        s->after_ext = ERB_PHASE_DONE;
++        break;
+     case ERB_OP_SET_RATE:
+         s->is_write = true;
+         s->word_size = 3;
++        s->after_ext = ERB_PHASE_DATA;
+         break;
+     case ERB_OP_READ_SFDP:
+         s->target = ERB_TGT_SFDP;
+-        s->addr_bytes = spi ? 3 : 4;
++        s->addr_bytes = s1 ? 3 : 4;
+         s->latency_bytes = erbium_latency_bytes(s);
+-        s->word_size = 1;
++        s->after_ext = ERB_PHASE_ADDR;
+         break;
+     case ERB_OP_READ_REG:
+         s->target = ERB_TGT_SCCR;
+-        s->addr_bytes = spi ? 3 : 4;
++        s->is_reg = true;
++        s->addr_bytes = s1 ? 3 : 4;
+         s->latency_bytes = erbium_latency_bytes(s);
+-        s->word_size = 4;
++        s->after_ext = ERB_PHASE_ADDR;
+         break;
+     case ERB_OP_WRITE_REG:
+         s->target = ERB_TGT_SCCR;
+-        s->addr_bytes = spi ? 3 : 4;
++        s->is_reg = true;
+         s->is_write = true;
+         s->word_size = 4;
++        s->addr_bytes = s1 ? 3 : 4;
++        s->after_ext = ERB_PHASE_ADDR;
+         break;
+     case ERB_OP_READ_MEM:
+         s->target = ERB_TGT_REMOTE;  /* resolved after address */
+         s->addr_bytes = 4;
+         s->latency_bytes = erbium_latency_bytes(s);
++        s->after_ext = ERB_PHASE_ADDR;
+         break;
+     case ERB_OP_WRITE_MEM:
+         s->target = ERB_TGT_REMOTE;
+-        s->addr_bytes = 4;
+         s->is_write = true;
++        s->addr_bytes = 4;
++        s->after_ext = ERB_PHASE_ADDR;
++        break;
++    case ERB_OP_NOP:
++        s->after_ext = ERB_PHASE_DONE;
+         break;
+     default:
++        /* RTL: not decoded (keeps the previous format); we treat as NOP */
+         qemu_log_mask(LOG_GUEST_ERROR, "erbium-xspi: unknown opcode 0x%02x\n",
+                       s->opcode);
+         trace_erbium_xspi_invalid(s->opcode, s->cmd_rate);
+-        s->cmd_error = true;
+-        s->phase = ERB_PHASE_DONE;
+-        return;
++        s->after_ext = ERB_PHASE_DONE;
++        break;
+     }
+ 
+-    s->after_ext = s->addr_bytes ? ERB_PHASE_ADDR : ERB_PHASE_DATA;
+-    s->phase = spi ? s->after_ext : ERB_PHASE_EXT;
+-    s->addr = 0;
+-    s->addr_got = 0;
+-    s->latency_got = 0;
+-    s->word_pos = 0;
+-    s->word_valid = false;
++    s->phase = erbium_rate_has_ext(s->cmd_rate) ? ERB_PHASE_EXT : s->after_ext;
+ }
+ 
+ static void erbium_address_done(ErbiumXSPI *s)
+ {
+     s->cur_addr = s->addr;
+-    s->bytes_done = 0;
+ 
+     if (s->target == ERB_TGT_REMOTE) {
+-        const ErbiumMapEntry *e = erbium_map_lookup(s->addr);
+-        if (e) {
+-            s->target = e->target;
+-        } else {
++        s->target = erbium_cpu_target(erbium_xspi_to_cpu(s->addr));
++        if (s->target == ERB_TGT_NONE) {
+             qemu_log_mask(LOG_GUEST_ERROR,
+                           "erbium-xspi: memory op 0x%02x to unmapped 0x%08x\n",
+                           s->opcode, s->addr);
+@@ -510,34 +623,23 @@ static void erbium_address_done(ErbiumXSPI *s)
+ 
+ static uint8_t erbium_data_byte(ErbiumXSPI *s, uint8_t tx)
+ {
+-    uint8_t rx = 0xff;
+-
+-    if (s->is_write) {
+-        s->word[s->word_pos++] = tx;
+-        s->bytes_done++;
+-        if (s->word_pos == s->word_size) {
+-            if (s->opcode == ERB_OP_SET_RATE) {
+-                memcpy(s->pending_rate, s->word, 3);
+-                s->rate_pending = true;
+-                s->phase = ERB_PHASE_DONE;
+-                s->word_pos = 0;
+-            } else {
+-                erbium_word_commit(s);
+-                s->cur_addr += s->word_size;
+-            }
+-        }
+-    } else {
+-        if (!s->word_valid) {
+-            erbium_word_fetch(s);
+-        }
+-        rx = s->word[s->word_pos++];
+-        s->bytes_done++;
+-        if (s->word_pos == s->word_size) {
+-            s->word_valid = false;
+-            s->cur_addr += s->word_size;
++    s->bytes_done++;
++    if (!s->is_write) {
++        return erbium_read_byte(s);
++    }
++
++    s->word[s->word_pos++] = tx;
++    if (s->word_pos == s->word_size) {
++        if (s->opcode == ERB_OP_SET_RATE) {
++            memcpy(s->pending_rate, s->word, 3);
++            s->rate_pending = true;
++            s->word_pos = 0;
++            s->phase = ERB_PHASE_DONE;
++        } else {
++            erbium_word_commit(s);
+         }
+     }
+-    return rx;
++    return 0;
+ }
+ 
+ static uint32_t erbium_xspi_transfer(SSIPeripheral *ss, uint32_t tx)
+@@ -548,17 +650,15 @@ static uint32_t erbium_xspi_transfer(SSIPeripheral *ss, uint32_t tx)
+     switch (s->phase) {
+     case ERB_PHASE_CMD:
+         s->opcode = b;
+-        s->cmd_error = false;
+         erbium_begin_command(s);
+         return 0;
+ 
+     case ERB_PHASE_EXT:
+         s->ext = b;
+-        if (s->ext_check && b != (uint8_t)~s->opcode) {
++        if (s->ext_check && b != s->opcode) {
+             qemu_log_mask(LOG_GUEST_ERROR,
+-                          "erbium-xspi: bad opcode extension 0x%02x for 0x%02x\n",
++                          "erbium-xspi: opcode extension 0x%02x != opcode 0x%02x\n",
+                           b, s->opcode);
+-            trace_erbium_xspi_invalid(s->opcode, s->cmd_rate);
+         }
+         s->phase = s->after_ext;
+         return 0;
+@@ -585,15 +685,20 @@ static uint32_t erbium_xspi_transfer(SSIPeripheral *ss, uint32_t tx)
+     }
+ }
+ 
+-static void erbium_xspi_soft_reset(ErbiumXSPI *s)
++static void erbium_xspi_chip_reset(ErbiumXSPI *s, bool from_command)
+ {
+-    trace_erbium_xspi_reset("command");
++    trace_erbium_xspi_reset(from_command ? "command" : "device");
+     memcpy(s->sccr, erbium_sccr_reset, sizeof(s->sccr));
++    s->phase = ERB_PHASE_CMD;
+     s->rate_pending = false;
+-    /* 0x99: "Reset Device and Enter default mode (1S)" */
+-    erbium_apply_rates(s, ERB_RATE_S1, ERB_RATE_S1, ERB_RATE_S1);
++    s->reset_pending = false;
++    s->word_pos = 0;
++    s->burst_valid = false;
++    erbium_apply_default_mode(s);   /* handlePostReset: rates from pins */
+     if (s->backend_connected) {
+-        erbium_backend_xfer(s, ERB_MSGOP_RESET, 1, NULL, 0, false);
++        erbium_backend_xfer(s, ERB_MSGOP_RESET, 0, NULL, 0, false);
++    } else if (s->stub_sysregs) {
++        memset(s->stub_sysregs, 0, ERB_STUB_SYSREGS_SIZE);
+     }
+ }
+ 
+@@ -602,16 +707,16 @@ static int erbium_xspi_set_cs(SSIPeripheral *ss, bool level)
+     ErbiumXSPI *s = ERBIUM_XSPI(ss);
+ 
+     if (level) {
+-        /* CS deasserted: finalize */
++        /* CS# deasserted: finalize (acInit) */
+         if (s->phase == ERB_PHASE_DATA && s->is_write) {
+-            erbium_word_commit(s);
++            erbium_word_commit(s);   /* drops any partial word */
+         }
+         if (s->phase == ERB_PHASE_DATA || s->phase == ERB_PHASE_LATENCY ||
+             s->phase == ERB_PHASE_DONE) {
+             trace_erbium_xspi_cs_done(s->opcode, s->addr, s->bytes_done);
+         } else if (s->phase != ERB_PHASE_CMD) {
+             qemu_log_mask(LOG_GUEST_ERROR,
+-                          "erbium-xspi: CS released mid-command (op 0x%02x, phase %d)\n",
++                          "erbium-xspi: CS# released mid-command (op 0x%02x, phase %d)\n",
+                           s->opcode, s->phase);
+         }
+         if (s->rate_pending) {
+@@ -623,19 +728,18 @@ static int erbium_xspi_set_cs(SSIPeripheral *ss, bool level)
+                                    s->pending_rate[2]);
+             } else {
+                 qemu_log_mask(LOG_GUEST_ERROR,
+-                              "erbium-xspi: invalid setRate %02x %02x %02x\n",
++                              "erbium-xspi: unsupported setRate %02x %02x %02x\n",
+                               s->pending_rate[0], s->pending_rate[1],
+                               s->pending_rate[2]);
+             }
+         }
+         if (s->reset_pending) {
+-            s->reset_pending = false;
+-            erbium_xspi_soft_reset(s);
++            erbium_xspi_chip_reset(s, true);
+         }
+     }
+     s->phase = ERB_PHASE_CMD;
+     s->word_pos = 0;
+-    s->word_valid = false;
++    s->burst_valid = false;
+     return 0;
+ }
+ 
+@@ -644,22 +748,7 @@ static int erbium_xspi_set_cs(SSIPeripheral *ss, bool level)
+ 
+ static void erbium_xspi_reset(DeviceState *dev)
+ {
+-    ErbiumXSPI *s = ERBIUM_XSPI(dev);
+-
+-    trace_erbium_xspi_reset("device");
+-    memcpy(s->sccr, erbium_sccr_reset, sizeof(s->sccr));
+-    s->phase = ERB_PHASE_CMD;
+-    s->rate_pending = false;
+-    s->reset_pending = false;
+-    s->word_pos = 0;
+-    s->word_valid = false;
+-    erbium_apply_default_mode(s);
+-    if (s->stub_sysregs) {
+-        memset(s->stub_sysregs, 0, ERB_STUB_SYSREGS_SIZE);
+-    }
+-    if (s->backend_connected) {
+-        erbium_backend_xfer(s, ERB_MSGOP_RESET, 0, NULL, 0, false);
+-    }
++    erbium_xspi_chip_reset(ERBIUM_XSPI(dev), false);
+ }
+ 
+ static void erbium_xspi_realize(SSIPeripheral *ss, Error **errp)
+@@ -707,7 +796,7 @@ static const Property erbium_xspi_properties[] = {
+     DEFINE_PROP_CHR("chardev", ErbiumXSPI, chr),
+     DEFINE_PROP_UINT8("default-mode", ErbiumXSPI, default_mode, 3),
+     DEFINE_PROP_INT32("latency-bytes", ErbiumXSPI, latency_bytes_override, -1),
+-    DEFINE_PROP_BOOL("strict", ErbiumXSPI, strict, false),
++    DEFINE_PROP_BOOL("sfdp-pad-quirk", ErbiumXSPI, sfdp_pad_quirk, true),
+     DEFINE_PROP_BOOL("ext-check", ErbiumXSPI, ext_check, false),
+ };
+ 
+diff --git a/hw/ssi/trace-events b/hw/ssi/trace-events
+index b89814f..72f7e19 100644
+--- a/hw/ssi/trace-events
++++ b/hw/ssi/trace-events
+@@ -74,3 +74,4 @@ erbium_xspi_sccr_read(unsigned off, uint32_t val) "sccr[0x%02x] -> 0x%08x"
+ erbium_xspi_sccr_write(unsigned off, uint32_t val) "sccr[0x%02x] <- 0x%08x"
+ erbium_xspi_axi_error(uint8_t op, uint64_t addr, int st) "op 0x%02x addr 0x%" PRIx64 " status %d"
+ erbium_xspi_backend(uint16_t op, uint64_t addr, uint32_t len, uint32_t st) "op %u addr 0x%" PRIx64 " len %u status %u"
++erbium_xspi_underflow(uint32_t addr, unsigned burst) "read past AXI burst: addr 0x%08x burst %u bytes"
+diff --git a/include/hw/ssi/erbium-xspi.h b/include/hw/ssi/erbium-xspi.h
+index 5aa7bc5..a9a79ff 100644
+--- a/include/hw/ssi/erbium-xspi.h
++++ b/include/hw/ssi/erbium-xspi.h
+@@ -6,11 +6,15 @@
+  * JESD251C-style command sequences.  Lane width / DTR are modelled as
+  * logical protocol state; bytes still move through QEMU's SSI abstraction.
+  *
++ * Behaviour follows the RTL (ip/xspi/bsv/xspi.bsv in core-et-erbium); see
++ * docs/rtl-xspi-findings.md in the erbium-emu repository.
++ *
+  * This work is licensed under the terms of the GNU GPL, version 2 or later.
+  */
+ #ifndef HW_SSI_ERBIUM_XSPI_H
+ #define HW_SSI_ERBIUM_XSPI_H
+ 
++#include "qemu/units.h"
+ #include "hw/ssi/ssi.h"
+ #include "chardev/char-fe.h"
+ #include "system/hostmem.h"
+@@ -21,7 +25,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(ErbiumXSPI, ERBIUM_XSPI)
+ 
+ #define ERBIUM_MRAM_SIZE        (16 * MiB)
+ 
+-/* xSPI opcodes (Erbium TRM, "XSPI Datasheet") */
++/* xSPI opcodes (xSPITypes.bsv command tables) */
+ #define ERB_OP_NOP              0x00
+ #define ERB_OP_WRITE_MEM        0x02
+ #define ERB_OP_READ_MEM         0x0B
+@@ -31,10 +35,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(ErbiumXSPI, ERBIUM_XSPI)
+ #define ERB_OP_WRITE_REG        0x71
+ #define ERB_OP_RESET            0x99
+ 
+-/* setRate encodings */
++/* setRate encodings (xSPITypes.bsv Rate enum) */
+ enum ErbiumRate {
+     ERB_RATE_S1 = 0,
+     ERB_RATE_D1 = 1,
++    ERB_RATE_S2 = 2,    /* no datapath in RTL */
++    ERB_RATE_D2 = 3,    /* no datapath in RTL */
+     ERB_RATE_S4 = 4,
+     ERB_RATE_D4 = 5,
+     ERB_RATE_S8 = 6,
+@@ -52,6 +58,7 @@ enum ErbiumRate {
+ #define ERB_SCCR_INT_STATUS     0x30
+ #define ERB_SCCR_SIZE           0x38
+ #define ERB_SCCR_NREGS          (ERB_SCCR_SIZE / 8)
++#define ERB_SCCR_ADDR_MASK      0x3f    /* decoder uses addr[5:0] */
+ 
+ /* CFG fields */
+ #define ERB_CFG_BURST_LENGTH_MASK       0x3
+@@ -63,17 +70,21 @@ enum ErbiumRate {
+ #define ERB_CFG_BURST_ENABLE            (1 << 16)
+ #define ERB_CFG_ULTRA_DEEP_PD           (1 << 17)
+ 
+-/* interrupt_status fields */
++/* xspi_status / interrupt_status fields */
++#define ERB_STATUS_WIP                  (1 << 0)
+ #define ERB_INT_AXI_RESP_MASK           0x3
+ #define ERB_INT_READ_UNDERFLOW          (1 << 2)
+ #define ERB_INT_WRITE_OVERFLOW          (1 << 3)
+ 
+-/* Backend protocol status codes (docs/protocol.md) */
++/* Backend protocol status codes (docs/protocol.md) == AXI responses */
+ #define ERB_ST_OK       0
+ #define ERB_ST_SLVERR   2
+ #define ERB_ST_DECERR   3
+ #define ERB_ST_BADREQ   0x100
+ 
++#define ERB_SFDP_ADDR_MASK      0xfff
++#define ERB_READ_BURST_MAX      128
++
+ typedef enum {
+     ERB_PHASE_CMD = 0,
+     ERB_PHASE_EXT,
+@@ -91,8 +102,6 @@ typedef enum {
+     ERB_TGT_REMOTE,     /* forwarded to backend (or built-in stub) */
+ } ErbiumTarget;
+ 
+-#define ERB_WORD_MAX 8
+-
+ struct ErbiumXSPI {
+     SSIPeripheral parent_obj;
+ 
+@@ -101,14 +110,14 @@ struct ErbiumXSPI {
+     CharFrontend chr;
+     uint8_t default_mode;       /* 2-bit strap: 0=HB 1=Octal 2=Quad 3=SPI */
+     int32_t latency_bytes_override; /* -1: derive from CFG/rates */
+-    bool strict;                /* reject undefined-behaviour sequences */
+-    bool ext_check;             /* verify opcode extension byte */
++    bool sfdp_pad_quirk;        /* RTL streams each SFDP DWORD + 4 zero bytes */
++    bool ext_check;             /* warn if Ext byte != opcode */
+ 
+     /* storage */
+     uint8_t *mram;              /* ERBIUM_MRAM_SIZE bytes */
+     uint8_t *mram_local;        /* allocated if no memdev */
+-    uint8_t *stub_sysregs;      /* built-in stub when no backend: 0x02000000, 16 KiB */
+-    uint8_t *stub_sram;         /* 0x0200C000, 4 KiB */
++    uint8_t *stub_sysregs;      /* built-in stub when no backend */
++    uint8_t *stub_sram;
+     bool backend_connected;
+ 
+     /* SCCR */
+@@ -121,7 +130,7 @@ struct ErbiumXSPI {
+ 
+     /* current transaction */
+     ErbiumPhase phase;
+-    ErbiumPhase after_ext;      /* phase following the EXT byte */
++    ErbiumPhase after_ext;
+     ErbiumTarget target;
+     uint8_t opcode;
+     uint8_t ext;
+@@ -131,15 +140,22 @@ struct ErbiumXSPI {
+     unsigned latency_bytes;
+     unsigned latency_got;
+     bool is_write;
+-    unsigned word_size;         /* 4 for register ops, 8 for memory ops */
+-    uint64_t cur_addr;          /* address of next data byte */
++    bool is_reg;                /* 32-bit register op (65h/71h) */
++    uint64_t cur_addr;          /* address of next word */
+     uint64_t bytes_done;
+-    uint8_t word[ERB_WORD_MAX];
++
++    /* write path: word assembly */
++    uint8_t word[8];
+     unsigned word_pos;
+-    bool word_valid;            /* read: word[] holds fetched data */
+-    uint8_t last_status;
++    unsigned word_size;
++
++    /* read path: burst buffer (one AXI burst per CS#) */
++    uint8_t burst[ERB_READ_BURST_MAX];
++    unsigned burst_len;
++    unsigned burst_pos;
++    bool burst_valid;
++
+     bool reset_pending;
+-    bool cmd_error;
+ };
+ 
+ /* helpers exported for tests */
+-- 
+2.43.0
+

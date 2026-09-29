@@ -1,0 +1,1032 @@
+From 83006037e17c573fede0d0b4d78e7617dfc52988 Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Tue, 29 Sep 2026 23:13:54 +0000
+Subject: [PATCH 3/4] sw-sysemu(erbium): SocketAgent host API (--api-socket)
+ and --mram-file
+
+Implements the QEMU <-> erbium_emu control protocol v1 (docs/protocol.md)
+as an api_communicate on a listening UNIX socket:
+
+* --api-socket PATH: SocketAgent accepts one client at a time, services
+  all complete requests per main-loop iteration with non-blocking reads
+  and a reassembly buffer (partial and pipelined messages handled).
+  READ/WRITE go through MainMemory with a Noagent, split at region
+  boundaries and into 4/8-byte units in register regions; memory_error
+  -> DECERR, misaligned register access / other exceptions -> SLVERR,
+  bad header/len -> BADREQ (corrupt header also drops the connection).
+  PING returns erb_info{1, 0, 0x40000000, 16MiB, "erbium_emu"}.
+  RESET kind 0 -> sys_emu::por_reset() (sysregs/SCCR + cold/warm reset of
+  the harts, memory preserved), kind 1 -> no-op.
+* --mram-file PATH: back MRAM with the shared file (MmapRegion).
+* api_communicate::keep_alive()/idle_wait(): with the socket the main loop
+  keeps running with no active harts and blocks in poll() for 1 ms per
+  iteration when idle (no timers running) instead of spinning.
+  --api-socket also lifts the default -max_cycles limit and the
+  'need an ELF' check.
+* FATAL chip errors while serving a host take the harts offline
+  (sys_emu::stop_all_harts) instead of ending the emulation; a host POR
+  brings them back.
+* SIGINT/SIGTERM end the emulation cleanly (socket file unlinked).
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ sw-sysemu/CMakeLists.txt                 |   2 +
+ sw-sysemu/sw-sysemu/main.cpp             |  26 +-
+ sw-sysemu/sw-sysemu/socket_agent.cpp     | 531 +++++++++++++++++++++++
+ sw-sysemu/sw-sysemu/socket_agent.h       | 118 +++++
+ sw-sysemu/sys_emu/api_communicate.h      |   8 +
+ sw-sysemu/sys_emu/sys_emu.cpp            |  73 +++-
+ sw-sysemu/sys_emu/sys_emu.h              |  22 +
+ sw-sysemu/sys_emu/sys_emu_parse_args.cpp |  35 ++
+ 8 files changed, 807 insertions(+), 8 deletions(-)
+ create mode 100644 sw-sysemu/sw-sysemu/socket_agent.cpp
+ create mode 100644 sw-sysemu/sw-sysemu/socket_agent.h
+
+diff --git a/sw-sysemu/CMakeLists.txt b/sw-sysemu/CMakeLists.txt
+index d3a15da..2cfd10f 100644
+--- a/sw-sysemu/CMakeLists.txt
++++ b/sw-sysemu/CMakeLists.txt
+@@ -433,6 +433,8 @@ target_sources(sw-erbium PRIVATE
+     devices/sysregs_er.cpp
+     esrs_er.cpp
+     # SW wrapper
++    sw-sysemu/socket_agent.cpp
++    sw-sysemu/socket_agent.h
+ )
+ target_include_directories(sw-erbium
+     PUBLIC
+diff --git a/sw-sysemu/sw-sysemu/main.cpp b/sw-sysemu/sw-sysemu/main.cpp
+index 0b5ec9d..2c5cafe 100644
+--- a/sw-sysemu/sw-sysemu/main.cpp
++++ b/sw-sysemu/sw-sysemu/main.cpp
+@@ -11,6 +11,9 @@
+ #include <memory>
+ 
+ #include "sys_emu.h"
++#if EMU_ERBIUM
++#include "socket_agent.h"
++#endif
+ 
+ int main(int argc, char *argv[])
+ {
+@@ -62,6 +65,27 @@ int main(int argc, char *argv[])
+         return EXIT_FAILURE;
+     }
+ 
++#if EMU_ERBIUM
++    SocketAgent* socket_agent = nullptr;
++    if (!cmd_options.api_socket_path.empty()) {
++        try {
++            socket_agent = new SocketAgent(cmd_options.api_socket_path);
++        } catch (const std::exception& e) {
++            std::cerr << "erbium_emu: " << e.what() << std::endl;
++            return EXIT_FAILURE;
++        }
++        api_comm.reset(socket_agent);
++    }
++#endif
++
+     auto emu = std::make_unique<sys_emu>(cmd_options, api_comm.get());
+-    return emu.get()->main_internal();
++#if EMU_ERBIUM
++    if (socket_agent) {
++        socket_agent->set_emu(emu.get());
++    }
++#endif
++    int rv = emu.get()->main_internal();
++    // Tear the emulator down before the API listener it references
++    emu.reset();
++    return rv;
+ }
+diff --git a/sw-sysemu/sw-sysemu/socket_agent.cpp b/sw-sysemu/sw-sysemu/socket_agent.cpp
+new file mode 100644
+index 0000000..6418ff5
+--- /dev/null
++++ b/sw-sysemu/sw-sysemu/socket_agent.cpp
+@@ -0,0 +1,531 @@
++/*-------------------------------------------------------------------------
++* Copyright (c) 2026 Ainekko, Co.
++* SPDX-License-Identifier: Apache-2.0
++*-------------------------------------------------------------------------*/
++
++#include "socket_agent.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <cinttypes>
++#include <csignal>
++#include <cstring>
++#include <iostream>
++#include <stdexcept>
++
++#include <fcntl.h>
++#include <poll.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++#include "emu_gio.h"
++#include "memory/main_memory.h"
++#include "memory/memory_error.h"
++#include "sys_emu.h"
++#include "system.h"
++
++#include <hwinc/top.h>
++
++namespace {
++
++volatile sig_atomic_t g_stop_requested = 0;
++
++void stop_signal_handler(int)
++{
++    g_stop_requested = 1;
++}
++
++void install_stop_handlers()
++{
++    struct sigaction sa;
++    std::memset(&sa, 0, sizeof(sa));
++    sa.sa_handler = stop_signal_handler;
++    sigemptyset(&sa.sa_mask);
++    sa.sa_flags = 0; // no SA_RESTART: interrupt a blocking poll()
++    sigaction(SIGINT, &sa, nullptr);
++    sigaction(SIGTERM, &sa, nullptr);
++    // Writing to a socket whose peer has gone must not kill the emulator
++    signal(SIGPIPE, SIG_IGN);
++}
++
++void set_nonblocking(int fd)
++{
++    int flags = fcntl(fd, F_GETFL, 0);
++    if (flags >= 0)
++        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
++}
++
++} // namespace
++
++
++SocketAgent::SocketAgent(const std::string& path)
++    : path_(path)
++{
++    struct sockaddr_un addr;
++    if (path.size() >= sizeof(addr.sun_path)) {
++        throw std::runtime_error("SocketAgent: socket path too long: " + path);
++    }
++
++    listen_fd_ = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
++    if (listen_fd_ < 0) {
++        throw std::runtime_error(std::string("SocketAgent: socket(): ") + std::strerror(errno));
++    }
++
++    // Remove a stale socket file from a previous run
++    ::unlink(path.c_str());
++
++    std::memset(&addr, 0, sizeof(addr));
++    addr.sun_family = AF_UNIX;
++    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
++    if (::bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
++        int err = errno;
++        ::close(listen_fd_);
++        listen_fd_ = -1;
++        throw std::runtime_error("SocketAgent: bind('" + path + "'): " + std::strerror(err));
++    }
++    if (::listen(listen_fd_, 1) != 0) {
++        int err = errno;
++        ::close(listen_fd_);
++        listen_fd_ = -1;
++        ::unlink(path.c_str());
++        throw std::runtime_error("SocketAgent: listen(): " + std::string(std::strerror(err)));
++    }
++    set_nonblocking(listen_fd_);
++
++    rx_buf_.reserve(sizeof(erb_msg_hdr) + ERB_MAX_LEN);
++    tx_buf_.reserve(sizeof(erb_msg_hdr) + ERB_MAX_LEN);
++
++    install_stop_handlers();
++}
++
++
++SocketAgent::~SocketAgent()
++{
++    drop_client();
++    if (listen_fd_ >= 0) {
++        ::close(listen_fd_);
++        listen_fd_ = -1;
++    }
++    ::unlink(path_.c_str());
++}
++
++
++void SocketAgent::set_system(bemu::System* system)
++{
++    chip_ = system;
++    agent_ = std::make_unique<bemu::Noagent>(chip_, "SocketAgent");
++    LOG_AGENT(INFO, *agent_, "Listening on UNIX socket \"%s\"", path_.c_str());
++}
++
++
++bool SocketAgent::raise_host_interrupt(uint32_t)
++{
++    // No out-of-band host event line in protocol v1 (host polls Mailbox1)
++    return false;
++}
++
++
++bool SocketAgent::host_memory_read(uint64_t, uint64_t, void*)
++{
++    // Erbium has no DMA into host memory
++    return false;
++}
++
++
++bool SocketAgent::host_memory_write(uint64_t, uint64_t, const void*)
++{
++    return false;
++}
++
++
++void SocketAgent::notify_iatu_ctrl_2_reg_write(int, uint32_t, uint32_t)
++{
++}
++
++
++// Called by testLog on a FATAL message (the message itself has already been
++// printed). Standalone sys_emu ends the simulation here; when serving a host
++// we behave like wedged silicon instead: the harts go offline and the socket
++// keeps being served so the host can inspect state and issue a POR.
++// Note: this runs from inside the logger, possibly in the middle of the hart
++// loop, so it must not log through testLog nor unlink harts synchronously.
++// testLog keeps its fatal flag set forever, so this is invoked again for
++// every later message: only react when there is something to stop.
++void SocketAgent::notify_fatal_error(const std::string& error)
++{
++    if (emu_) {
++        if (emu_->stop_all_harts()) {
++            std::cerr << "erbium_emu: fatal error in chip model" << (error.empty() ? "" : ": ") << error
++                      << " - harts taken offline, still serving " << path_ << std::endl;
++        }
++    } else if (chip_) {
++        chip_->set_emu_done(true, true);
++    }
++}
++
++
++// ---------------------------------------------------------------------------
++// Connection handling
++// ---------------------------------------------------------------------------
++
++void SocketAgent::accept_client()
++{
++    int fd = ::accept4(listen_fd_, nullptr, nullptr, SOCK_CLOEXEC);
++    if (fd < 0) {
++        return; // EAGAIN or transient error: try again next iteration
++    }
++    set_nonblocking(fd);
++    client_fd_ = fd;
++    rx_buf_.clear();
++    if (agent_) {
++        LOG_AGENT(INFO, *agent_, "%s", "Host connected");
++    }
++}
++
++
++void SocketAgent::drop_client()
++{
++    if (client_fd_ >= 0) {
++        ::close(client_fd_);
++        client_fd_ = -1;
++        rx_buf_.clear();
++        if (agent_) {
++            LOG_AGENT(INFO, *agent_, "%s", "Host disconnected");
++        }
++    }
++}
++
++
++// Pull everything currently readable into rx_buf_. Returns false when the
++// peer closed the connection or a hard error occurred.
++bool SocketAgent::read_client()
++{
++    for (;;) {
++        uint8_t tmp[8192];
++        ssize_t n = ::recv(client_fd_, tmp, sizeof(tmp), 0);
++        if (n > 0) {
++            rx_buf_.insert(rx_buf_.end(), tmp, tmp + n);
++            // Service what we have before reading more, keeping the
++            // reassembly buffer small.
++            handle_requests();
++            if (client_fd_ < 0) {
++                return false;
++            }
++            continue;
++        }
++        if (n == 0) {
++            return false; // orderly shutdown
++        }
++        if (errno == EINTR) {
++            continue;
++        }
++        if (errno == EAGAIN || errno == EWOULDBLOCK) {
++            return true;
++        }
++        return false;
++    }
++}
++
++
++void SocketAgent::process()
++{
++    if (g_stop_requested) {
++        g_stop_requested = 0;
++        if (agent_) {
++            LOG_AGENT(INFO, *agent_, "%s", "Stop requested by signal");
++        }
++        if (chip_) {
++            chip_->set_emu_done(true);
++        }
++        return;
++    }
++
++    if (client_fd_ < 0) {
++        accept_client();
++        if (client_fd_ < 0) {
++            return;
++        }
++    }
++
++    if (!read_client()) {
++        drop_client();
++    }
++}
++
++
++void SocketAgent::idle_wait()
++{
++    struct pollfd pfd;
++    pfd.fd = (client_fd_ >= 0) ? client_fd_ : listen_fd_;
++    pfd.events = POLLIN;
++    pfd.revents = 0;
++    if (pfd.fd < 0) {
++        return;
++    }
++    // Block for up to 1 ms; readiness is serviced by the next process().
++    ::poll(&pfd, 1, 1);
++}
++
++
++// ---------------------------------------------------------------------------
++// Protocol
++// ---------------------------------------------------------------------------
++
++void SocketAgent::handle_requests()
++{
++    size_t pos = 0;
++    while (client_fd_ >= 0 && rx_buf_.size() - pos >= sizeof(erb_msg_hdr)) {
++        erb_msg_hdr hdr;
++        std::memcpy(&hdr, rx_buf_.data() + pos, sizeof(hdr));
++
++        if (hdr.magic != ERB_MAGIC || hdr.version != ERB_VERSION || hdr.len > ERB_MAX_LEN) {
++            // We cannot resynchronise a stream with a corrupt header: answer
++            // BADREQ and drop the connection.
++            if (agent_) {
++                LOG_AGENT(WARN, *agent_, "Bad request header (magic=0x%08" PRIx32
++                          " version=%u op=%u len=%u): dropping client",
++                          hdr.magic, hdr.version, hdr.op, hdr.len);
++            }
++            send_response(hdr.op, ERB_ST_BADREQ, hdr.addr, nullptr, 0);
++            drop_client();
++            return;
++        }
++
++        uint32_t payload_len = (hdr.op == ERB_OP_WRITE) ? hdr.len : 0;
++        if (rx_buf_.size() - pos < sizeof(hdr) + payload_len) {
++            break; // partial message: wait for more data
++        }
++
++        handle_request(hdr, rx_buf_.data() + pos + sizeof(hdr));
++        pos += sizeof(hdr) + payload_len;
++    }
++    if (pos > 0 && client_fd_ >= 0) {
++        rx_buf_.erase(rx_buf_.begin(), rx_buf_.begin() + pos);
++    }
++}
++
++
++void SocketAgent::handle_request(const erb_msg_hdr& hdr, const uint8_t* payload)
++{
++    ++requests_;
++    switch (hdr.op) {
++    case ERB_OP_PING: {
++        erb_info info;
++        std::memset(&info, 0, sizeof(info));
++        info.proto_version = ERB_VERSION;
++        info.flags = 0;
++        info.mram_base = ERBIUM_TOP_MRAM_BASE;
++        info.mram_size = ERBIUM_TOP_MRAM_SIZE;
++        std::strncpy(info.name, "erbium_emu", sizeof(info.name) - 1);
++        send_response(hdr.op, ERB_ST_OK, 0, &info, sizeof(info));
++        break;
++    }
++
++    case ERB_OP_READ: {
++        if (hdr.len < 1 || hdr.len > ERB_MAX_LEN) {
++            send_response(hdr.op, ERB_ST_BADREQ, hdr.addr, nullptr, 0);
++            break;
++        }
++        uint8_t data[ERB_MAX_LEN];
++        uint32_t st = do_read(hdr.addr, hdr.len, data);
++        if (st == ERB_ST_OK) {
++            send_response(hdr.op, st, hdr.addr, data, hdr.len);
++        } else {
++            send_response(hdr.op, st, hdr.addr, nullptr, 0);
++        }
++        break;
++    }
++
++    case ERB_OP_WRITE: {
++        if (hdr.len < 1 || hdr.len > ERB_MAX_LEN) {
++            send_response(hdr.op, ERB_ST_BADREQ, hdr.addr, nullptr, 0);
++            break;
++        }
++        uint32_t st = do_write(hdr.addr, hdr.len, payload);
++        send_response(hdr.op, st, hdr.addr, nullptr, 0);
++        break;
++    }
++
++    case ERB_OP_RESET: {
++        uint32_t st = do_reset(hdr.addr);
++        send_response(hdr.op, st, hdr.addr, nullptr, 0);
++        break;
++    }
++
++    default:
++        if (agent_) {
++            LOG_AGENT(WARN, *agent_, "Unknown request op %u", hdr.op);
++        }
++        send_response(hdr.op, ERB_ST_BADREQ, hdr.addr, nullptr, 0);
++        break;
++    }
++}
++
++
++bool SocketAgent::send_response(uint16_t op, uint32_t status, uint64_t addr,
++                                const void* payload, uint32_t len)
++{
++    if (client_fd_ < 0) {
++        return false;
++    }
++    erb_msg_hdr hdr;
++    hdr.magic = ERB_MAGIC;
++    hdr.version = ERB_VERSION;
++    hdr.op = static_cast<uint16_t>(op | ERB_OP_RESP);
++    hdr.status = status;
++    hdr.len = len;
++    hdr.addr = addr;
++
++    tx_buf_.resize(sizeof(hdr) + len);
++    std::memcpy(tx_buf_.data(), &hdr, sizeof(hdr));
++    if (len) {
++        std::memcpy(tx_buf_.data() + sizeof(hdr), payload, len);
++    }
++    if (!send_all(tx_buf_.data(), tx_buf_.size())) {
++        drop_client();
++        return false;
++    }
++    return true;
++}
++
++
++// Blocking send of the whole buffer on the non-blocking client socket.
++bool SocketAgent::send_all(const void* data, size_t n)
++{
++    const uint8_t* p = static_cast<const uint8_t*>(data);
++    while (n > 0) {
++        ssize_t w = ::send(client_fd_, p, n, MSG_NOSIGNAL);
++        if (w > 0) {
++            p += w;
++            n -= static_cast<size_t>(w);
++            continue;
++        }
++        if (w < 0 && errno == EINTR) {
++            continue;
++        }
++        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++            struct pollfd pfd;
++            pfd.fd = client_fd_;
++            pfd.events = POLLOUT;
++            pfd.revents = 0;
++            if (::poll(&pfd, 1, 1000) <= 0 && errno != EINTR) {
++                return false;
++            }
++            continue;
++        }
++        return false;
++    }
++    return true;
++}
++
++
++// ---------------------------------------------------------------------------
++// Memory access
++// ---------------------------------------------------------------------------
++
++// Walks [addr, addr+n) splitting the access at region boundaries and, inside
++// register regions, into naturally aligned 4/8-byte units that the region
++// accepts. @op(chunk_addr, chunk_len, offset) performs one access.
++template<typename F>
++uint32_t SocketAgent::access(uint64_t addr, uint32_t n, F&& op)
++{
++    if (!chip_ || !agent_) {
++        return ERB_ST_SLVERR;
++    }
++    try {
++        uint64_t cur = addr;
++        uint32_t off = 0;
++        while (off < n) {
++            bemu::MainMemory::addr_type region_last = 0;
++            unsigned sizes = chip_->memory.access_sizes(cur, &region_last);
++            uint64_t remaining = n - off;
++            uint64_t to_end = region_last - cur + 1;
++            uint64_t chunk = std::min<uint64_t>(remaining, to_end);
++
++            if (sizes != 0) {
++                // Register region: pick the largest accepted unit that fits
++                // the alignment of the address and the remaining length.
++                unsigned unit = 0;
++                for (unsigned s = 8; s >= 1; s >>= 1) {
++                    if ((sizes & (1u << s)) && (cur % s) == 0 && (chunk % s) == 0) {
++                        unit = s;
++                        break;
++                    }
++                }
++                if (unit == 0) {
++                    if (agent_) {
++                        LOG_AGENT(WARN, *agent_, "Misaligned/odd-size register access at 0x%" PRIx64
++                                  " (%" PRIu64 " bytes)", cur, chunk);
++                    }
++                    return ERB_ST_SLVERR;
++                }
++                for (uint64_t i = 0; i < chunk; i += unit) {
++                    op(cur + i, unit, off + static_cast<uint32_t>(i));
++                }
++            } else {
++                op(cur, chunk, off);
++            }
++            cur += chunk;
++            off += static_cast<uint32_t>(chunk);
++        }
++        return ERB_ST_OK;
++    }
++    catch (const bemu::memory_error& e) {
++        if (agent_) {
++            LOG_AGENT(WARN, *agent_, "Host access to unmapped address 0x%" PRIx64, e.addr);
++        }
++        return ERB_ST_DECERR;
++    }
++    catch (const std::exception& e) {
++        if (agent_) {
++            LOG_AGENT(WARN, *agent_, "Host access at 0x%" PRIx64 " failed: %s", addr, e.what());
++        }
++        return ERB_ST_SLVERR;
++    }
++}
++
++
++uint32_t SocketAgent::do_read(uint64_t addr, uint32_t n, uint8_t* out)
++{
++    return access(addr, n, [&](uint64_t a, uint64_t len, uint32_t off) {
++        chip_->memory.read(*agent_, a, len, out + off);
++    });
++}
++
++
++uint32_t SocketAgent::do_write(uint64_t addr, uint32_t n, const uint8_t* in)
++{
++    return access(addr, n, [&](uint64_t a, uint64_t len, uint32_t off) {
++        chip_->memory.write(*agent_, a, len, in + off);
++    });
++}
++
++
++uint32_t SocketAgent::do_reset(uint64_t kind)
++{
++    switch (kind) {
++    case 0: // POR: whole chip
++        if (emu_) {
++            try {
++                emu_->por_reset();
++            }
++            catch (const std::exception& e) {
++                if (agent_) {
++                    LOG_AGENT(ERR, *agent_, "POR reset failed: %s", e.what());
++                }
++                return ERB_ST_SLVERR;
++            }
++        } else if (agent_) {
++            LOG_AGENT(WARN, *agent_, "%s", "POR reset requested but no driver attached: ignored");
++        }
++        return ERB_ST_OK;
++    case 1: // xSPI-only: nothing to do on the CPU side
++        return ERB_ST_OK;
++    default:
++        if (agent_) {
++            LOG_AGENT(WARN, *agent_, "Unknown reset kind %" PRIu64, kind);
++        }
++        return ERB_ST_BADREQ;
++    }
++}
+diff --git a/sw-sysemu/sw-sysemu/socket_agent.h b/sw-sysemu/sw-sysemu/socket_agent.h
+new file mode 100644
+index 0000000..cf2736b
+--- /dev/null
++++ b/sw-sysemu/sw-sysemu/socket_agent.h
+@@ -0,0 +1,118 @@
++/*-------------------------------------------------------------------------
++* Copyright (c) 2026 Ainekko, Co.
++* SPDX-License-Identifier: Apache-2.0
++*-------------------------------------------------------------------------*/
++
++#ifndef _SOCKET_AGENT_H_
++#define _SOCKET_AGENT_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "api_communicate.h"
++#include "agent.h"
++
++class sys_emu;
++
++namespace bemu {
++class System;
++}
++
++// api_communicate implementation that serves the QEMU <-> erbium_emu control
++// protocol (docs/protocol.md) over a listening UNIX stream socket.
++//
++// The host (QEMU's erbium-xspi device) is the only requester; every request
++// is answered synchronously from process(), which the emulator main loop
++// calls once per iteration. Requests are memory accesses in the CPU address
++// map, forwarded to bemu::MainMemory with a Noagent, plus PING and RESET.
++class SocketAgent : public api_communicate {
++public:
++    // Protocol constants (keep in sync with docs/protocol.md)
++    static constexpr uint32_t ERB_MAGIC      = 0x42524555; // 'UERB'
++    static constexpr uint16_t ERB_VERSION    = 1;
++    static constexpr uint16_t ERB_OP_PING    = 1;
++    static constexpr uint16_t ERB_OP_READ    = 2;
++    static constexpr uint16_t ERB_OP_WRITE   = 3;
++    static constexpr uint16_t ERB_OP_RESET   = 4;
++    static constexpr uint16_t ERB_OP_RESP    = 0x8000;
++    static constexpr uint32_t ERB_ST_OK      = 0;
++    static constexpr uint32_t ERB_ST_SLVERR  = 2;
++    static constexpr uint32_t ERB_ST_DECERR  = 3;
++    static constexpr uint32_t ERB_ST_BADREQ  = 0x100;
++    static constexpr uint32_t ERB_MAX_LEN    = 4096;
++
++    struct erb_msg_hdr {
++        uint32_t magic;
++        uint16_t version;
++        uint16_t op;
++        uint32_t status;
++        uint32_t len;
++        uint64_t addr;
++    };
++    static_assert(sizeof(erb_msg_hdr) == 24, "erb_msg_hdr must be 24 bytes");
++
++    struct erb_info {
++        uint32_t proto_version;
++        uint32_t flags;
++        uint64_t mram_base;
++        uint64_t mram_size;
++        char     name[32];
++    };
++    static_assert(sizeof(erb_info) == 56, "erb_info must be 56 bytes");
++
++    // Creates the listening socket at @path (a stale socket file is removed
++    // first). Throws std::runtime_error on failure.
++    explicit SocketAgent(const std::string& path);
++    ~SocketAgent() override;
++
++    SocketAgent(const SocketAgent&) = delete;
++    SocketAgent& operator=(const SocketAgent&) = delete;
++
++    // The driver is needed for RESET (POR); optional.
++    void set_emu(sys_emu* emu) { emu_ = emu; }
++
++    // api_communicate interface
++    void set_system(bemu::System* system) override;
++    void process() override;
++    bool raise_host_interrupt(uint32_t bitmap) override;
++    bool host_memory_read(uint64_t host_addr, uint64_t size, void* data) override;
++    bool host_memory_write(uint64_t host_addr, uint64_t size, const void* data) override;
++    void notify_iatu_ctrl_2_reg_write(int pcie_id, uint32_t iatu, uint32_t value) override;
++    void notify_fatal_error(const std::string& error) override;
++    bool keep_alive() const override { return true; }
++    void idle_wait() override;
++
++    const std::string& path() const { return path_; }
++    bool has_client() const { return client_fd_ >= 0; }
++
++private:
++    void accept_client();
++    void drop_client();
++    bool read_client();          // returns false if the client went away
++    void handle_requests();      // consume all complete requests in rx_buf_
++    void handle_request(const erb_msg_hdr& hdr, const uint8_t* payload);
++    bool send_response(uint16_t op, uint32_t status, uint64_t addr,
++                       const void* payload, uint32_t len);
++    bool send_all(const void* data, size_t n);
++
++    // Memory access with splitting; returns an ERB_ST_* code
++    uint32_t do_read(uint64_t addr, uint32_t n, uint8_t* out);
++    uint32_t do_write(uint64_t addr, uint32_t n, const uint8_t* in);
++    uint32_t do_reset(uint64_t kind);
++    template<typename F> uint32_t access(uint64_t addr, uint32_t n, F&& op);
++
++    std::string   path_;
++    int           listen_fd_ = -1;
++    int           client_fd_ = -1;
++    bemu::System* chip_ = nullptr;
++    sys_emu*      emu_ = nullptr;
++    std::unique_ptr<bemu::Noagent> agent_;
++    std::vector<uint8_t> rx_buf_;
++    std::vector<uint8_t> tx_buf_;
++    uint64_t      requests_ = 0;
++};
++
++#endif // _SOCKET_AGENT_H_
+diff --git a/sw-sysemu/sys_emu/api_communicate.h b/sw-sysemu/sys_emu/api_communicate.h
+index 53dba1d..0d00137 100644
+--- a/sw-sysemu/sys_emu/api_communicate.h
++++ b/sw-sysemu/sys_emu/api_communicate.h
+@@ -25,6 +25,14 @@ public:
+     virtual bool host_memory_write(uint64_t host_addr, uint64_t size, const void *data) = 0;
+     virtual void notify_iatu_ctrl_2_reg_write(int pcie_id, uint32_t iatu, uint32_t value) = 0;
+     virtual void notify_fatal_error(const std::string& = "") = 0;
++
++    // Return true if the main loop must keep running (and calling process())
++    // even when there are no active or sleeping harts.
++    virtual bool keep_alive() const { return false; }
++
++    // Called by the main loop when keep_alive() is set and no hart is active;
++    // may block for a short time waiting for host activity.
++    virtual void idle_wait() { }
+ };
+ 
+ #endif // _API_COMMUNICATE_
+diff --git a/sw-sysemu/sys_emu/sys_emu.cpp b/sw-sysemu/sys_emu/sys_emu.cpp
+index 3ecbb69..f4477c1 100644
+--- a/sw-sysemu/sys_emu/sys_emu.cpp
++++ b/sw-sysemu/sys_emu/sys_emu.cpp
+@@ -257,10 +257,22 @@ sys_emu::sys_emu(const sys_emu_cmd_options &cmd_options, api_communicate *api_co
+     single_step.reset();
+ 
+     if (cmd_options.elf_files.empty() && cmd_options.file_load_files.empty() &&
+-        cmd_options.mem_desc_file.empty() && cmd_options.api_comm_path.empty() && g_preload->empty()) {
++        cmd_options.mem_desc_file.empty() && cmd_options.api_comm_path.empty() && g_preload->empty()
++#if EMU_ERBIUM
++        && cmd_options.api_socket_path.empty()
++#endif
++        ) {
+         LOG_AGENT(FTL, agent, "%s", "Need an ELF file, a file load, a mem_desc file or runtime API!");
+     }
+ 
++#if EMU_ERBIUM
++    // Must be set before chip.init() creates the memory regions
++    chip.memory.mram_file = cmd_options.mram_file;
++    if (!cmd_options.mram_file.empty()) {
++        LOG_AGENT(INFO, agent, "MRAM backed by file \"%s\"", cmd_options.mram_file.c_str());
++    }
++#endif
++
+     // Init emu
+     chip.init(bemu::System::Stepping::A0);
+     memcpy(&chip.memory_reset_value, &cmd_options.mem_reset, MEM_RESET_PATTERN_SIZE);
+@@ -459,6 +471,47 @@ sys_emu::sys_emu(const sys_emu_cmd_options &cmd_options, api_communicate *api_co
+         api_listener->set_system(&chip);
+     }
+ 
++    reset_chip();
++
++    // Initialize xregs passed to command line
++    for (auto &info: cmd_options.set_xreg) {
++        chip.cpu[info.thread].xregs[info.xreg] = info.value;
++    }
++}
++
++
++#if EMU_ERBIUM
++void sys_emu::por_reset()
++{
++    LOG_AGENT(INFO, agent, "%s", "Power-on reset requested by host");
++    // Awaking harts are still linked in a list; fold them back first so the
++    // reset below sees consistent hart lists.
++    chip.active.splice(chip.active.cend(), chip.awaking);
++    chip.memory.por_reset();
++    reset_chip();
++}
++
++
++bool sys_emu::stop_all_harts()
++{
++    // No logging here: this may be called from within the logger itself
++    bool stopped = false;
++    for (auto& hart : chip.cpu) {
++        if (!hart.is_nonexistent() && !hart.is_unavailable()) {
++            // Only marks pending_unlink: safe to call from inside the hart loop
++            hart.become_unavailable();
++            stopped = true;
++        }
++    }
++    return stopped;
++}
++#endif
++
++
++// Cold reset + simulation configuration + warm reset, i.e. everything that
++// brings the harts out of reset at the configured PC.
++void sys_emu::reset_chip()
++{
+     // Reset the cold-reset part of the system
+     chip.cold_reset();
+ 
+@@ -492,11 +545,6 @@ sys_emu::sys_emu(const sys_emu_cmd_options &cmd_options, api_communicate *api_co
+         chip.begin_warm_reset(shire);
+         chip.end_warm_reset(shire);
+     }
+-
+-    // Initialize xregs passed to command line
+-    for (auto &info: cmd_options.set_xreg) {
+-        chip.cpu[info.thread].xregs[info.xreg] = info.value;
+-    }
+ }
+ 
+ 
+@@ -527,10 +575,15 @@ int sys_emu::main_internal() {
+     double total_time = 0.0;
+     const auto start_time = std::chrono::high_resolution_clock::now();
+ 
++    // With an API listener that wants to keep serving (e.g. the QEMU socket
++    // backend) the emulator runs until told to stop, even with no harts.
++    const bool keep_alive = (api_listener != nullptr) && api_listener->keep_alive();
++
+     // While there are active threads or the network emulator is still not done
+     while (!chip.get_emu_done()
+            && (emu_cycle < cmd_options.max_cycles)
+            && (chip.has_active_harts()
++               || keep_alive
+                || (chip.has_sleeping_harts()
+                    && ((api_listener != nullptr)
+                        || chip.timers_active()))))
+@@ -567,9 +620,15 @@ int sys_emu::main_internal() {
+             }
+         }
+ 
+-        // Runtime API: Process new commands
++        // Runtime API: Process new commands. When nothing is running the
++        // listener may block for a short while instead of busy looping.
+         if (api_listener) {
+             api_listener->process();
++            // (Not while a timer is counting: sleeping harts waiting on the
++            // rvtimer would otherwise wake up at 1 cycle/ms.)
++            if (keep_alive && !chip.has_active_harts() && !chip.timers_active()) {
++                api_listener->idle_wait();
++            }
+         }
+ 
+         // Update peripherals/devices
+diff --git a/sw-sysemu/sys_emu/sys_emu.h b/sw-sysemu/sys_emu/sys_emu.h
+index eb31f91..ab913e2 100644
+--- a/sw-sysemu/sys_emu/sys_emu.h
++++ b/sw-sysemu/sys_emu/sys_emu.h
+@@ -172,6 +172,13 @@ struct sys_emu_cmd_options {
+ #endif
+ 
+     std::string otp_load_file;
++
++#if EMU_ERBIUM
++    // File backing MRAM (shared with e.g. QEMU); empty: in-process memory
++    std::string mram_file;
++    // UNIX socket path served by SocketAgent; empty: no host API
++    std::string api_socket_path;
++#endif
+ };
+ 
+ class api_communicate;
+@@ -265,6 +272,19 @@ public:
+ 
+     api_communicate* get_api_communicate() { return api_listener; }
+ 
++#if EMU_ERBIUM
++    // Power-on reset of the whole chip requested by the host: registers and
++    // harts come back to their initial state (same sequence as construction)
++    // while memory contents (ROM, SRAM, MRAM) are preserved.
++    SW_SYSEMU_EXPORT void por_reset();
++
++    // Take every hart offline (as if its thread were disabled) without
++    // ending the emulation; used when the chip model hits a fatal error while
++    // serving a host. A subsequent por_reset() brings the harts back.
++    // Returns false if no hart was online (already stopped).
++    SW_SYSEMU_EXPORT bool stop_all_harts();
++#endif
++
+     testLog& get_logger() { return chip.log; }
+ 
+ protected:
+@@ -277,6 +297,8 @@ protected:
+ 
+ private:
+ 
++    void reset_chip();
++
+     struct Addr_range {
+         uint64_t start;
+         uint64_t end;
+diff --git a/sw-sysemu/sys_emu/sys_emu_parse_args.cpp b/sw-sysemu/sys_emu/sys_emu_parse_args.cpp
+index ea94f9e..981b8b2 100644
+--- a/sw-sysemu/sys_emu/sys_emu_parse_args.cpp
++++ b/sw-sysemu/sys_emu/sys_emu_parse_args.cpp
+@@ -56,6 +56,12 @@ static const char * help_msg =
+ "     -set_xreg <t>,<r>,<val>  Sets the xregister (integer) <r> of thread <t> to value <val>. <t> can be 'sp' for the Service Processor\n"
+ #endif // SDK_RELEASE
+ "     -max_cycles <cycles>     Stops execution after provided number of cycles (default: 10M)\n"
++#if EMU_ERBIUM
++"     --mram-file <path>       Back MRAM with a MAP_SHARED mapping of <path> (created/grown to 16MiB if needed)\n"
++"     --api-socket <path>      Listen on UNIX socket <path> and serve host READ/WRITE/RESET/PING requests\n"
++"                              (see docs/protocol.md). Implies keep-alive with no active harts and, unless\n"
++"                              -max_cycles is given, no cycle limit\n"
++#endif
+ #ifndef SDK_RELEASE
+ "     -mem_reset <byte>        Reset value of main memory (default: 0)\n"
+ "     -mem_reset32 <uint32>    Reset value of main memory (default: 0)\n"
+@@ -194,6 +200,12 @@ sys_emu::parse_command_line_arguments(int argc, char* argv[])
+         {"set_xreg",               required_argument, nullptr, 0},
+ #endif
+         {"max_cycles",             required_argument, nullptr, 0},
++#if EMU_ERBIUM
++        {"mram-file",              required_argument, nullptr, 0},
++        {"mram_file",              required_argument, nullptr, 0},
++        {"api-socket",             required_argument, nullptr, 0},
++        {"api_socket",             required_argument, nullptr, 0},
++#endif
+ #ifndef SDK_RELEASE
+         {"mem_reset",              required_argument, nullptr, 0},
+         {"mem_reset32",            required_argument, nullptr, 0},
+@@ -261,6 +273,8 @@ sys_emu::parse_command_line_arguments(int argc, char* argv[])
+         {nullptr,                  0,                 nullptr, 0}
+     };
+ 
++    bool max_cycles_given = false;
++
+     while ((opt = getopt_long_only(argc, argv, "", long_options, &index)) != -1) {
+         if (opt == '?') {
+             SE_ERROR("Wrong arguments");
+@@ -296,6 +310,16 @@ sys_emu::parse_command_line_arguments(int argc, char* argv[])
+         {
+             cmd_options.mem_desc_file = optarg;
+         }
++#if EMU_ERBIUM
++        else if (!strcmp(name, "mram-file") || !strcmp(name, "mram_file"))
++        {
++            cmd_options.mram_file = optarg;
++        }
++        else if (!strcmp(name, "api-socket") || !strcmp(name, "api_socket"))
++        {
++            cmd_options.api_socket_path = optarg;
++        }
++#endif
+         else if (!strcmp(name, "l"))
+         {
+             cmd_options.log_en = true;
+@@ -430,6 +454,7 @@ sys_emu::parse_command_line_arguments(int argc, char* argv[])
+         }
+         else if (!strcmp(name, "max_cycles"))
+         {
++            max_cycles_given = true;
+             sscanf(optarg, "%" SCNu64, &cmd_options.max_cycles);
+         }
+         else if (!strcmp(name, "mem_reset"))
+@@ -651,6 +676,16 @@ sys_emu::parse_command_line_arguments(int argc, char* argv[])
+     // Enable logging for all threads if no filter has been specified
+     if (cmd_options.log_thread.none()) cmd_options.log_thread.set();
+ 
++#if EMU_ERBIUM
++    // Serving a host over the API socket: keep running until killed unless
++    // the user explicitly bounded the run.
++    if (!cmd_options.api_socket_path.empty() && !max_cycles_given) {
++        cmd_options.max_cycles = ~0ull;
++    }
++#else
++    (void) max_cycles_given;
++#endif
++
+     return std::make_pair(true, cmd_options);
+ }
+ 
+-- 
+2.43.0
+

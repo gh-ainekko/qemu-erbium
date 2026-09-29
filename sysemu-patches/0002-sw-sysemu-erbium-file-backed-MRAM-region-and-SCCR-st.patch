@@ -1,0 +1,454 @@
+From aca1e613f76820109f432457dfb9bcd714c8bca1 Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Tue, 29 Sep 2026 23:13:54 +0000
+Subject: [PATCH 2/4] sw-sysemu(erbium): file-backed MRAM region and SCCR stub
+
+* memory/mmap_region.h: MmapRegion<Base,N>, a MemoryRegion backed by a
+  MAP_SHARED mapping of a file (created/grown to N if needed, never
+  truncated so contents survive MainMemory::reset()). No reset pattern:
+  it exposes the file contents like non-volatile memory.
+* MainMemory::mram_file: when set, MRAM is an MmapRegion instead of a
+  DenseRegion. The old mapping is dropped before re-mapping on reset.
+* devices/sccr_er.h: SccrEr stub for the xSPI SCCR block at
+  ERBIUM_TOP_XSPI_REGISTERS_BASE (0x40 bytes, 64-bit stride, reset
+  ID0=0x2 CFG=0x1382) so minion firmware touching it does not fault.
+  Real SCCR behaviour lives on the host (QEMU) side.
+* MainMemory::access_sizes(): tells host-side agents what access sizes a
+  region accepts (needed to split arbitrary host accesses).
+* MainMemory::por_reset(): reset sysregs (cause POR) and SCCR without
+  touching memory contents; SysregsEr::reset() made public for that.
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ sw-sysemu/devices/sccr_er.h             | 105 +++++++++++++++++++
+ sw-sysemu/devices/sysregs_er.h          |   2 +
+ sw-sysemu/emu-er.mk                     |   2 +
+ sw-sysemu/memory/erbium/main_memory.cpp |  39 ++++++-
+ sw-sysemu/memory/erbium/main_memory.h   |  23 +++++
+ sw-sysemu/memory/mmap_region.h          | 132 ++++++++++++++++++++++++
+ 6 files changed, 302 insertions(+), 1 deletion(-)
+ create mode 100644 sw-sysemu/devices/sccr_er.h
+ create mode 100644 sw-sysemu/memory/mmap_region.h
+
+diff --git a/sw-sysemu/devices/sccr_er.h b/sw-sysemu/devices/sccr_er.h
+new file mode 100644
+index 0000000..115fec8
+--- /dev/null
++++ b/sw-sysemu/devices/sccr_er.h
+@@ -0,0 +1,105 @@
++/*-------------------------------------------------------------------------
++* Copyright (c) 2026 Ainekko, Co.
++* SPDX-License-Identifier: Apache-2.0
++*-------------------------------------------------------------------------*/
++
++#ifndef BEMU_SCCR_ER_H
++#define BEMU_SCCR_ER_H
++
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <ostream>
++#include <stdexcept>
++#include "memory/memory_error.h"
++#include "memory/memory_region.h"
++
++namespace bemu {
++
++
++// Stub for the xSPI target IP "Status and Control Registers" (SCCR) block
++// at ERBIUM_TOP_XSPI_REGISTERS_BASE.
++//
++// The real SCCR behaviour (setRate, WIP, AXI-error reporting, ...) lives on
++// the host/xSPI side (QEMU's erbium-xspi device). This region only exists
++// so that minion firmware touching e.g. xspi_control.interrupt_enable does
++// not hit a memory_error: every register is plain 64-bit-stride storage
++// with the documented reset values.
++//
++// Register map (TRM SCCR_Reg, 64-bit stride, size 0x38):
++//   0x00 ID0              reset 0x2 (mgf_id=2)
++//   0x08 ID1              reset 0x0
++//   0x10 CFG              reset 0x1382 (BurstLength=2, FixedLatency=1,
++//                                       InitialLatency=8, Reserved(11:8)=1,
++//                                       DriveStrength=3)
++//   0x18 xspi_status      reset 0x0
++//   0x20 xspi_control     reset 0x0
++//   0x28 xspi_rates       reset 0x0
++//   0x30 interrupt_status reset 0x0
++//
++// Note: hwinc/top.h sizes the block at 0x1C; the TRM map is 0x38 with 64-bit
++// registers. We cover 0x40 bytes (8 x 64-bit slots, the last one unused).
++template <unsigned long long Base>
++struct SccrEr : public MemoryRegion {
++    using addr_type     = typename MemoryRegion::addr_type;
++    using size_type     = typename MemoryRegion::size_type;
++    using value_type    = typename MemoryRegion::value_type;
++    using pointer       = typename MemoryRegion::pointer;
++    using const_pointer = typename MemoryRegion::const_pointer;
++
++    static constexpr size_type   SIZE      = 0x40;
++    static constexpr unsigned    NUM_REGS  = SIZE / 8;
++
++    static constexpr size_type ID0              = 0x00;
++    static constexpr size_type ID1              = 0x08;
++    static constexpr size_type CFG              = 0x10;
++    static constexpr size_type XSPI_STATUS      = 0x18;
++    static constexpr size_type XSPI_CONTROL     = 0x20;
++    static constexpr size_type XSPI_RATES       = 0x28;
++    static constexpr size_type INTERRUPT_STATUS = 0x30;
++
++    static constexpr uint64_t ID0_RESET = 0x2;
++    static constexpr uint64_t CFG_RESET = 0x1382;
++
++    SccrEr() { reset(); }
++
++    void reset() {
++        regs.fill(0);
++        regs[ID0 / 8] = ID0_RESET;
++        regs[CFG / 8] = CFG_RESET;
++    }
++
++    void read(const Agent&, size_type pos, size_type n, pointer result) override {
++        check_access(pos, n);
++        std::memcpy(result, reinterpret_cast<const uint8_t*>(regs.data()) + pos, n);
++    }
++
++    void write(const Agent&, size_type pos, size_type n, const_pointer source) override {
++        check_access(pos, n);
++        std::memcpy(reinterpret_cast<uint8_t*>(regs.data()) + pos, source, n);
++    }
++
++    void init(const Agent&, size_type, size_type, const_pointer) override {
++        throw std::runtime_error("bemu::SccrEr::init()");
++    }
++
++    addr_type first() const override { return Base; }
++    addr_type last() const override { return Base + SIZE - 1; }
++
++    void dump_data(const Agent&, std::ostream&, size_type, size_type) const override { }
++
++    std::array<uint64_t, NUM_REGS> regs{};
++
++private:
++    // Registers are 32/64-bit oriented: accept naturally aligned 4- or 8-byte
++    // accesses that do not cross a 64-bit register boundary.
++    void check_access(size_type pos, size_type n) const {
++        if ((n != 4 && n != 8) || (pos % n) != 0 || (pos / 8) != ((pos + n - 1) / 8) || pos + n > SIZE)
++            throw memory_error(Base + pos);
++    }
++};
++
++
++} // namespace bemu
++
++#endif // BEMU_SCCR_ER_H
+diff --git a/sw-sysemu/devices/sysregs_er.h b/sw-sysemu/devices/sysregs_er.h
+index 3434280..e50565f 100644
+--- a/sw-sysemu/devices/sysregs_er.h
++++ b/sw-sysemu/devices/sysregs_er.h
+@@ -112,7 +112,9 @@ private:
+     // Watchdog device with 4-cycle divider (250MHz from 1GHz system clock)
+     Watchdog<4> watchdog;
+ 
++public:
+     void reset(ResetCause cause = ResetCause::NONE);
++private:
+ 
+     // Static watchdog timeout handler, triggers cold reset
+     static void watchdog_timeout_handler(const Agent& agent) {
+diff --git a/sw-sysemu/emu-er.mk b/sw-sysemu/emu-er.mk
+index 5314032..47bd9f4 100644
+--- a/sw-sysemu/emu-er.mk
++++ b/sw-sysemu/emu-er.mk
+@@ -15,6 +15,7 @@ emu_hdrs := \
+ 	devices/plic_er.h \
+ 	devices/pll.h \
+ 	devices/rvtimer.h \
++	devices/sccr_er.h \
+ 	devices/shakti_uart.h \
+ 	devices/spi.h \
+ 	devices/sysregs_er.h \
+@@ -34,6 +35,7 @@ emu_hdrs := \
+ 	memory/main_memory.h \
+ 	memory/memory_error.h \
+ 	memory/memory_region.h \
++	memory/mmap_region.h \
+ 	memory/scratch_region.h \
+ 	memory/sparse_region.h \
+ 	memory/sysreg_region.h \
+diff --git a/sw-sysemu/memory/erbium/main_memory.cpp b/sw-sysemu/memory/erbium/main_memory.cpp
+index 5da708d..f9f458b 100644
+--- a/sw-sysemu/memory/erbium/main_memory.cpp
++++ b/sw-sysemu/memory/erbium/main_memory.cpp
+@@ -8,9 +8,11 @@
+ #include "devices/plic_er.h"
+ #include "devices/shakti_uart.h"
+ #include "devices/sysregs_er.h"
++#include "devices/sccr_er.h"
+ #include "system.h"
+ #include "memory/sysreg_region.h"
+ #include "memory/dense_region.h"
++#include "memory/mmap_region.h"
+ 
+ namespace bemu {
+ 
+@@ -21,12 +23,47 @@ void MainMemory::reset()
+     regions[uart_idx].reset(new ShaktiUart<region_bases[uart_idx], region_sizes[uart_idx], ER_PLIC_UART0_INTR_ID>());
+     regions[bootrom_idx].reset(new DenseRegion<region_bases[bootrom_idx], region_sizes[bootrom_idx], false>());
+     regions[sram_idx].reset(new DenseRegion<region_bases[sram_idx], region_sizes[sram_idx]>());
+-    regions[dram_idx].reset(new DenseRegion<region_bases[dram_idx], region_sizes[dram_idx]>());
++    regions[sccr_idx].reset(new SccrEr<region_bases[sccr_idx]>());
++    if (mram_file.empty()) {
++        regions[dram_idx].reset(new DenseRegion<region_bases[dram_idx], region_sizes[dram_idx]>());
++    } else {
++        // Drop the previous mapping first so that we never hold two mappings
++        // of the same file.
++        regions[dram_idx].reset();
++        regions[dram_idx].reset(new MmapRegion<region_bases[dram_idx], region_sizes[dram_idx]>(mram_file));
++    }
+     regions[otp_idx].reset(new DenseRegion<region_bases[otp_idx], region_sizes[otp_idx], false>());
+     regions[sysreg_idx].reset(new SysregRegion<region_bases[sysreg_idx], region_sizes[sysreg_idx]>());
+     regions[plic_idx].reset(new ER_PLIC<region_bases[plic_idx], region_sizes[plic_idx]>());
+ }
+ 
++unsigned MainMemory::access_sizes(addr_type addr, addr_type* last) const
++{
++    auto lo = std::lower_bound(regions.cbegin(), regions.cend(), addr, above);
++    if ((lo == regions.cend()) || ((*lo)->first() > addr))
++        throw memory_error(addr);
++    if (last)
++        *last = (*lo)->last();
++    switch (lo - regions.cbegin()) {
++    case erbreg_idx:    // SysregsEr: 32-bit registers, 4 or 8 byte access
++    case sccr_idx:      // SCCR stub: 4 or 8 byte access
++        return (1u << 4) | (1u << 8);
++    case uart_idx:      // ShaktiUart: 32-bit registers
++    case plic_idx:      // PLIC: 32-bit registers, 4 byte access only
++        return (1u << 4);
++    case sysreg_idx:    // ESRs: 64-bit access only
++        return (1u << 8);
++    default:            // DenseRegion / MmapRegion: byte addressable
++        return 0;
++    }
++}
++
++void MainMemory::por_reset()
++{
++    dynamic_cast<SysregsEr<region_bases[erbreg_idx]>*>(regions[erbreg_idx].get())->reset(ResetCause::POR);
++    dynamic_cast<SccrEr<region_bases[sccr_idx]>*>(regions[sccr_idx].get())->reset();
++}
++
+ void MainMemory::wdt_clock_tick(const Agent& agent, uint64_t cycle)
+ {
+     auto ptr = dynamic_cast<SysregsEr<region_bases[erbreg_idx]>*>(regions[erbreg_idx].get());
+diff --git a/sw-sysemu/memory/erbium/main_memory.h b/sw-sysemu/memory/erbium/main_memory.h
+index 644bff3..43f0047 100644
+--- a/sw-sysemu/memory/erbium/main_memory.h
++++ b/sw-sysemu/memory/erbium/main_memory.h
+@@ -11,6 +11,7 @@
+ #include <cstdint>
+ #include <memory>
+ #include <stdexcept>
++#include <string>
+ #include "agent.h"
+ #include "literals.h"
+ #include "memory/memory_error.h"
+@@ -30,6 +31,7 @@ namespace bemu {
+ // | 0x00_0200_4000 | 0x00_0200_4FFF |  4KiB    | UART              |
+ // | 0x00_0200_A000 | 0x00_0200_BFFF |  8KiB    | Boot ROM          |
+ // | 0x00_0200_C000 | 0x00_0200_CFFF |  4KiB    | Scratch SRAM      |
++// | 0x00_0200_F000 | 0x00_0200_F03F |  64B     | xSPI SCCR (stub)  |
+ // | 0x00_4000_0000 | 0x00_40FF_FFFF | 16MiB    | MRAM              |
+ // | 0x00_7FFF_D000 | 0x00_7FFF_FFFF | 12KiB    | OTP (read-only)   |
+ // | 0x00_8000_0000 | 0x00_80FF_FFFF | 16MiB    | ESR Registers     |
+@@ -51,6 +53,7 @@ private:
+         uart_idx,
+         bootrom_idx,
+         sram_idx,
++        sccr_idx,
+         dram_idx,
+         otp_idx,
+         sysreg_idx,
+@@ -65,6 +68,7 @@ private:
+         /* uart    */ ERBIUM_TOP_UART_REGISTERS_BASE,
+         /* bootrom */ ERBIUM_TOP_BOOTROM_BASE,
+         /* sram    */ ERBIUM_TOP_SRAM_BASE,
++        /* sccr    */ ERBIUM_TOP_XSPI_REGISTERS_BASE,
+         /* dram    */ ERBIUM_TOP_MRAM_BASE,
+         /* otp     */ 0x007FFFD000ull,
+         /* sysreg  */ ERBIUM_TOP_CPU_REGISTERS_BASE,
+@@ -77,6 +81,7 @@ private:
+         /* uart    */ 4_KiB,
+         /* bootrom */ ERBIUM_TOP_BOOTROM_SIZE,
+         /* sram    */ ERBIUM_TOP_SRAM_SIZE,
++        /* sccr    */ 0x40, // TRM SCCR map is 0x38 with 64-bit stride (top.h says 0x1C)
+         /* dram    */ ERBIUM_TOP_MRAM_SIZE,
+         /* otp     */ 12_KiB,
+         /* sysreg  */ 16_MiB,
+@@ -86,8 +91,26 @@ private:
+ public:
+     // ----- Public methods -----
+ 
++    // Re-creates all regions. MRAM is a DenseRegion unless mram_file is set,
++    // in which case it is an MmapRegion sharing that file (contents survive
++    // the reset, like real non-volatile memory).
+     void reset();
+ 
++    // Path of the file backing MRAM (empty: use an in-process DenseRegion).
++    // Must be set before the first reset().
++    std::string mram_file;
++
++    // Returns the set of access sizes a host-side agent may use for @addr as
++    // a bit mask (bit s set: naturally aligned s-byte accesses are accepted),
++    // or 0 for byte-addressable memory (any size/alignment). Throws memory_error if
++    // @addr is not mapped.
++    // If @last is not null it receives the last valid address of the region.
++    unsigned access_sizes(addr_type addr, addr_type* last = nullptr) const;
++
++    // Power-on reset of the register blocks (system registers, SCCR stub)
++    // without touching memory contents (ROM, SRAM, MRAM survive).
++    void por_reset();
++
+     void read(const Agent& agent, addr_type addr, size_type n, void* result) {
+         const auto elem = search(addr, n);
+         elem->read(agent, addr - elem->first(), n, reinterpret_cast<pointer>(result));
+diff --git a/sw-sysemu/memory/mmap_region.h b/sw-sysemu/memory/mmap_region.h
+new file mode 100644
+index 0000000..07f1846
+--- /dev/null
++++ b/sw-sysemu/memory/mmap_region.h
+@@ -0,0 +1,132 @@
++/*-------------------------------------------------------------------------
++* Copyright (c) 2026 Ainekko, Co.
++* SPDX-License-Identifier: Apache-2.0
++*-------------------------------------------------------------------------*/
++
++#ifndef BEMU_MMAP_REGION_H
++#define BEMU_MMAP_REGION_H
++
++#include <algorithm>
++#include <cerrno>
++#include <cstring>
++#include <ostream>
++#include <stdexcept>
++#include <string>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include "memory/memory_error.h"
++#include "memory/memory_region.h"
++
++namespace bemu {
++
++
++// A memory region backed by a MAP_SHARED mapping of a file. Used to share
++// non-volatile memory (Erbium MRAM) with another process, e.g. a QEMU
++// memory-backend-file with share=on.
++//
++// The file is created if it does not exist and grown to the region size if
++// it is smaller; an existing file is never truncated, so the contents
++// survive an emulator reset (the region object is re-created on
++// MainMemory::reset(), which simply unmaps and re-maps the same file).
++//
++// The reset pattern (-mem_reset) does not apply: the region exposes the file
++// contents as-is, like real non-volatile memory would.
++template<unsigned long long Base, unsigned long long N, bool Writeable=true>
++struct MmapRegion : public MemoryRegion {
++    using addr_type     = typename MemoryRegion::addr_type;
++    using size_type     = typename MemoryRegion::size_type;
++    using value_type    = typename MemoryRegion::value_type;
++    using pointer       = typename MemoryRegion::pointer;
++    using const_pointer = typename MemoryRegion::const_pointer;
++
++    static_assert(!(Base % 64),
++                  "bemu::MmapRegion must be aligned to 64");
++    static_assert((N > 0) && !(N % 64),
++                  "bemu::MmapRegion size must be a multiple of 64");
++
++    explicit MmapRegion(const std::string& path)
++        : path_(path)
++    {
++        int fd = ::open(path.c_str(), (Writeable ? O_RDWR : O_RDONLY) | O_CREAT | O_CLOEXEC, 0666);
++        if (fd < 0) {
++            throw std::runtime_error("bemu::MmapRegion: cannot open '" + path + "': " + std::strerror(errno));
++        }
++        struct stat st;
++        if (::fstat(fd, &st) != 0) {
++            int err = errno;
++            ::close(fd);
++            throw std::runtime_error("bemu::MmapRegion: fstat '" + path + "': " + std::strerror(err));
++        }
++        if (static_cast<unsigned long long>(st.st_size) < N) {
++            if (!Writeable || ::ftruncate(fd, static_cast<off_t>(N)) != 0) {
++                int err = errno;
++                ::close(fd);
++                throw std::runtime_error("bemu::MmapRegion: cannot grow '" + path + "' to " +
++                                         std::to_string(N) + " bytes: " + std::strerror(err));
++            }
++        }
++        void* p = ::mmap(nullptr, N, PROT_READ | (Writeable ? PROT_WRITE : 0), MAP_SHARED, fd, 0);
++        ::close(fd);
++        if (p == MAP_FAILED) {
++            throw std::runtime_error("bemu::MmapRegion: mmap '" + path + "': " + std::strerror(errno));
++        }
++        data_ = static_cast<pointer>(p);
++    }
++
++    ~MmapRegion() override {
++        if (data_) {
++            ::munmap(data_, N);
++        }
++    }
++
++    MmapRegion(const MmapRegion&) = delete;
++    MmapRegion& operator=(const MmapRegion&) = delete;
++
++    void read(const Agent&, size_type pos, size_type n, pointer result) override {
++        std::copy_n(data_ + pos, n, result);
++    }
++
++    void write(const Agent& agent, size_type pos, size_type n, const_pointer source) override {
++        if (!Writeable)
++            throw memory_error(first() + pos);
++        init(agent, pos, n, source);
++    }
++
++    void init(const Agent&, size_type pos, size_type n, const_pointer source) override {
++        std::copy_n(source, n, data_ + pos);
++    }
++
++    addr_type first() const override { return Base; }
++    addr_type last() const override { return Base + N - 1; }
++
++    void dump_data(const Agent&, std::ostream& os, size_type pos, size_type n) const override {
++        size_type m = (pos >= N) ? 0 : std::min(n, N - pos);
++        if (m > 0) {
++            os.write(reinterpret_cast<const char*>(data_ + pos), m);
++            n -= m;
++        }
++        const char zero = 0;
++        while (n-- > 0)
++            os.write(&zero, 1);
++    }
++
++    // Flush dirty pages to the file (not required for sharing with another
++    // process mapping the same file, only for durability).
++    void sync() const {
++        ::msync(data_, N, MS_SYNC);
++    }
++
++    const std::string& path() const { return path_; }
++    pointer data() { return data_; }
++
++private:
++    std::string path_;
++    pointer     data_ = nullptr;
++};
++
++
++} // namespace bemu
++
++#endif // BEMU_MMAP_REGION_H
+-- 
+2.43.0
+

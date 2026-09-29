@@ -1,0 +1,287 @@
+From 4afc2c95f4f725b78daa020a9898a7458a0c9e5e Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Tue, 29 Sep 2026 23:13:54 +0000
+Subject: [PATCH 4/4] sw-sysemu(erbium): erb_client.py test client and
+ mailbox_worker firmware
+
+tools/erb_client.py (python3, stdlib only) speaks protocol v1:
+  erb_client.py SOCK ping | read ADDR LEN | write ADDR HEX | reset [KIND]
+(commands can be chained with '--').
+
+tests/erbium/host/mailbox_worker.c is a never-terminating minion firmware
+that polls Mailbox0 for jobs (CRC32 / fill of 4 KiB in MRAM) and reports
+in Mailbox1; used to smoke-test the host <-> erbium_emu <-> MRAM-file path.
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ sw-sysemu/tests/erbium/host/mailbox_worker.c |  71 ++++++++
+ sw-sysemu/tools/erb_client.py                | 179 +++++++++++++++++++
+ 2 files changed, 250 insertions(+)
+ create mode 100644 sw-sysemu/tests/erbium/host/mailbox_worker.c
+ create mode 100755 sw-sysemu/tools/erb_client.py
+
+diff --git a/sw-sysemu/tests/erbium/host/mailbox_worker.c b/sw-sysemu/tests/erbium/host/mailbox_worker.c
+new file mode 100644
+index 0000000..d5d8ff6
+--- /dev/null
++++ b/sw-sysemu/tests/erbium/host/mailbox_worker.c
+@@ -0,0 +1,71 @@
++/*-------------------------------------------------------------------------
++* Copyright (c) 2026 Ainekko, Co.
++* SPDX-License-Identifier: Apache-2.0
++*-------------------------------------------------------------------------*/
++
++/*
++* Host-driven "compute engine" smoke firmware for the QEMU/xSPI backend.
++*
++* Loop forever:
++*   wait for Mailbox0 != 0            (host writes a job word)
++*   job = Mailbox0; Mailbox0 = 0
++*   job[31:24] = opcode, job[15:0] = offset in MRAM in 256-byte units
++*     opcode 1: CRC32 of 4 KiB at MRAM+offset -> Mailbox1
++*     opcode 2: fill 4 KiB at MRAM+offset with byte job[23:16] -> Mailbox1 = 1
++*   any other: Mailbox1 = 0xBAD00000 | opcode
++*
++* The host talks to the sysregs through erbium_emu's API socket
++* (tools/erb_client.py) and to MRAM through the shared --mram-file.
++*
++* Unlike the regular tests this never terminates: it is meant to be run
++* under erbium_emu --api-socket, which keeps serving while harts poll.
++*/
++
++#include <stdint.h>
++
++#define SYSREGS_BASE   0x02000000ull
++#define MAILBOX0       (*(volatile uint32_t *)(SYSREGS_BASE + 0x68))
++#define MAILBOX1       (*(volatile uint32_t *)(SYSREGS_BASE + 0x70))
++#define MRAM_BASE      0x40000000ull
++#define CHUNK          4096
++
++static uint32_t crc32(const volatile uint8_t *p, unsigned n)
++{
++    uint32_t crc = 0xFFFFFFFFu;
++    for (unsigned i = 0; i < n; ++i) {
++        crc ^= p[i];
++        for (int k = 0; k < 8; ++k)
++            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
++    }
++    return ~crc;
++}
++
++int main(void)
++{
++    MAILBOX1 = 0xC0FFEE00u;             /* "worker ready" */
++    for (;;) {
++        uint32_t job;
++        while ((job = MAILBOX0) == 0)
++            ;
++        MAILBOX0 = 0;
++        uint32_t op = job >> 24;
++        uint64_t off = (uint64_t)(job & 0xFFFFu) * 256u;
++        volatile uint8_t *buf = (volatile uint8_t *)(MRAM_BASE + off);
++        switch (op) {
++        case 1:
++            MAILBOX1 = crc32(buf, CHUNK);
++            break;
++        case 2: {
++            uint8_t v = (uint8_t)(job >> 16);
++            for (unsigned i = 0; i < CHUNK; ++i)
++                buf[i] = v;
++            MAILBOX1 = 1;
++            break;
++        }
++        default:
++            MAILBOX1 = 0xBAD00000u | op;
++            break;
++        }
++    }
++    return 0;
++}
+diff --git a/sw-sysemu/tools/erb_client.py b/sw-sysemu/tools/erb_client.py
+new file mode 100755
+index 0000000..76c46e1
+--- /dev/null
++++ b/sw-sysemu/tools/erb_client.py
+@@ -0,0 +1,179 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 Ainekko, Co.
++# SPDX-License-Identifier: Apache-2.0
++"""Tiny test client for the QEMU <-> erbium_emu control protocol (docs/protocol.md).
++
++Usage:
++  erb_client.py SOCK ping
++  erb_client.py SOCK read  ADDR LEN
++  erb_client.py SOCK write ADDR HEXBYTES
++  erb_client.py SOCK reset [KIND]        (KIND: 0 = POR (default), 1 = xSPI-only)
++
++Several commands can be chained on one connection by separating them with '--':
++  erb_client.py SOCK write 0x2000068 deadbeef -- read 0x2000068 4
++
++Exit status is 0 if every command returned ERB_ST_OK, 1 otherwise.
++Only the Python standard library is used.
++"""
++
++import socket
++import struct
++import sys
++
++ERB_MAGIC = 0x42524555  # 'UERB'
++ERB_VERSION = 1
++
++ERB_OP_PING = 1
++ERB_OP_READ = 2
++ERB_OP_WRITE = 3
++ERB_OP_RESET = 4
++ERB_OP_RESP = 0x8000
++
++ERB_ST = {
++    0: "OK",
++    2: "SLVERR",
++    3: "DECERR",
++    0x100: "BADREQ",
++}
++
++HDR = struct.Struct("<IHHIIQ")  # magic, version, op, status, len, addr
++assert HDR.size == 24
++INFO = struct.Struct("<IIQQ32s")
++assert INFO.size == 56
++
++
++class ErbError(Exception):
++    pass
++
++
++class ErbClient:
++    def __init__(self, path):
++        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++        self.sock.connect(path)
++
++    def close(self):
++        self.sock.close()
++
++    def _recv_exact(self, n):
++        buf = b""
++        while len(buf) < n:
++            chunk = self.sock.recv(n - len(buf))
++            if not chunk:
++                raise ErbError("connection closed by server")
++            buf += chunk
++        return buf
++
++    def request(self, op, addr=0, length=0, payload=b""):
++        """Send one request and return (status, addr, payload)."""
++        hdr = HDR.pack(ERB_MAGIC, ERB_VERSION, op, 0, length, addr)
++        self.sock.sendall(hdr + payload)
++        magic, version, rop, status, rlen, raddr = HDR.unpack(self._recv_exact(HDR.size))
++        if magic != ERB_MAGIC or version != ERB_VERSION:
++            raise ErbError("bad response header magic/version")
++        if rop != (op | ERB_OP_RESP):
++            raise ErbError("response op 0x%x does not match request op 0x%x" % (rop, op))
++        data = self._recv_exact(rlen) if rlen else b""
++        return status, raddr, data
++
++    def ping(self):
++        status, _, data = self.request(ERB_OP_PING)
++        info = None
++        if status == 0 and len(data) >= INFO.size:
++            pv, flags, mram_base, mram_size, name = INFO.unpack(data[:INFO.size])
++            info = {
++                "proto_version": pv,
++                "flags": flags,
++                "mram_base": mram_base,
++                "mram_size": mram_size,
++                "name": name.split(b"\0", 1)[0].decode("ascii", "replace"),
++            }
++        return status, info
++
++    def read(self, addr, length):
++        status, _, data = self.request(ERB_OP_READ, addr, length)
++        return status, data
++
++    def write(self, addr, data):
++        status, _, _ = self.request(ERB_OP_WRITE, addr, len(data), data)
++        return status
++
++    def reset(self, kind=0):
++        status, _, _ = self.request(ERB_OP_RESET, kind)
++        return status
++
++
++def st_name(status):
++    return ERB_ST.get(status, "0x%x" % status)
++
++
++def hexdump(data, base):
++    lines = []
++    for off in range(0, len(data), 16):
++        chunk = data[off:off + 16]
++        hexpart = " ".join("%02x" % b for b in chunk)
++        asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
++        lines.append("%010x  %-47s  |%s|" % (base + off, hexpart, asc))
++    return "\n".join(lines)
++
++
++def run_command(client, argv):
++    cmd = argv[0]
++    if cmd == "ping":
++        status, info = client.ping()
++        print("ping: %s" % st_name(status))
++        if info:
++            print("  proto_version=%d flags=0x%x mram_base=0x%x mram_size=0x%x name=%r"
++                  % (info["proto_version"], info["flags"], info["mram_base"],
++                     info["mram_size"], info["name"]))
++        return status
++    if cmd == "read":
++        addr = int(argv[1], 0)
++        length = int(argv[2], 0)
++        status, data = client.read(addr, length)
++        print("read 0x%x len %d: %s" % (addr, length, st_name(status)))
++        if data:
++            print(hexdump(data, addr))
++        return status
++    if cmd == "write":
++        addr = int(argv[1], 0)
++        data = bytes.fromhex(argv[2])
++        status = client.write(addr, data)
++        print("write 0x%x len %d: %s" % (addr, len(data), st_name(status)))
++        return status
++    if cmd == "reset":
++        kind = int(argv[1], 0) if len(argv) > 1 else 0
++        status = client.reset(kind)
++        print("reset kind %d: %s" % (kind, st_name(status)))
++        return status
++    raise SystemExit("unknown command %r\n%s" % (cmd, __doc__))
++
++
++def main(argv):
++    if len(argv) < 3:
++        raise SystemExit(__doc__)
++    path = argv[1]
++    groups = []
++    cur = []
++    for a in argv[2:]:
++        if a == "--":
++            if cur:
++                groups.append(cur)
++            cur = []
++        else:
++            cur.append(a)
++    if cur:
++        groups.append(cur)
++
++    client = ErbClient(path)
++    ok = True
++    try:
++        for g in groups:
++            if run_command(client, g) != 0:
++                ok = False
++    finally:
++        client.close()
++    return 0 if ok else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv))
+-- 
+2.43.0
+

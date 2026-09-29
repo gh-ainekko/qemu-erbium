@@ -1,0 +1,249 @@
+ 
+ SCCR_Reg address map 
+ Absolute Address: 0x0 
+ Base Offset: 0x0 
+ Size: 0x38 
+ Status and control Registers 
+ Offset | 
+ Identifier | 
+ Name | 
+ 0x00 | 
+ ID0 | 
+ id0 | 
+ 0x08 | 
+ ID1 | 
+ ID1 | 
+ 0x10 | 
+ CFG | 
+ — | 
+ 0x18 | 
+ xspi_status | 
+ — | 
+ 0x20 | 
+ xspi_control | 
+ — | 
+ 0x28 | 
+ xspi_rates | 
+ — | 
+ 0x30 | 
+ interrupt_status | 
+ — | 
+ ID0 register 
+ Absolute Address: 0x0 
+ Base Offset: 0x0 
+ Size: 0x8 
+ Bits | 
+ Identifier | 
+ Access | 
+ Reset | 
+ Name | 
+ 3:0 | 
+ mgf_id | 
+ rw | 
+ 0x2 | 
+ — | 
+ 15:4 | 
+ devid0 | 
+ rw | 
+ 0x0 | 
+ — | 
+ mgf_id field 
+ Manufacturer: TODO check how to obtain this number 
+ devid0 field 
+ DEVID0 TODO Use as suitable 
+ ID1 register 
+ Absolute Address: 0x8 
+ Base Offset: 0x8 
+ Size: 0x8 
+ Bits | 
+ Identifier | 
+ Access | 
+ Reset | 
+ Name | 
+ 3:0 | 
+ dev_type | 
+ rw | 
+ 0x0 | 
+ — | 
+ 15:4 | 
+ devid1 | 
+ rw | 
+ 0x0 | 
+ — | 
+ dev_type field 
+ Device Type set to hyperram 
+ devid1 field 
+ TODO Use as appropriate 
+ CFG register 
+ Absolute Address: 0x10 
+ Base Offset: 0x10 
+ Size: 0x8 
+ Bits | 
+ Identifier | 
+ Access | 
+ Reset | 
+ Name | 
+ 1:0 | 
+ BurstLength | 
+ rw | 
+ 0x2 | 
+ — | 
+ 2 | 
+ HybridBurstEnable | 
+ r | 
+ 0x0 | 
+ — | 
+ 3 | 
+ FixedLatency | 
+ r | 
+ 0x1 | 
+ — | 
+ 7:4 | 
+ InitialLatency | 
+ rw | 
+ 0x8 | 
+ — | 
+ 11:8 | 
+ Reserved | 
+ r | 
+ 0x1 | 
+ — | 
+ 14:12 | 
+ DriveStrength | 
+ r | 
+ 0x3 | 
+ — | 
+ 15 | 
+ DeepPowerDown | 
+ rw | 
+ 0x0 | 
+ — | 
+ 16 | 
+ BurstEnable | 
+ rw | 
+ 0x0 | 
+ — | 
+ 17 | 
+ UltraDeepPowerDown | 
+ rw | 
+ 0x0 | 
+ — | 
+ BurstLength field 
+ Burst Length 
+ HybridBurstEnable field 
+ Burst Enable 
+ FixedLatency field 
+ Fixed Latency 
+ InitialLatency field 
+ Initial Latency. 
+ DriveStrength field 
+ Drive Strength. 
+ DeepPowerDown field 
+ Deep Power down, Not too deep, not too shallow 
+ BurstEnable field 
+ Enable bust access. Applicable only to memory access. Register access are one at a time 
+ UltraDeepPowerDown field 
+ Ultra Deep Power down. 
+ xspi_status register 
+ Absolute Address: 0x18 
+ Base Offset: 0x18 
+ Size: 0x8 
+ Bits | 
+ Identifier | 
+ Access | 
+ Reset | 
+ Name | 
+ 0 | 
+ wip | 
+ r | 
+ 0x0 | 
+ — | 
+ wip field 
+ write in progress; Valid only after a write mem transaction 
+ xspi_control register 
+ Absolute Address: 0x20 
+ Base Offset: 0x20 
+ Size: 0x8 
+ Bits | 
+ Identifier | 
+ Access | 
+ Reset | 
+ Name | 
+ 0 | 
+ use_xspi_clk | 
+ rw | 
+ 0x0 | 
+ — | 
+ 1 | 
+ interrupt_enable | 
+ rw | 
+ 0x0 | 
+ — | 
+ use_xspi_clk field 
+ Use xspi clock as system clock 
+ interrupt_enable field 
+ Use xspi clock as system clock 
+ xspi_rates register 
+ Absolute Address: 0x28 
+ Base Offset: 0x28 
+ Size: 0x8 
+ Bits | 
+ Identifier | 
+ Access | 
+ Reset | 
+ Name | 
+ 7:0 | 
+ cmd_rate | 
+ rw | 
+ 0x0 | 
+ — | 
+ 15:8 | 
+ addr_rate | 
+ rw | 
+ 0x0 | 
+ — | 
+ 23:16 | 
+ data_rate | 
+ rw | 
+ 0x0 | 
+ — | 
+ cmd_rate field 
+ CMD Rate 
+ addr_rate field 
+ CMD Rate 
+ data_rate field 
+ CMD Rate 
+ interrupt_status register 
+ Absolute Address: 0x30 
+ Base Offset: 0x30 
+ Size: 0x8 
+ Bits | 
+ Identifier | 
+ Access | 
+ Reset | 
+ Name | 
+ 1:0 | 
+ axi_resp | 
+ r, rclr | 
+ 0x0 | 
+ — | 
+ 2 | 
+ read_underflow | 
+ r, rclr | 
+ 0x0 | 
+ — | 
+ 3 | 
+ write_overflow | 
+ r, rclr | 
+ 0x0 | 
+ — | 
+ axi_resp field 
+ AXI Resp Error 
+ read_underflow field 
+ Read FIFO Underflow Error 
+ write_overflow field 
+ Write FIFO Overflow Error 
+ Previous 
+ Next 
+ Built with MkDocs using a theme provided by Read the Docs .
+

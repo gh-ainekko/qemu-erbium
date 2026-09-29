@@ -1,0 +1,6 @@
+ 
+ Max burst length 256. Read and write. 
+ Previous 
+ Next 
+ Built with MkDocs using a theme provided by Read the Docs .
+
