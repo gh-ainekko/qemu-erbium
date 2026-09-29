@@ -1,7 +1,7 @@
 From f457a13f003463139d98ff6b493bb7255a34413e Mon Sep 17 00:00:00 2001
 From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
 Date: Tue, 29 Sep 2026 23:19:59 +0000
-Subject: [PATCH 2/5] erbium-xspi: follow RTL semantics (latency 8+IL, AXI
+Subject: [PATCH 2/7] erbium-xspi: follow RTL semantics (latency 8+IL, AXI
  burst limits, 4K write wrap, SCCR at 0x4000F000, SFDP pad quirk, chip reset)
 
 Co-authored-by: Shelley <shelley@exe.dev>

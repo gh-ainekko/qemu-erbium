@@ -1,0 +1,1286 @@
+From: Erbium emulation <roman@nekko.ai>
+Subject: [PATCH 2/2] mtd: devices: add Erbium xSPI target driver (MRAM MTD + /dev/erbiumN control plane)
+
+spi-mem client for the Erbium AI chip's xSPI Profile 2.0 port.
+---
+--- a/drivers/mtd/devices/Kconfig
++++ b/drivers/mtd/devices/Kconfig
+@@ -79,6 +79,16 @@
+ 	  other key product data.  The second half is programmed with a
+ 	  unique-to-each-chip bit pattern at the factory.
+ 
++config MTD_ERBIUM_XSPI
++	tristate "Erbium AI chip xSPI target (MRAM + control plane)"
++	depends on SPI_MEM && OF
++	help
++	  Driver for the xSPI target port of the Erbium chip.  Exposes the
++	  on-die MRAM as an MTD RAM device and the control plane (slave
++	  control registers, SFDP, system registers/mailboxes, SRAM) through
++	  /dev/erbiumN.  The chip speaks xSPI Profile 2.0 and cannot be
++	  driven by the generic SPI NOR framework.
++
+ config MTD_MCHP23K256
+ 	tristate "Microchip 23K256 SRAM"
+ 	depends on SPI_MASTER
+--- a/drivers/mtd/devices/Makefile
++++ b/drivers/mtd/devices/Makefile
+@@ -18,6 +18,7 @@
+ obj-$(CONFIG_MTD_BCM47XXSFLASH)	+= bcm47xxsflash.o
+ obj-$(CONFIG_MTD_ST_SPI_FSM)    += st_spi_fsm.o
+ obj-$(CONFIG_MTD_POWERNV_FLASH)	+= powernv_flash.o
++obj-$(CONFIG_MTD_ERBIUM_XSPI)	+= erbium-xspi.o
+ 
+ 
+ CFLAGS_docg3.o			+= -I$(src)
+--- /dev/null
++++ b/drivers/mtd/devices/erbium-xspi.c
+@@ -0,0 +1,1087 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Erbium xSPI target driver (spi-mem client).
++ *
++ * The Erbium AI chip exposes itself to a host as an xSPI *target* speaking
++ * the JEDEC xSPI Profile 2.0 command set: the on-die 16 MiB MRAM is
++ * memory-mapped (Read Memory 0Bh / Write Memory 02h), a small block of
++ * slave control registers (SCCR) is reachable with 65h/71h, the SFDP ROM
++ * with 5Ah, the line rates are switched with 52h and 99h resets the chip.
++ * There is no write-enable latch, no status polling and no erase; the
++ * NoC behind the port also maps the system registers (mailboxes) and SRAM
++ * of the RISC-V subsystem into the same 32-bit xSPI address space.
++ *
++ * This driver registers the MRAM as an MTD_RAM device and a misc character
++ * device (/dev/erbiumN) for the control plane; see
++ * include/uapi/linux/erbium-xspi.h.
++ *
++ * Hardware facts the transfer sizes below follow (from the RTL):
++ *  - a Read Memory frame is served by ONE AXI burst: 8 bytes, or
++ *    128/64/16/32 bytes for CFG.BurstLength 0..3 when CFG.BurstEnable;
++ *    bytes clocked out beyond that read as zero and set
++ *    interrupt_status.read_underflow;
++ *  - Write Memory data is consumed in 8-byte beats; the address wraps
++ *    within a 4 KiB page; a trailing partial beat is dropped;
++ *  - the read latency is 8 + CFG.InitialLatency SCK cycles;
++ *  - register/SFDP ops take 3 address bytes at S1 command rate, 4 otherwise;
++ *  - 4S/4D/8S/8D command rates carry an (ignored) opcode extension byte.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/fs.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/slab.h>
++#include <linux/spi/spi.h>
++#include <linux/spi/spi-mem.h>
++#include <linux/uaccess.h>
++#include <linux/unaligned.h>
++#include <linux/erbium-xspi.h>
++
++#define ERB_OP_WRITE_MEM	0x02
++#define ERB_OP_READ_MEM		0x0B
++#define ERB_OP_SET_RATE		0x52
++#define ERB_OP_READ_SFDP	0x5A
++#define ERB_OP_READ_REG		0x65
++#define ERB_OP_WRITE_REG	0x71
++#define ERB_OP_RESET		0x99
++
++#define ERB_CFG_BURST_LEN	GENMASK(1, 0)
++#define ERB_CFG_INIT_LATENCY	GENMASK(7, 4)
++#define ERB_CFG_BURST_EN	BIT(16)
++#define ERB_INT_AXI_RESP	GENMASK(1, 0)
++#define ERB_INT_READ_UNDERFLOW	BIT(2)
++#define ERB_INT_ILLEGAL_CMD	BIT(3)
++
++#define ERB_RATES_CMD		GENMASK(3, 0)
++#define ERB_RATES_ADDR		GENMASK(11, 8)
++#define ERB_RATES_DATA		GENMASK(19, 16)
++
++#define ERB_DEFAULT_MRAM_SIZE	SZ_16M
++#define ERB_WRITE_UNIT		8
++#define ERB_WRITE_PAGE		SZ_4K
++#define ERB_MAX_READ_BURST	128
++#define ERB_SFDP_SIZE		SZ_4K
++
++struct erbium_xspi {
++	struct spi_mem *mem;
++	struct mtd_info mtd;
++	struct miscdevice misc;
++	char misc_name[16];
++	struct mutex lock;		/* serialises all xSPI traffic */
++
++	/* current line configuration */
++	u8 rate_cmd, rate_addr, rate_data;
++	u32 cfg;			/* SCCR.CFG shadow */
++	u32 burst_cfg;			/* CFG value to use for MRAM bulk reads (0: none) */
++	u32 read_burst;			/* bytes per Read Memory frame */
++	u32 write_burst;		/* bytes per Write Memory frame */
++	unsigned int latency_cycles;
++
++	u32 id0, id1;
++	u64 mram_size;
++	bool octal_dtr;			/* try to switch to 8D-8D-8D at probe */
++	u8 *bounce;			/* ERB_MAX_READ_BURST bytes */
++	u8 *scratch;			/* DMA-able 8-byte word for register ops */
++};
++
++static bool erbium_octal_dtr = true;
++module_param_named(octal_dtr, erbium_octal_dtr, bool, 0444);
++MODULE_PARM_DESC(octal_dtr, "switch to 8D-8D-8D when the controller can (default: true)");
++
++static unsigned int erbium_max_read;
++module_param_named(max_read, erbium_max_read, uint, 0444);
++MODULE_PARM_DESC(max_read, "cap Read Memory frames to this many bytes (0: auto, enables 128-byte bursts)");
++
++/* ---- rate helpers ------------------------------------------------------ */
++
++static u8 erbium_rate_buswidth(u8 rate)
++{
++	switch (rate & 0xf) {
++	case ERBIUM_RATE_S1:
++	case 1:
++		return 1;
++	case ERBIUM_RATE_S4:
++	case ERBIUM_RATE_D4:
++		return 4;
++	case ERBIUM_RATE_S8:
++	case ERBIUM_RATE_D8:
++		return 8;
++	default:
++		return 0;
++	}
++}
++
++static bool erbium_rate_dtr(u8 rate)
++{
++	return rate & 1;
++}
++
++static bool erbium_rate_has_ext(u8 cmd_rate)
++{
++	return erbium_rate_buswidth(cmd_rate) > 1;
++}
++
++static bool erbium_rates_valid(u8 c, u8 a, u8 d)
++{
++	return erbium_rate_buswidth(c) && erbium_rate_buswidth(a) &&
++	       erbium_rate_buswidth(d);
++}
++
++/* Dummy bytes for the current latency at the data rate */
++static unsigned int erbium_dummy_bytes(struct erbium_xspi *erb)
++{
++	unsigned int bw = erbium_rate_buswidth(erb->rate_data);
++	unsigned int cycles = erb->latency_cycles;
++
++	return DIV_ROUND_UP(cycles * bw * (erbium_rate_dtr(erb->rate_data) ? 2 : 1), 8);
++}
++
++static unsigned int erbium_reg_addr_bytes(struct erbium_xspi *erb)
++{
++	return erb->rate_cmd == ERBIUM_RATE_S1 ? 3 : 4;
++}
++
++/* Fill in the line widths/DTR flags of an op for the current rates */
++static void erbium_op_apply_rates(struct erbium_xspi *erb, struct spi_mem_op *op)
++{
++	op->cmd.buswidth = erbium_rate_buswidth(erb->rate_cmd);
++	op->cmd.dtr = erbium_rate_dtr(erb->rate_cmd);
++	op->cmd.nbytes = erbium_rate_has_ext(erb->rate_cmd) ? 2 : 1;
++	if (op->cmd.nbytes == 2) {
++		/* Ext byte is don't-care for Erbium; repeat the opcode */
++		op->cmd.opcode = (op->cmd.opcode << 8) | (op->cmd.opcode & 0xff);
++	}
++	op->addr.buswidth = op->addr.nbytes ? erbium_rate_buswidth(erb->rate_addr) : 0;
++	op->addr.dtr = op->addr.nbytes ? erbium_rate_dtr(erb->rate_addr) : 0;
++	op->dummy.buswidth = op->dummy.nbytes ? erbium_rate_buswidth(erb->rate_data) : 0;
++	op->dummy.dtr = op->dummy.nbytes ? erbium_rate_dtr(erb->rate_data) : 0;
++	op->data.buswidth = op->data.nbytes ? erbium_rate_buswidth(erb->rate_data) : 0;
++	op->data.dtr = op->data.nbytes ? erbium_rate_dtr(erb->rate_data) : 0;
++}
++
++static int erbium_exec(struct erbium_xspi *erb, struct spi_mem_op *op)
++{
++	int ret;
++
++	erbium_op_apply_rates(erb, op);
++	ret = spi_mem_exec_op(erb->mem, op);
++	if (ret)
++		dev_dbg(&erb->mem->spi->dev, "op %02x addr %llx len %u failed: %d\n",
++			op->cmd.opcode, op->addr.val, op->data.nbytes, ret);
++	return ret;
++}
++
++/* ---- primitive xSPI commands (caller holds erb->lock) ------------------ */
++
++static int erbium_reg_read(struct erbium_xspi *erb, u32 off, u32 *val)
++{
++	struct spi_mem_op op = {
++		.cmd = { .opcode = ERB_OP_READ_REG },
++		.addr = { .nbytes = erbium_reg_addr_bytes(erb), .val = off & 0x3f },
++		.dummy = { .nbytes = erbium_dummy_bytes(erb) },
++		.data = { .dir = SPI_MEM_DATA_IN, .nbytes = 4, .buf.in = erb->scratch },
++	};
++	int ret;
++
++	ret = erbium_exec(erb, &op);
++	if (!ret)
++		*val = get_unaligned_le32(erb->scratch);
++	return ret;
++}
++
++static int erbium_reg_write(struct erbium_xspi *erb, u32 off, u32 val)
++{
++	struct spi_mem_op op = {
++		.cmd = { .opcode = ERB_OP_WRITE_REG },
++		.addr = { .nbytes = erbium_reg_addr_bytes(erb), .val = off & 0x3f },
++		.data = { .dir = SPI_MEM_DATA_OUT, .nbytes = 4, .buf.out = erb->scratch },
++	};
++
++	put_unaligned_le32(val, erb->scratch);
++	return erbium_exec(erb, &op);
++}
++
++/* One SFDP DWORD; the RTL streams 4 pad bytes after every DWORD */
++static int erbium_sfdp_read_dword(struct erbium_xspi *erb, u32 off, u32 *val)
++{
++	struct spi_mem_op op = {
++		.cmd = { .opcode = ERB_OP_READ_SFDP },
++		.addr = { .nbytes = erbium_reg_addr_bytes(erb), .val = off & 0xffc },
++		.dummy = { .nbytes = erbium_dummy_bytes(erb) },
++		.data = { .dir = SPI_MEM_DATA_IN, .nbytes = 4, .buf.in = erb->scratch },
++	};
++	int ret;
++
++	ret = erbium_exec(erb, &op);
++	if (!ret)
++		*val = get_unaligned_le32(erb->scratch);
++	return ret;
++}
++
++/* Read Memory: one frame, len <= read_burst */
++static int erbium_mem_read_frame(struct erbium_xspi *erb, u32 addr,
++				 void *buf, size_t len)
++{
++	struct spi_mem_op op = {
++		.cmd = { .opcode = ERB_OP_READ_MEM },
++		.addr = { .nbytes = 4, .val = addr },
++		.dummy = { .nbytes = erbium_dummy_bytes(erb) },
++		.data = { .dir = SPI_MEM_DATA_IN, .nbytes = len, .buf.in = buf },
++	};
++	int ret;
++
++	erbium_op_apply_rates(erb, &op);
++	ret = spi_mem_adjust_op_size(erb->mem, &op);
++	if (ret)
++		return ret;
++	if (op.data.nbytes != len)
++		return -E2BIG;
++	return spi_mem_exec_op(erb->mem, &op);
++}
++
++/* Write Memory: one frame, len multiple of 8, not crossing a 4 KiB page */
++static int erbium_mem_write_frame(struct erbium_xspi *erb, u32 addr,
++				  const void *buf, size_t len)
++{
++	struct spi_mem_op op = {
++		.cmd = { .opcode = ERB_OP_WRITE_MEM },
++		.addr = { .nbytes = 4, .val = addr },
++		.data = { .dir = SPI_MEM_DATA_OUT, .nbytes = len, .buf.out = buf },
++	};
++	int ret;
++
++	erbium_op_apply_rates(erb, &op);
++	ret = spi_mem_adjust_op_size(erb->mem, &op);
++	if (ret)
++		return ret;
++	if (op.data.nbytes != len)
++		return -E2BIG;
++	return spi_mem_exec_op(erb->mem, &op);
++}
++
++/* Arbitrary-length read of the xSPI map, chunked into bursts */
++static int erbium_mem_read(struct erbium_xspi *erb, u64 addr, void *buf,
++			   size_t len)
++{
++	while (len) {
++		size_t n = min_t(size_t, len, erb->read_burst);
++		int ret;
++
++		/* keep frames inside a burst-aligned window */
++		n = min_t(size_t, n, erb->read_burst - (addr & (erb->read_burst - 1)));
++		ret = erbium_mem_read_frame(erb, addr, buf, n);
++		if (ret)
++			return ret;
++		addr += n;
++		buf += n;
++		len -= n;
++	}
++	return 0;
++}
++
++/*
++ * Arbitrary read-modify-write of the xSPI map in 8-byte units.  The
++ * hardware only ever writes whole 64-bit beats, so unaligned head/tail
++ * bytes need a read first.
++ */
++static int erbium_mem_write(struct erbium_xspi *erb, u64 addr,
++			    const void *buf, size_t len)
++{
++	u8 *tmp = erb->scratch;
++	int ret;
++
++	/* unaligned head */
++	if (addr & (ERB_WRITE_UNIT - 1)) {
++		u64 base = addr & ~(u64)(ERB_WRITE_UNIT - 1);
++		size_t off = addr - base;
++		size_t n = min(len, ERB_WRITE_UNIT - off);
++
++		ret = erbium_mem_read_frame(erb, base, tmp, ERB_WRITE_UNIT);
++		if (ret)
++			return ret;
++		memcpy(tmp + off, buf, n);
++		ret = erbium_mem_write_frame(erb, base, tmp, ERB_WRITE_UNIT);
++		if (ret)
++			return ret;
++		addr += n;
++		buf += n;
++		len -= n;
++	}
++
++	/* aligned body, frames limited by write_burst and the 4 KiB page */
++	while (len >= ERB_WRITE_UNIT) {
++		size_t n = min_t(size_t, len & ~(ERB_WRITE_UNIT - 1), erb->write_burst);
++
++		n = min_t(size_t, n, ERB_WRITE_PAGE - (addr & (ERB_WRITE_PAGE - 1)));
++		ret = erbium_mem_write_frame(erb, addr, buf, n);
++		if (ret)
++			return ret;
++		addr += n;
++		buf += n;
++		len -= n;
++	}
++
++	/* partial tail */
++	if (len) {
++		ret = erbium_mem_read_frame(erb, addr, tmp, ERB_WRITE_UNIT);
++		if (ret)
++			return ret;
++		memcpy(tmp, buf, len);
++		ret = erbium_mem_write_frame(erb, addr, tmp, ERB_WRITE_UNIT);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++/* ---- configuration ----------------------------------------------------- */
++
++static u32 erbium_burst_from_cfg(u32 cfg)
++{
++	static const u8 lens[4] = { 128, 64, 16, 32 };
++
++	if (!(cfg & ERB_CFG_BURST_EN))
++		return 8;
++	return lens[FIELD_GET(ERB_CFG_BURST_LEN, cfg)];
++}
++
++/* Recompute the derived transfer parameters from the CFG shadow */
++static void erbium_update_params(struct erbium_xspi *erb)
++{
++	struct spi_mem_op op = {
++		.cmd = { .opcode = ERB_OP_READ_MEM },
++		.addr = { .nbytes = 4 },
++		.data = { .dir = SPI_MEM_DATA_IN, .nbytes = ERB_MAX_READ_BURST,
++			  .buf.in = erb->bounce },
++	};
++
++	erb->latency_cycles = 8 + FIELD_GET(ERB_CFG_INIT_LATENCY, erb->cfg);
++	erb->read_burst = erbium_burst_from_cfg(erb->cfg);
++	if (erbium_max_read)
++		erb->read_burst = min(erb->read_burst, rounddown_pow_of_two(erbium_max_read));
++
++	/* the controller may cap a single op (e.g. STIG-only paths) */
++	op.dummy.nbytes = erbium_dummy_bytes(erb);
++	erbium_op_apply_rates(erb, &op);
++	if (!spi_mem_adjust_op_size(erb->mem, &op) && op.data.nbytes < erb->read_burst)
++		erb->read_burst = rounddown_pow_of_two(op.data.nbytes);
++	if (erb->read_burst < ERB_WRITE_UNIT)
++		erb->read_burst = ERB_WRITE_UNIT;
++
++	/* writes: any multiple of 8 up to the page; let the controller cap it */
++	op.cmd.opcode = ERB_OP_WRITE_MEM;
++	op.dummy.nbytes = 0;
++	op.data.dir = SPI_MEM_DATA_OUT;
++	op.data.nbytes = ERB_WRITE_PAGE;
++	op.data.buf.out = erb->bounce;
++	erbium_op_apply_rates(erb, &op);
++	erb->write_burst = ERB_WRITE_PAGE;
++	if (!spi_mem_adjust_op_size(erb->mem, &op))
++		erb->write_burst = max_t(u32, op.data.nbytes & ~(ERB_WRITE_UNIT - 1),
++					 ERB_WRITE_UNIT);
++}
++
++/* Can the controller drive this rate triple for all op shapes we use? */
++static bool erbium_rates_supported(struct erbium_xspi *erb, u8 c, u8 a, u8 d)
++{
++	struct erbium_xspi tmp = *erb;
++	struct spi_mem_op rd = {
++		.cmd = { .opcode = ERB_OP_READ_MEM },
++		.addr = { .nbytes = 4 },
++		.data = { .dir = SPI_MEM_DATA_IN, .nbytes = 8, .buf.in = erb->bounce },
++	};
++	struct spi_mem_op wr = {
++		.cmd = { .opcode = ERB_OP_WRITE_MEM },
++		.addr = { .nbytes = 4 },
++		.data = { .dir = SPI_MEM_DATA_OUT, .nbytes = 8, .buf.out = erb->bounce },
++	};
++	struct spi_mem_op rr = {
++		.cmd = { .opcode = ERB_OP_READ_REG },
++		.addr = { .nbytes = 4 },
++		.data = { .dir = SPI_MEM_DATA_IN, .nbytes = 4, .buf.in = erb->bounce },
++	};
++	struct spi_mem_op rst = {
++		.cmd = { .opcode = ERB_OP_RESET },
++	};
++
++	if (!erbium_rates_valid(c, a, d))
++		return false;
++	tmp.rate_cmd = c;
++	tmp.rate_addr = a;
++	tmp.rate_data = d;
++	rd.dummy.nbytes = erbium_dummy_bytes(&tmp);
++	rr.dummy.nbytes = rd.dummy.nbytes;
++	rr.addr.nbytes = erbium_reg_addr_bytes(&tmp);
++	erbium_op_apply_rates(&tmp, &rd);
++	erbium_op_apply_rates(&tmp, &wr);
++	erbium_op_apply_rates(&tmp, &rr);
++	erbium_op_apply_rates(&tmp, &rst);
++	return spi_mem_supports_op(erb->mem, &rd) &&
++	       spi_mem_supports_op(erb->mem, &wr) &&
++	       spi_mem_supports_op(erb->mem, &rr) &&
++	       spi_mem_supports_op(erb->mem, &rst);
++}
++
++/* Issue 52h at the current rates and switch the driver to the new ones */
++static int erbium_set_rates(struct erbium_xspi *erb, u8 c, u8 a, u8 d)
++{
++	struct spi_mem_op op = {
++		.cmd = { .opcode = ERB_OP_SET_RATE },
++		.addr = { .nbytes = 3, .val = (c << 16) | (a << 8) | d },
++	};
++	u32 rates;
++	int ret;
++
++	if (!erbium_rates_supported(erb, c, a, d))
++		return -EOPNOTSUPP;
++
++	ret = erbium_exec(erb, &op);
++	if (ret)
++		return ret;
++	erb->rate_cmd = c;
++	erb->rate_addr = a;
++	erb->rate_data = d;
++	erbium_update_params(erb);
++
++	ret = erbium_reg_read(erb, ERBIUM_SCCR_RATES, &rates);
++	if (ret)
++		return ret;
++	if (FIELD_GET(ERB_RATES_CMD, rates) != c ||
++	    FIELD_GET(ERB_RATES_ADDR, rates) != a ||
++	    FIELD_GET(ERB_RATES_DATA, rates) != d) {
++		dev_err(&erb->mem->spi->dev,
++			"rate switch to %u/%u/%u not confirmed (RATES=%08x)\n",
++			c, a, d, rates);
++		return -EIO;
++	}
++	return 0;
++}
++
++/* Read SCCR and (re)derive everything; called at probe and after reset */
++static int erbium_sync_from_device(struct erbium_xspi *erb)
++{
++	u32 rates;
++	int ret;
++
++	ret = erbium_reg_read(erb, ERBIUM_SCCR_ID0, &erb->id0);
++	if (ret)
++		return ret;
++	ret = erbium_reg_read(erb, ERBIUM_SCCR_ID1, &erb->id1);
++	if (ret)
++		return ret;
++	ret = erbium_reg_read(erb, ERBIUM_SCCR_CFG, &erb->cfg);
++	if (ret)
++		return ret;
++	ret = erbium_reg_read(erb, ERBIUM_SCCR_RATES, &rates);
++	if (ret)
++		return ret;
++	if (FIELD_GET(ERB_RATES_CMD, rates) != erb->rate_cmd ||
++	    FIELD_GET(ERB_RATES_ADDR, rates) != erb->rate_addr ||
++	    FIELD_GET(ERB_RATES_DATA, rates) != erb->rate_data) {
++		dev_warn(&erb->mem->spi->dev,
++			 "device reports rates %08x, driver assumed %u/%u/%u\n",
++			 rates, erb->rate_cmd, erb->rate_addr, erb->rate_data);
++	}
++	erbium_update_params(erb);
++	return 0;
++}
++
++/*
++ * A Read Memory frame always triggers one AXI burst of CFG.BurstLength at
++ * the NoC, whatever the host clocks out.  128-byte bursts are great for
++ * the MRAM but must not be used on the register-like parts of the map
++ * (system registers, SCCR), so bursts are switched on only around MRAM
++ * bulk reads and CFG is left at the reset default otherwise.
++ */
++static int erbium_probe_bursts(struct erbium_xspi *erb)
++{
++	u32 cfg = (erb->cfg & ~ERB_CFG_BURST_LEN) | ERB_CFG_BURST_EN;
++	u32 rb;
++	int ret;
++
++	erb->burst_cfg = 0;
++	if (erbium_max_read && erbium_max_read <= 8)
++		return 0;
++
++	/* BurstLength 0 = 128 bytes */
++	ret = erbium_reg_write(erb, ERBIUM_SCCR_CFG, cfg);
++	if (ret)
++		return ret;
++	ret = erbium_reg_read(erb, ERBIUM_SCCR_CFG, &rb);
++	if (ret)
++		return ret;
++	if (rb & ERB_CFG_BURST_EN)
++		erb->burst_cfg = rb;
++	else
++		dev_warn(&erb->mem->spi->dev, "BurstEnable did not stick (CFG=%08x)\n", rb);
++	ret = erbium_reg_write(erb, ERBIUM_SCCR_CFG, erb->cfg);
++	if (ret)
++		return ret;
++	erbium_update_params(erb);
++	return 0;
++}
++
++static int erbium_bursts(struct erbium_xspi *erb, bool on)
++{
++	u32 want = on ? erb->burst_cfg : (erb->burst_cfg & ~ERB_CFG_BURST_EN);
++	int ret;
++
++	if (!erb->burst_cfg || (erb->cfg & ERB_CFG_BURST_EN) == (want & ERB_CFG_BURST_EN))
++		return 0;
++	ret = erbium_reg_write(erb, ERBIUM_SCCR_CFG, want);
++	if (ret)
++		return ret;
++	erb->cfg = want;
++	erbium_update_params(erb);
++	return 0;
++}
++
++static int erbium_chip_reset(struct erbium_xspi *erb)
++{
++	struct spi_mem_op op = { .cmd = { .opcode = ERB_OP_RESET } };
++	int ret;
++
++	ret = erbium_exec(erb, &op);
++	if (ret)
++		return ret;
++	/* strap default: we only know how to talk S1 afterwards */
++	erb->rate_cmd = erb->rate_addr = erb->rate_data = ERBIUM_RATE_S1;
++	usleep_range(100, 200);
++	ret = erbium_sync_from_device(erb);
++	if (ret)
++		return ret;
++	ret = erbium_probe_bursts(erb);
++	if (ret)
++		return ret;
++	if (erb->octal_dtr &&
++	    erbium_set_rates(erb, ERBIUM_RATE_D8, ERBIUM_RATE_D8, ERBIUM_RATE_D8))
++		dev_info(&erb->mem->spi->dev, "staying in 1S-1S-1S\n");
++	return 0;
++}
++
++/* ---- SFDP ---------------------------------------------------------------- */
++
++static int erbium_parse_sfdp(struct erbium_xspi *erb)
++{
++	struct device *dev = &erb->mem->spi->dev;
++	u32 sig, hdr, ptp, bfpt, dw2;
++	int ret;
++
++	ret = erbium_sfdp_read_dword(erb, 0, &sig);
++	if (ret)
++		return ret;
++	if (sig != 0x50444653) {	/* "SFDP" */
++		dev_err(dev, "bad SFDP signature %08x\n", sig);
++		return -ENODEV;
++	}
++	ret = erbium_sfdp_read_dword(erb, 4, &hdr);
++	if (ret)
++		return ret;
++	/* first parameter header: BFPT */
++	ret = erbium_sfdp_read_dword(erb, 0x08, &hdr);
++	if (ret)
++		return ret;
++	ret = erbium_sfdp_read_dword(erb, 0x0c, &ptp);
++	if (ret)
++		return ret;
++	if ((hdr & 0xff) != 0x00 || (ptp >> 24) != 0xff) {
++		dev_warn(dev, "first SFDP parameter is not the BFPT (%08x %08x)\n", hdr, ptp);
++		return 0;
++	}
++	bfpt = ptp & 0xffffff;
++	ret = erbium_sfdp_read_dword(erb, bfpt + 4, &dw2);
++	if (ret)
++		return ret;
++	if (dw2 & BIT(31))
++		erb->mram_size = 1ULL << ((dw2 & 0x7fffffff) - 3);
++	else
++		erb->mram_size = ((u64)dw2 + 1) / 8;
++	dev_dbg(dev, "SFDP: BFPT @%x density dword %08x -> %llu bytes\n",
++		bfpt, dw2, erb->mram_size);
++
++	/*
++	 * Erratum: the SFDP ROM of the first Erbium silicon states 16 Mbit
++	 * (DW2 = 0x00FFFFFF) while the MRAM is 16 MiB.  A DT
++	 * "ainekko,mram-size" wins over SFDP; otherwise apply the fix-up.
++	 */
++	if (of_property_read_u64(dev->of_node, "ainekko,mram-size", &erb->mram_size) == 0) {
++		dev_info(dev, "MRAM size %llu from DT (SFDP says %llu)\n",
++			 erb->mram_size, ((u64)dw2 + 1) / 8);
++	} else if (dw2 == 0x00ffffff) {
++		dev_warn(dev, "SFDP density 16 Mbit is a known erratum, assuming 16 MiB\n");
++		erb->mram_size = ERB_DEFAULT_MRAM_SIZE;
++	}
++	return 0;
++}
++
++/* ---- MTD ----------------------------------------------------------------- */
++
++static struct erbium_xspi *mtd_to_erb(struct mtd_info *mtd)
++{
++	return container_of(mtd, struct erbium_xspi, mtd);
++}
++
++static int erbium_mtd_read(struct mtd_info *mtd, loff_t from, size_t len,
++			   size_t *retlen, u_char *buf)
++{
++	struct erbium_xspi *erb = mtd_to_erb(mtd);
++	int ret;
++
++	mutex_lock(&erb->lock);
++	ret = len > ERB_WRITE_UNIT ? erbium_bursts(erb, true) : 0;
++	if (!ret)
++		ret = erbium_mem_read(erb, ERBIUM_XSPI_MRAM_BASE + from, buf, len);
++	if (!ret)
++		ret = erbium_bursts(erb, false);
++	mutex_unlock(&erb->lock);
++	if (!ret)
++		*retlen = len;
++	return ret;
++}
++
++static int erbium_mtd_write(struct mtd_info *mtd, loff_t to, size_t len,
++			    size_t *retlen, const u_char *buf)
++{
++	struct erbium_xspi *erb = mtd_to_erb(mtd);
++	int ret;
++
++	mutex_lock(&erb->lock);
++	ret = erbium_mem_write(erb, ERBIUM_XSPI_MRAM_BASE + to, buf, len);
++	mutex_unlock(&erb->lock);
++	if (!ret)
++		*retlen = len;
++	return ret;
++}
++
++/* No erase on MRAM; emulate the NOR convention (0xff) with plain writes */
++static int erbium_mtd_erase(struct mtd_info *mtd, struct erase_info *instr)
++{
++	struct erbium_xspi *erb = mtd_to_erb(mtd);
++	u64 addr = instr->addr, end = instr->addr + instr->len;
++	int ret = 0;
++
++	memset(erb->bounce, 0xff, ERB_MAX_READ_BURST);
++	mutex_lock(&erb->lock);
++	while (addr < end && !ret) {
++		size_t n = min_t(u64, end - addr, ERB_MAX_READ_BURST);
++
++		ret = erbium_mem_write(erb, ERBIUM_XSPI_MRAM_BASE + addr,
++				       erb->bounce, n);
++		addr += n;
++	}
++	mutex_unlock(&erb->lock);
++	return ret;
++}
++
++/* ---- character device ---------------------------------------------------- */
++
++static struct erbium_xspi *file_to_erb(struct file *f)
++{
++	struct miscdevice *misc = f->private_data;
++
++	return container_of(misc, struct erbium_xspi, misc);
++}
++
++static long erbium_ioctl_mem(struct erbium_xspi *erb, unsigned int cmd,
++			     void __user *uarg)
++{
++	struct erbium_mem_xfer x;
++	void *kbuf;
++	int ret;
++
++	if (copy_from_user(&x, uarg, sizeof(x)))
++		return -EFAULT;
++	if (!x.len || x.len > SZ_1M || x.flags || x.addr + x.len > SZ_4G)
++		return -EINVAL;
++	kbuf = kvmalloc(x.len, GFP_KERNEL);
++	if (!kbuf)
++		return -ENOMEM;
++	if (cmd == ERBIUM_IOC_MEM_WRITE &&
++	    copy_from_user(kbuf, u64_to_user_ptr(x.buf), x.len)) {
++		ret = -EFAULT;
++		goto out;
++	}
++	mutex_lock(&erb->lock);
++	if (cmd == ERBIUM_IOC_MEM_WRITE) {
++		ret = erbium_mem_write(erb, x.addr, kbuf, x.len);
++	} else {
++		bool mram = x.addr + x.len <= ERBIUM_XSPI_MRAM_BASE + erb->mram_size;
++
++		ret = mram && x.len > ERB_WRITE_UNIT ? erbium_bursts(erb, true) : 0;
++		if (!ret)
++			ret = erbium_mem_read(erb, x.addr, kbuf, x.len);
++		if (!ret)
++			ret = erbium_bursts(erb, false);
++	}
++	mutex_unlock(&erb->lock);
++	if (!ret && cmd == ERBIUM_IOC_MEM_READ &&
++	    copy_to_user(u64_to_user_ptr(x.buf), kbuf, x.len))
++		ret = -EFAULT;
++out:
++	kvfree(kbuf);
++	return ret;
++}
++
++static long erbium_ioctl_sfdp(struct erbium_xspi *erb, void __user *uarg)
++{
++	struct erbium_sfdp_xfer x;
++	u32 *kbuf;
++	unsigned int i, n;
++	int ret = 0;
++
++	if (copy_from_user(&x, uarg, sizeof(x)))
++		return -EFAULT;
++	if ((x.offset | x.len) & 3 || !x.len || x.offset + x.len > ERB_SFDP_SIZE)
++		return -EINVAL;
++	n = x.len / 4;
++	kbuf = kmalloc_array(n, 4, GFP_KERNEL);
++	if (!kbuf)
++		return -ENOMEM;
++	mutex_lock(&erb->lock);
++	for (i = 0; i < n && !ret; i++) {
++		u32 v;
++
++		ret = erbium_sfdp_read_dword(erb, x.offset + 4 * i, &v);
++		kbuf[i] = cpu_to_le32(v);
++	}
++	mutex_unlock(&erb->lock);
++	if (!ret && copy_to_user(u64_to_user_ptr(x.buf), kbuf, x.len))
++		ret = -EFAULT;
++	kfree(kbuf);
++	return ret;
++}
++
++static long erbium_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
++{
++	struct erbium_xspi *erb = file_to_erb(f);
++	void __user *uarg = (void __user *)arg;
++	int ret;
++
++	switch (cmd) {
++	case ERBIUM_IOC_GET_INFO: {
++		struct erbium_info info = {};
++
++		mutex_lock(&erb->lock);
++		ret = erbium_reg_read(erb, ERBIUM_SCCR_STATUS, &info.status);
++		if (!ret)
++			ret = erbium_reg_read(erb, ERBIUM_SCCR_RATES, &info.rates);
++		if (!ret)
++			ret = erbium_reg_read(erb, ERBIUM_SCCR_INT_STATUS, &info.int_status);
++		if (!ret)
++			ret = erbium_reg_read(erb, ERBIUM_SCCR_CFG, &erb->cfg);
++		info.id0 = erb->id0;
++		info.id1 = erb->id1;
++		info.cfg = erb->cfg;
++		info.mram_size = erb->mram_size;
++		info.read_burst = erb->burst_cfg ? erbium_burst_from_cfg(erb->burst_cfg) : erb->read_burst;
++		info.write_burst = erb->write_burst;
++		info.latency_cycles = erb->latency_cycles;
++		info.cur_rates = erb->rate_cmd | erb->rate_addr << 8 | erb->rate_data << 16;
++		mutex_unlock(&erb->lock);
++		if (ret)
++			return ret;
++		return copy_to_user(uarg, &info, sizeof(info)) ? -EFAULT : 0;
++	}
++	case ERBIUM_IOC_REG_READ: {
++		struct erbium_reg r;
++
++		if (copy_from_user(&r, uarg, sizeof(r)))
++			return -EFAULT;
++		if (r.offset & ~0x3fu)
++			return -EINVAL;
++		mutex_lock(&erb->lock);
++		ret = erbium_reg_read(erb, r.offset, &r.value);
++		mutex_unlock(&erb->lock);
++		if (ret)
++			return ret;
++		return copy_to_user(uarg, &r, sizeof(r)) ? -EFAULT : 0;
++	}
++	case ERBIUM_IOC_REG_WRITE: {
++		struct erbium_reg r;
++
++		if (copy_from_user(&r, uarg, sizeof(r)))
++			return -EFAULT;
++		if (r.offset & ~0x3fu)
++			return -EINVAL;
++		mutex_lock(&erb->lock);
++		ret = erbium_reg_write(erb, r.offset, r.value);
++		if (!ret && (r.offset & 0x3f) == ERBIUM_SCCR_CFG) {
++			/* latency / burst may have changed under us */
++			ret = erbium_reg_read(erb, ERBIUM_SCCR_CFG, &erb->cfg);
++			erbium_update_params(erb);
++		}
++		mutex_unlock(&erb->lock);
++		return ret;
++	}
++	case ERBIUM_IOC_MEM_READ:
++	case ERBIUM_IOC_MEM_WRITE:
++		return erbium_ioctl_mem(erb, cmd, uarg);
++	case ERBIUM_IOC_SFDP_READ:
++		return erbium_ioctl_sfdp(erb, uarg);
++	case ERBIUM_IOC_SET_RATES: {
++		struct erbium_rates r;
++
++		if (copy_from_user(&r, uarg, sizeof(r)))
++			return -EFAULT;
++		mutex_lock(&erb->lock);
++		ret = erbium_set_rates(erb, r.cmd, r.addr, r.data);
++		mutex_unlock(&erb->lock);
++		return ret;
++	}
++	case ERBIUM_IOC_RESET:
++		mutex_lock(&erb->lock);
++		ret = erbium_chip_reset(erb);
++		mutex_unlock(&erb->lock);
++		return ret;
++	default:
++		return -ENOTTY;
++	}
++}
++
++static const struct file_operations erbium_fops = {
++	.owner = THIS_MODULE,
++	.unlocked_ioctl = erbium_ioctl,
++	.compat_ioctl = compat_ptr_ioctl,
++};
++
++/* ---- sysfs -------------------------------------------------------------- */
++
++/* misc_register() stores the miscdevice as drvdata of this_device */
++static struct erbium_xspi *sysfs_to_erb(struct device *dev)
++{
++	struct miscdevice *misc = dev_get_drvdata(dev);
++
++	return container_of(misc, struct erbium_xspi, misc);
++}
++
++static ssize_t rates_show(struct device *dev, struct device_attribute *attr,
++			  char *buf)
++{
++	struct erbium_xspi *erb = sysfs_to_erb(dev);
++	static const char * const names[] = {
++		"S1", "D1", "S2", "D2", "S4", "D4", "S8", "D8", "HB",
++	};
++	u8 r[3] = { erb->rate_cmd, erb->rate_addr, erb->rate_data };
++	int i, n = 0;
++
++	for (i = 0; i < 3; i++)
++		n += sysfs_emit_at(buf, n, "%s%s", i ? "-" : "",
++				   r[i] < ARRAY_SIZE(names) ? names[r[i]] : "?");
++	return n + sysfs_emit_at(buf, n, "\n");
++}
++static DEVICE_ATTR_RO(rates);
++
++static ssize_t mailbox_show(struct device *dev, u32 off, char *buf)
++{
++	struct erbium_xspi *erb = sysfs_to_erb(dev);
++	u32 v;
++	int ret;
++
++	mutex_lock(&erb->lock);
++	ret = erbium_mem_read_frame(erb, ERBIUM_XSPI_SYSREGS_BASE + off,
++				    erb->scratch, 8);
++	v = get_unaligned_le32(erb->scratch);
++	mutex_unlock(&erb->lock);
++	if (ret)
++		return ret;
++	return sysfs_emit(buf, "0x%08x\n", v);
++}
++
++static ssize_t mailbox_store(struct device *dev, u32 off, const char *buf,
++			     size_t count)
++{
++	struct erbium_xspi *erb = sysfs_to_erb(dev);
++	u32 val;
++	int ret;
++
++	ret = kstrtou32(buf, 0, &val);
++	if (ret)
++		return ret;
++	mutex_lock(&erb->lock);
++	put_unaligned_le64(val, erb->scratch);
++	ret = erbium_mem_write_frame(erb, ERBIUM_XSPI_SYSREGS_BASE + off,
++				     erb->scratch, 8);
++	mutex_unlock(&erb->lock);
++	return ret ? ret : count;
++}
++
++#define ERBIUM_MAILBOX_ATTR(_name, _off)					\
++static ssize_t _name##_show(struct device *dev, struct device_attribute *attr, \
++			    char *buf)						\
++{ return mailbox_show(dev, _off, buf); }					\
++static ssize_t _name##_store(struct device *dev, struct device_attribute *attr,\
++			     const char *buf, size_t count)			\
++{ return mailbox_store(dev, _off, buf, count); }				\
++static DEVICE_ATTR_RW(_name)
++
++ERBIUM_MAILBOX_ATTR(mailbox0, ERBIUM_SYSREG_MAILBOX0);
++ERBIUM_MAILBOX_ATTR(mailbox1, ERBIUM_SYSREG_MAILBOX1);
++
++static ssize_t chip_id_show(struct device *dev, struct device_attribute *attr,
++			    char *buf)
++{
++	struct erbium_xspi *erb = sysfs_to_erb(dev);
++
++	return sysfs_emit(buf, "%08x %08x\n", erb->id0, erb->id1);
++}
++static DEVICE_ATTR_RO(chip_id);
++
++static struct attribute *erbium_attrs[] = {
++	&dev_attr_rates.attr,
++	&dev_attr_mailbox0.attr,
++	&dev_attr_mailbox1.attr,
++	&dev_attr_chip_id.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(erbium);
++
++/* ---- probe --------------------------------------------------------------- */
++
++static DEFINE_IDA(erbium_ida);
++
++static int erbium_probe(struct spi_mem *mem)
++{
++	struct device *dev = &mem->spi->dev;
++	struct erbium_xspi *erb;
++	int id, ret;
++
++	erb = devm_kzalloc(dev, sizeof(*erb), GFP_KERNEL);
++	if (!erb)
++		return -ENOMEM;
++	erb->bounce = devm_kmalloc(dev, ERB_MAX_READ_BURST, GFP_KERNEL);
++	erb->scratch = devm_kmalloc(dev, ERB_WRITE_UNIT, GFP_KERNEL);
++	if (!erb->bounce || !erb->scratch)
++		return -ENOMEM;
++	erb->mem = mem;
++	mutex_init(&erb->lock);
++	spi_mem_set_drvdata(mem, erb);
++	erb->octal_dtr = erbium_octal_dtr &&
++			 !of_property_read_bool(dev->of_node, "ainekko,no-octal-dtr");
++
++	/*
++	 * We do not know which strap the board uses; assume 1S-1S-1S (strap 3)
++	 * unless the DT says otherwise.
++	 */
++	erb->rate_cmd = erb->rate_addr = erb->rate_data = ERBIUM_RATE_S1;
++	if (of_property_read_bool(dev->of_node, "ainekko,boot-octal-dtr"))
++		erb->rate_cmd = erb->rate_addr = erb->rate_data = ERBIUM_RATE_D8;
++	erb->cfg = FIELD_PREP(ERB_CFG_INIT_LATENCY, 8);
++	erb->latency_cycles = 16;
++	erb->read_burst = 8;
++	erb->write_burst = 8;
++	erb->mram_size = ERB_DEFAULT_MRAM_SIZE;
++
++	ret = erbium_sync_from_device(erb);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot read SCCR\n");
++	if (erb->id0 == 0 || erb->id0 == 0xffffffff)
++		return dev_err_probe(dev, -ENODEV, "no Erbium found (ID0=%08x)\n", erb->id0);
++
++	ret = erbium_parse_sfdp(erb);
++	if (ret)
++		dev_warn(dev, "SFDP unreadable (%d), assuming %llu bytes\n", ret, erb->mram_size);
++
++	ret = erbium_probe_bursts(erb);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot configure bursts\n");
++
++	if (erb->octal_dtr && erb->rate_cmd != ERBIUM_RATE_D8) {
++		ret = erbium_set_rates(erb, ERBIUM_RATE_D8, ERBIUM_RATE_D8, ERBIUM_RATE_D8);
++		if (ret)
++			dev_info(dev, "8D-8D-8D unavailable (%d), staying in 1S-1S-1S\n", ret);
++	}
++
++	/* MTD */
++	erb->mtd.name = devm_kasprintf(dev, GFP_KERNEL, "erbium-mram");
++	erb->mtd.dev.parent = dev;
++	erb->mtd.type = MTD_RAM;
++	erb->mtd.flags = MTD_CAP_RAM | MTD_NO_ERASE;
++	erb->mtd.size = erb->mram_size;
++	erb->mtd.writesize = 1;
++	erb->mtd.writebufsize = ERB_WRITE_PAGE;
++	erb->mtd.erasesize = ERB_WRITE_PAGE;
++	erb->mtd._read = erbium_mtd_read;
++	erb->mtd._write = erbium_mtd_write;
++	erb->mtd._erase = erbium_mtd_erase;
++	erb->mtd.owner = THIS_MODULE;
++	mtd_set_of_node(&erb->mtd, dev->of_node);
++	ret = mtd_device_register(&erb->mtd, NULL, 0);
++	if (ret)
++		return dev_err_probe(dev, ret, "mtd registration failed\n");
++
++	/* control chardev */
++	id = ida_alloc(&erbium_ida, GFP_KERNEL);
++	if (id < 0) {
++		ret = id;
++		goto err_mtd;
++	}
++	snprintf(erb->misc_name, sizeof(erb->misc_name), "erbium%d", id);
++	erb->misc.minor = MISC_DYNAMIC_MINOR;
++	erb->misc.name = erb->misc_name;
++	erb->misc.fops = &erbium_fops;
++	erb->misc.parent = dev;
++	erb->misc.groups = erbium_groups;
++	ret = misc_register(&erb->misc);
++	if (ret)
++		goto err_ida;
++
++	dev_info(dev, "Erbium xSPI id %08x/%08x, %llu KiB MRAM, %s, latency %u, burst rd %u/wr %u, /dev/%s\n",
++		 erb->id0, erb->id1, erb->mram_size / 1024,
++		 erb->rate_cmd == ERBIUM_RATE_D8 ? "8D-8D-8D" : "1S-1S-1S",
++		 erb->latency_cycles,
++		 erb->burst_cfg ? erbium_burst_from_cfg(erb->burst_cfg) : erb->read_burst,
++		 erb->write_burst,
++		 erb->misc_name);
++	return 0;
++
++err_ida:
++	ida_free(&erbium_ida, id);
++err_mtd:
++	mtd_device_unregister(&erb->mtd);
++	return ret;
++}
++
++static int erbium_remove(struct spi_mem *mem)
++{
++	struct erbium_xspi *erb = spi_mem_get_drvdata(mem);
++	int id;
++
++	if (sscanf(erb->misc_name, "erbium%d", &id) == 1)
++		ida_free(&erbium_ida, id);
++	misc_deregister(&erb->misc);
++	return mtd_device_unregister(&erb->mtd);
++}
++
++static const struct of_device_id erbium_of_match[] = {
++	{ .compatible = "ainekko,erbium-xspi" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, erbium_of_match);
++
++static const struct spi_device_id erbium_spi_ids[] = {
++	{ "erbium-xspi" },
++	{ }
++};
++MODULE_DEVICE_TABLE(spi, erbium_spi_ids);
++
++static struct spi_mem_driver erbium_driver = {
++	.spidrv = {
++		.driver = {
++			.name = "erbium-xspi",
++			.of_match_table = erbium_of_match,
++		},
++		.id_table = erbium_spi_ids,
++	},
++	.probe = erbium_probe,
++	.remove = erbium_remove,
++};
++module_spi_mem_driver(erbium_driver);
++
++MODULE_DESCRIPTION("Erbium xSPI target (MRAM + control plane) driver");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/include/uapi/linux/erbium-xspi.h
+@@ -0,0 +1,92 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * User API of the Erbium xSPI target driver (/dev/erbiumN).
++ *
++ * The MRAM is exposed as an MTD device; this character device gives access
++ * to everything else reachable through the xSPI port: the xSPI slave
++ * control/configuration registers (SCCR), the SFDP ROM, and arbitrary
++ * locations of the xSPI address map (system registers, SRAM, ...).
++ */
++#ifndef _UAPI_LINUX_ERBIUM_XSPI_H
++#define _UAPI_LINUX_ERBIUM_XSPI_H
++
++#include <linux/types.h>
++#include <linux/ioctl.h>
++
++/* xSPI address map (Erbium xSPI slave, see TRM "xSPI address translation") */
++#define ERBIUM_XSPI_MRAM_BASE		0x00000000ULL
++#define ERBIUM_XSPI_SYSREGS_BASE	0x40000000ULL
++#define ERBIUM_XSPI_SRAM_BASE		0x4000C000ULL
++#define ERBIUM_XSPI_SCCR_BASE		0x4000F000ULL
++
++/* system register offsets from ERBIUM_XSPI_SYSREGS_BASE */
++#define ERBIUM_SYSREG_SYS_INTERRUPT	0x20
++#define ERBIUM_SYSREG_MAILBOX0		0x68
++#define ERBIUM_SYSREG_MAILBOX1		0x70
++
++/* SCCR register offsets */
++#define ERBIUM_SCCR_ID0			0x00
++#define ERBIUM_SCCR_ID1			0x08
++#define ERBIUM_SCCR_CFG			0x10
++#define ERBIUM_SCCR_STATUS		0x18
++#define ERBIUM_SCCR_ADDR		0x20
++#define ERBIUM_SCCR_RATES		0x28
++#define ERBIUM_SCCR_INT_STATUS		0x30
++
++/* xSPI rates (SCCR.RATES fields and 52h Set Rate bytes) */
++#define ERBIUM_RATE_S1			0
++#define ERBIUM_RATE_S4			2
++#define ERBIUM_RATE_D4			3
++#define ERBIUM_RATE_S8			6
++#define ERBIUM_RATE_D8			7
++
++struct erbium_reg {
++	__u32 offset;		/* SCCR offset (0x00..0x3f, 8-byte stride) */
++	__u32 value;
++};
++
++struct erbium_mem_xfer {
++	__u64 addr;		/* xSPI address */
++	__u64 buf;		/* user pointer */
++	__u32 len;		/* bytes; multiple of 8 recommended for writes */
++	__u32 flags;		/* reserved, 0 */
++};
++
++struct erbium_sfdp_xfer {
++	__u32 offset;		/* SFDP byte address, 4-byte aligned */
++	__u32 len;		/* bytes, multiple of 4 */
++	__u64 buf;		/* user pointer */
++};
++
++struct erbium_rates {
++	__u8 cmd;
++	__u8 addr;
++	__u8 data;
++	__u8 pad;
++};
++
++struct erbium_info {
++	__u32 id0;
++	__u32 id1;
++	__u32 cfg;
++	__u32 status;
++	__u32 rates;		/* SCCR.RATES raw */
++	__u32 int_status;	/* last read of interrupt_status (rclr!) */
++	__u64 mram_size;
++	__u32 read_burst;	/* max bytes per Read Memory frame */
++	__u32 write_burst;	/* max bytes per Write Memory frame */
++	__u32 latency_cycles;
++	__u32 cur_rates;	/* rates the driver is currently using (cmd|addr<<8|data<<16) */
++};
++
++#define ERBIUM_IOC_MAGIC		'E'
++#define ERBIUM_IOC_GET_INFO		_IOR(ERBIUM_IOC_MAGIC, 0x00, struct erbium_info)
++#define ERBIUM_IOC_REG_READ		_IOWR(ERBIUM_IOC_MAGIC, 0x01, struct erbium_reg)
++#define ERBIUM_IOC_REG_WRITE		_IOW(ERBIUM_IOC_MAGIC, 0x02, struct erbium_reg)
++#define ERBIUM_IOC_MEM_READ		_IOW(ERBIUM_IOC_MAGIC, 0x03, struct erbium_mem_xfer)
++#define ERBIUM_IOC_MEM_WRITE		_IOW(ERBIUM_IOC_MAGIC, 0x04, struct erbium_mem_xfer)
++#define ERBIUM_IOC_SFDP_READ		_IOW(ERBIUM_IOC_MAGIC, 0x05, struct erbium_sfdp_xfer)
++#define ERBIUM_IOC_SET_RATES		_IOW(ERBIUM_IOC_MAGIC, 0x06, struct erbium_rates)
++#define ERBIUM_IOC_RESET		_IO(ERBIUM_IOC_MAGIC, 0x07)
++
++#endif /* _UAPI_LINUX_ERBIUM_XSPI_H */
+--- /dev/null
++++ b/Documentation/devicetree/bindings/mtd/ainekko,erbium-xspi.yaml
+@@ -0,0 +1,64 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/mtd/ainekko,erbium-xspi.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Erbium AI chip xSPI target port
++
++maintainers:
++  - Roman Shaposhnik <roman@nekko.ai>
++
++description: |
++  The Erbium chip attaches to a host as an xSPI (JEDEC Profile 2.0) target.
++  Its 16 MiB MRAM is memory mapped with Read/Write Memory (0Bh/02h); the
++  slave control registers, SFDP ROM and the chip's system registers/SRAM
++  are reachable through the same port.  It is not a NOR flash (no
++  write-enable, status polling or erase).
++
++allOf:
++  - $ref: /schemas/spi/spi-peripheral-props.yaml#
++
++properties:
++  compatible:
++    const: ainekko,erbium-xspi
++
++  reg:
++    maxItems: 1
++
++  ainekko,mram-size:
++    $ref: /schemas/types.yaml#/definitions/uint64
++    description:
++      Size of the MRAM in bytes.  Overrides the (buggy on early silicon)
++      SFDP density.
++
++  ainekko,boot-octal-dtr:
++    type: boolean
++    description:
++      The xspi_mode straps select 8D-8D-8D out of reset (OSPI_DEFAULT)
++      rather than 1S-1S-1S.
++
++  ainekko,no-octal-dtr:
++    type: boolean
++    description: Never switch the link to 8D-8D-8D.
++
++required:
++  - compatible
++  - reg
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    spi {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        erbium@0 {
++            compatible = "ainekko,erbium-xspi";
++            reg = <0>;
++            spi-max-frequency = <100000000>;
++            spi-tx-bus-width = <8>;
++            spi-rx-bus-width = <8>;
++        };
++    };

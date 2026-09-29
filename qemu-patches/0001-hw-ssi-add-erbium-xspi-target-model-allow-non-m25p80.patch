@@ -1,7 +1,7 @@
 From 0ed6dbd215004d3674057890382b1728b788bb4b Mon Sep 17 00:00:00 2001
 From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
 Date: Tue, 29 Sep 2026 23:05:38 +0000
-Subject: [PATCH 1/5] hw/ssi: add erbium-xspi target model; allow non-m25p80
+Subject: [PATCH 1/7] hw/ssi: add erbium-xspi target model; allow non-m25p80
  ospi-model on xlnx-versal-virt
 
 Co-authored-by: Shelley <shelley@exe.dev>

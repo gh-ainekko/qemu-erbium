@@ -1,0 +1,134 @@
+From 7fbcc7f18b6244b90c15f3a4377e5b29edbe688a Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Tue, 29 Sep 2026 23:37:05 +0000
+Subject: [PATCH 6/7] xlnx-versal: generate OSPI DT node (cdns,qspi-nor) and
+ flash children; create OSPI flash before loading the DTB
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ hw/arm/xlnx-versal-virt.c | 26 +++++++++---------
+ hw/arm/xlnx-versal.c      | 57 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 70 insertions(+), 13 deletions(-)
+
+diff --git a/hw/arm/xlnx-versal-virt.c b/hw/arm/xlnx-versal-virt.c
+index 9037818..b674a38 100644
+--- a/hw/arm/xlnx-versal-virt.c
++++ b/hw/arm/xlnx-versal-virt.c
+@@ -278,19 +278,6 @@ static void versal_virt_init(MachineState *machine)
+         sd_plug_card(s, i, drive_get(IF_SD, 0, i));
+     }
+ 
+-    s->binfo.ram_size = machine->ram_size;
+-    s->binfo.loader_start = 0x0;
+-    s->binfo.get_dtb = versal_virt_get_dtb;
+-    s->binfo.modify_dtb = versal_virt_modify_dtb;
+-    s->binfo.psci_conduit = psci_conduit;
+-    if (!machine->kernel_filename) {
+-        /* Some boot-loaders (e.g u-boot) don't like blobs at address 0 (NULL).
+-         * Offset things by 4K.  */
+-        s->binfo.loader_start = 0x1000;
+-        s->binfo.dtb_limit = 0x1000000;
+-    }
+-    arm_load_kernel(ARM_CPU(versal_get_boot_cpu(&s->soc)), machine, &s->binfo);
+-
+     for (i = 0; i < XLNX_VERSAL_NUM_OSPI_FLASH; i++) {
+         ObjectClass *flash_klass;
+         DriveInfo *dinfo = drive_get(IF_MTD, 0, i);
+@@ -324,6 +311,19 @@ static void versal_virt_init(MachineState *machine)
+         blk = dinfo ? blk_by_legacy_dinfo(dinfo) : NULL;
+         versal_ospi_create_flash(&s->soc, i, mdl, is_m25p80 ? blk : NULL);
+     }
++
++    s->binfo.ram_size = machine->ram_size;
++    s->binfo.loader_start = 0x0;
++    s->binfo.get_dtb = versal_virt_get_dtb;
++    s->binfo.modify_dtb = versal_virt_modify_dtb;
++    s->binfo.psci_conduit = psci_conduit;
++    if (!machine->kernel_filename) {
++        /* Some boot-loaders (e.g u-boot) don't like blobs at address 0 (NULL).
++         * Offset things by 4K.  */
++        s->binfo.loader_start = 0x1000;
++        s->binfo.dtb_limit = 0x1000000;
++    }
++    arm_load_kernel(ARM_CPU(versal_get_boot_cpu(&s->soc)), machine, &s->binfo);
+ }
+ 
+ static void versal_virt_machine_instance_init(Object *obj)
+diff --git a/hw/arm/xlnx-versal.c b/hw/arm/xlnx-versal.c
+index abc4b81..27e90f0 100644
+--- a/hw/arm/xlnx-versal.c
++++ b/hw/arm/xlnx-versal.c
+@@ -1533,6 +1533,36 @@ static DeviceState *versal_create_ospi(Versal *s,
+     sysbus_connect_irq(SYS_BUS_DEVICE(dma_src), 0, qdev_get_gpio_in(orgate, 1));
+     sysbus_connect_irq(SYS_BUS_DEVICE(dma_dst), 0, qdev_get_gpio_in(orgate, 2));
+ 
++    /*
++     * DT node.  The generic "cdns,qspi-nor" binding makes Linux use
++     * indirect/STIG mode only (no DAC, no OSPI DMA, no PM firmware), which
++     * is all the model needs.  Flash children are added by
++     * versal_ospi_create_flash().
++     */
++    {
++        const char compatible[] = "cdns,qspi-nor";
++        g_autofree char *node;
++
++        node = versal_fdt_add_subnode(s, "/spi", map->ctrl,
++                                      compatible, sizeof(compatible));
++        qemu_fdt_setprop_sized_cells(s->cfg.fdt, node, "reg",
++                                     2, map->ctrl, 2, 0x10000,
++                                     2, map->dac, 2, map->dac_sz);
++        qemu_fdt_setprop_cells(s->cfg.fdt, node, "interrupts",
++                               GIC_FDT_IRQ_TYPE_SPI, map->irq,
++                               GIC_FDT_IRQ_FLAGS_LEVEL_HI);
++        qemu_fdt_setprop_cells(s->cfg.fdt, node, "clocks",
++                               s->phandle.clk_125mhz);
++        qemu_fdt_setprop_cell(s->cfg.fdt, node, "cdns,fifo-depth", 256);
++        qemu_fdt_setprop_cell(s->cfg.fdt, node, "cdns,fifo-width", 4);
++        qemu_fdt_setprop_cell(s->cfg.fdt, node, "cdns,trigger-address",
++                              map->dac);
++        qemu_fdt_setprop_cell(s->cfg.fdt, node, "num-cs",
++                              4);
++        qemu_fdt_setprop_cell(s->cfg.fdt, node, "#address-cells", 1);
++        qemu_fdt_setprop_cell(s->cfg.fdt, node, "#size-cells", 0);
++    }
++
+     return dev;
+ }
+ 
+@@ -2027,6 +2057,33 @@ void versal_ospi_create_flash(Versal *s, int flash_idx, const char *flash_mdl,
+     cs_line = qdev_get_gpio_in_named(flash, SSI_GPIO_CS, 0);
+ 
+     qdev_connect_gpio_out(ospi, flash_idx, cs_line);
++
++    /* DT child of the OSPI node created in versal_create_ospi() */
++    if (s->cfg.fdt) {
++        const VersalMap *map = versal_get_map(s);
++        g_autofree char *node = g_strdup_printf("/spi@%" PRIx64 "/flash@%d",
++                                                map->ospi.ctrl, flash_idx);
++        bool is_erbium = object_dynamic_cast(OBJECT(flash), "erbium-xspi");
++
++        qemu_fdt_add_subnode(s->cfg.fdt, node);
++        if (is_erbium) {
++            qemu_fdt_setprop_string(s->cfg.fdt, node, "compatible",
++                                    "ainekko,erbium-xspi");
++        } else {
++            qemu_fdt_setprop_string(s->cfg.fdt, node, "compatible",
++                                    "jedec,spi-nor");
++        }
++        qemu_fdt_setprop_cell(s->cfg.fdt, node, "reg", flash_idx);
++        qemu_fdt_setprop_cell(s->cfg.fdt, node, "spi-max-frequency",
++                              20 * 1000 * 1000);
++        qemu_fdt_setprop_cell(s->cfg.fdt, node, "spi-tx-bus-width", 8);
++        qemu_fdt_setprop_cell(s->cfg.fdt, node, "spi-rx-bus-width", 8);
++        qemu_fdt_setprop_cell(s->cfg.fdt, node, "cdns,read-delay", 0);
++        qemu_fdt_setprop_cell(s->cfg.fdt, node, "cdns,tshsl-ns", 50);
++        qemu_fdt_setprop_cell(s->cfg.fdt, node, "cdns,tsd2d-ns", 50);
++        qemu_fdt_setprop_cell(s->cfg.fdt, node, "cdns,tchsh-ns", 4);
++        qemu_fdt_setprop_cell(s->cfg.fdt, node, "cdns,tslch-ns", 4);
++    }
+ }
+ 
+ qemu_irq versal_get_reserved_irq(Versal *s, int idx, int *dtb_idx)
+-- 
+2.43.0
+

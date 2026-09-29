@@ -1,0 +1,27 @@
+From: Erbium emulation <roman@nekko.ai>
+Subject: [PATCH 1/2] spi: cadence-quadspi: fall back to PIO when no PM firmware drives the Versal OSPI DMA mux
+
+zynqmp_pm_ospi_mux_select() returns -ENODEV when CONFIG_ZYNQMP_FIRMWARE
+is off or no TF-A is present (e.g. QEMU xlnx-versal-virt). Instead of
+failing every read larger than 3 bytes, disable the DMA path and use
+indirect PIO reads.
+---
+--- a/drivers/spi/spi-cadence-quadspi.c
++++ b/drivers/spi/spi-cadence-quadspi.c
+@@ -868,6 +868,16 @@
+ 		goto nondmard;
+ 
+ 	ret = zynqmp_pm_ospi_mux_select(cqspi->pd_dev_id, PM_OSPI_MUX_SEL_DMA);
++	if (ret == -ENODEV || ret == -EOPNOTSUPP) {
++		/*
++		 * No platform management firmware to steer the OSPI DMA mux
++		 * (e.g. running under QEMU or without TF-A).  Fall back to
++		 * PIO indirect reads for good.
++		 */
++		dev_info_once(dev, "no PM firmware for OSPI DMA, using PIO\n");
++		cqspi->use_dma_read = false;
++		return cqspi_indirect_read_execute(f_pdata, rxbuf, from_addr, n_rx);
++	}
+ 	if (ret)
+ 		return ret;
+ 

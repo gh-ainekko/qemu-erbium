@@ -1,0 +1,35 @@
+From 804503b93786bba7fb0a5740cff67bb91e5aeb2c Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Tue, 29 Sep 2026 23:45:31 +0000
+Subject: [PATCH 7/7] xlnx-versal: OSPI DT node compatible xlnx,versal-ospi-1.0
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ hw/arm/xlnx-versal.c | 9 ++++-----
+ 1 file changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/hw/arm/xlnx-versal.c b/hw/arm/xlnx-versal.c
+index 27e90f0..727777a 100644
+--- a/hw/arm/xlnx-versal.c
++++ b/hw/arm/xlnx-versal.c
+@@ -1534,13 +1534,12 @@ static DeviceState *versal_create_ospi(Versal *s,
+     sysbus_connect_irq(SYS_BUS_DEVICE(dma_dst), 0, qdev_get_gpio_in(orgate, 2));
+ 
+     /*
+-     * DT node.  The generic "cdns,qspi-nor" binding makes Linux use
+-     * indirect/STIG mode only (no DAC, no OSPI DMA, no PM firmware), which
+-     * is all the model needs.  Flash children are added by
+-     * versal_ospi_create_flash().
++     * DT node.  Linux' cadence-quadspi uses indirect/STIG mode for Versal
++     * (octal capable); its DMA path needs PM firmware and falls back to PIO
++     * without it.  Flash children are added by versal_ospi_create_flash().
+      */
+     {
+-        const char compatible[] = "cdns,qspi-nor";
++        const char compatible[] = "xlnx,versal-ospi-1.0\0cdns,qspi-nor";
+         g_autofree char *node;
+ 
+         node = versal_fdt_add_subnode(s, "/spi", map->ctrl,
+-- 
+2.43.0
+

@@ -9,11 +9,19 @@
 
 ## Added during implementation (see docs/rtl-xspi-findings.md for details)
 
-- [ ] **Linux side (M2):** write the Erbium `spi-mem` driver (MTD RAM type + control chardev); needs a
-      guest kernel, an OSPI DT node for `xlnx-versal-virt` (QEMU generates none; `docs/qemu-ospi-notes.md` §7)
-      and `OSPI_QSPI_IOU_AXI_MUX_SEL` bit1 set for DAC mode. Driver must respect: reads limited to one AXI
-      burst per CS# (8 B default, 128 B max with CFG.BurstEnable), 8-byte write granularity, 4 KiB write wrap,
-      latency = 8 + CFG.InitialLatency cycles, 4-byte addresses, ext byte in 4S/4D/8S/8D.
+- [x] **Linux side (M2):** `erbium-xspi` spi-mem driver + QEMU-generated OSPI DT node (`linux/`).
+- [ ] **SFDP density erratum:** RTL BFPT DW2 = `0x00FFFFFF` (16 Mbit) but the MRAM is 16 MiB. Driver
+      applies a fix-up / honours `ainekko,mram-size`. Confirm intended value with the HW team.
+- [ ] **Cadence WREN/RDSR on real HW:** the controller auto-inserts 06h before indirect writes and polls
+      05h afterwards; Erbium ignores 06h (RTL: not decoded) but 05h is an illegal command → check what
+      `interrupt_status.illegal_cmd` does to the next op; add a per-flash "no write completion" quirk
+      to `spi-cadence-quadspi` (or set `WR_COMPLETION_CTRL.DISABLE_POLLING` via DT).
+- [ ] **Burst reads over registers:** a Read Memory frame issues a full BurstLength AXI burst at the NoC
+      even if the host clocks 8 bytes; over sysregs that touches unimplemented offsets (DECERR). Driver
+      only enables bursts around MRAM bulk reads. Ask HW whether BurstLength should be clamped by the
+      frame or whether sysregs tolerate it.
+- [ ] **4S/4D/8S rates from a Cadence host:** they need an opcode-extension byte in STR, which the
+      controller can only send in DTR (`DUAL_BYTE_OPCODE_EN`). Only 1S-1S-1S and 8D-8D-8D are usable.
 - [ ] **HW questions from RTL vs TRM:** SRAM at CPU 0x0200C000/xSPI 0x4000C000 (TRM says 0x0200A000/0x40005000);
       SCCR size 0x38 with 8-byte stride (`hwinc/top.h` says 0x1C); max read burst 128 B (TRM says 256);
       `xspi_control.interrupt_enable` unwired; Mailbox1 @0x70; SFDP NPH=6 (should be 5), 0xFF0F pointer 0x1100

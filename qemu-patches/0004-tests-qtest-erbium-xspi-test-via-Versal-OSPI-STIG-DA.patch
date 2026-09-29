@@ -1,7 +1,7 @@
 From 9699a2f151cc51754b1f6862e77e4ae3e1393690 Mon Sep 17 00:00:00 2001
 From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
 Date: Tue, 29 Sep 2026 23:25:01 +0000
-Subject: [PATCH 4/5] tests/qtest: erbium-xspi-test via Versal OSPI
+Subject: [PATCH 4/7] tests/qtest: erbium-xspi-test via Versal OSPI
  (STIG/DAC/indirect); ospi: accumulate full frames for indirect writes
 
 Co-authored-by: Shelley <shelley@exe.dev>

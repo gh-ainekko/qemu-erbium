@@ -1,7 +1,7 @@
 From bba9b0592b30d84daf41dc226acfaa07e4278d50 Mon Sep 17 00:00:00 2001
 From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
 Date: Tue, 29 Sep 2026 23:26:37 +0000
-Subject: [PATCH 5/5] erbium-xspi: fix READ request length; loud backend loss;
+Subject: [PATCH 5/7] erbium-xspi: fix READ request length; loud backend loss;
  qtest: optional end-to-end backend-mailbox test
 
 Co-authored-by: Shelley <shelley@exe.dev>

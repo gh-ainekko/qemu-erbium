@@ -26,6 +26,8 @@ UNIX socket that models the xSPI IP's AXI port into the NoC (`docs/protocol.md`)
 | `docs/sfdp-rtl.hex`, `tools/gen_sfdp_from_trm.py` | SFDP image from RTL / generator from TRM |
 | `scripts/run-e2e.sh` | start erbium_emu with the mailbox worker and run the qtests end-to-end |
 | `scripts/apply-patches.sh` | re-apply both series on fresh clones |
+| `linux/` | guest kernel: patches (driver + cadence fix), config fragment, initramfs, `erbctl`, in-guest test — see `linux/README.md` |
+| `scripts/run-linux.sh` | boot the guest (`--test` for the autotest, `--backend SOCK` for erbium_emu) |
 
 `ext/` (Xilinx QEMU, core-et-erbium RTL) and `et-platform/` are separate clones, not tracked here.
 
@@ -54,6 +56,8 @@ qemu-system-aarch64 -M xlnx-versal-virt,ospi-flash=erbium-xspi \
   memory ops over the full xSPI map, RTL burst/latency/wrap semantics, 99h chip reset; 7 qtests.
 * M3 backend: done — `erbium_emu` serves the socket, shares MRAM, `mailbox_worker.elf` completes
   host-submitted CRC/fill jobs end-to-end through xSPI (qtest `backend-mailbox`).
-* M2 Linux `spi-mem` driver: not started (needs a guest kernel + DT node for the OSPI, see
-  `docs/qemu-ospi-notes.md` §7).
+* M2 Linux driver: done — `drivers/mtd/devices/erbium-xspi.c` (spi-mem client; MTD RAM +
+  `/dev/erbiumN` control plane, 8D-8D-8D), QEMU generates the OSPI/flash DT nodes, guest kernel
+  6.12 + busybox initramfs boots in 0.5 s and `scripts/run-linux.sh --test [--backend SOCK]` runs
+  the in-guest end-to-end test including a minion mailbox job. See `linux/README.md`.
 * HyperBus profile: not implemented (logged as unimplemented).

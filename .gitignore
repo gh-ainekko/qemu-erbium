@@ -2,3 +2,4 @@ ext/
 et-platform/
 build/
 *.img
+linux/rootfs/busybox

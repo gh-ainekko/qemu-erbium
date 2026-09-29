@@ -1,7 +1,7 @@
 From 4b67c786f553f1d2c6e697300f9d7881f9a6a42c Mon Sep 17 00:00:00 2001
 From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
 Date: Tue, 29 Sep 2026 23:21:11 +0000
-Subject: [PATCH 3/5] xlnx-versal-ospi: optional faithful-frames (opcode ext +
+Subject: [PATCH 3/7] xlnx-versal-ospi: optional faithful-frames (opcode ext +
  dummy bytes); erbium-xspi: ignore auto WREN/WRDI
 
 Co-authored-by: Shelley <shelley@exe.dev>
