@@ -22,3 +22,8 @@ for i in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
 cd "$QEMU_BUILD"
 ERBIUM_BACKEND_SOCKET=$SOCK ERBIUM_MRAM_FILE=$MRAM QTEST_QEMU_BINARY=./qemu-system-aarch64 \
     tests/qtest/erbium-xspi-test "$@"
+
+# Linux guest against the same backend (skip with NO_LINUX=1)
+if [ -z "${NO_LINUX:-}" ] && [ -f "$R/build/linux/arch/arm64/boot/Image" ]; then
+  "$R/scripts/run-linux.sh" --test --backend "$SOCK" --mram "$MRAM" 2>&1 | grep -E 'erbium-xspi spi|==|crc32|FAIL|ALL TESTS|RESULT'
+fi
