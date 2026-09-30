@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
-# End-to-end smoke: erbium_emu (mailbox worker) + QEMU erbium-xspi qtests.
+# End-to-end smoke: erbium_emu (mailbox worker) + QEMU erbium-xspi qtests + Linux guest test.
 set -euo pipefail
-R=$(cd "$(dirname "$0")/.." && pwd)
+R=$(cd "$(dirname "$0")/.." && pwd); . "$R/scripts/env.sh"
 SOCK=${SOCK:-/tmp/erb.sock}
 MRAM=${MRAM:-/tmp/mram.img}
-QEMU_BUILD=$R/ext/qemu/build
-EMU=$R/build/sw-sysemu/erbium_emu
-FW=$R/et-platform/sw-sysemu/tests/erbium/build/mailbox_worker.elf
 
-[ -x "$EMU" ] || { echo "build erbium_emu first (docs/sysemu-notes.md)"; exit 1; }
-[ -f "$FW" ] || { echo "build mailbox_worker.elf first (docs/sysemu-notes.md)"; exit 1; }
+[ -x "$EMU" ] || { echo "erbium_emu not found ($EMU); run bootstrap.sh"; exit 1; }
+[ -f "$FW" ] || { echo "mailbox_worker.elf not found ($FW); run bootstrap.sh"; exit 1; }
+[ -x "$QTEST" ] || { echo "qtest not found ($QTEST); run bootstrap.sh"; exit 1; }
 [ -f "$MRAM" ] || truncate -s 16M "$MRAM"
 rm -f "$SOCK"
 
@@ -19,11 +17,15 @@ EMU_PID=$!
 trap 'kill $EMU_PID 2>/dev/null || true' EXIT
 for i in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done
 
-cd "$QEMU_BUILD"
-ERBIUM_BACKEND_SOCKET=$SOCK ERBIUM_MRAM_FILE=$MRAM QTEST_QEMU_BINARY=./qemu-system-aarch64 \
-    tests/qtest/erbium-xspi-test "$@"
+echo "== qtests (stub backend)"
+QTEST_QEMU_BINARY="$QEMU" "$QTEST"
+echo "== qtests (erbium_emu backend)"
+ERBIUM_BACKEND_SOCKET=$SOCK ERBIUM_MRAM_FILE=$MRAM QTEST_QEMU_BINARY="$QEMU" "$QTEST"
 
 # Linux guest against the same backend (skip with NO_LINUX=1)
-if [ -z "${NO_LINUX:-}" ] && [ -f "$R/build/linux/arch/arm64/boot/Image" ]; then
-  "$R/scripts/run-linux.sh" --test --backend "$SOCK" --mram "$MRAM" 2>&1 | grep -E 'erbium-xspi spi|==|crc32|FAIL|ALL TESTS|RESULT'
+if [ -z "${NO_LINUX:-}" ] && [ -f "$IMAGE" ]; then
+  echo "== Linux guest (erbium_emu backend)"
+  out=$("$R/scripts/run-linux.sh" --test --backend "$SOCK" --mram "$MRAM" 2>&1)
+  echo "$out" | grep -E 'erbium-xspi spi|==|crc32|FAIL|ALL TESTS|RESULT'
+  echo "$out" | grep -q 'ERBIUM-TEST-RESULT 0'
 fi

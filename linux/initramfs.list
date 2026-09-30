@@ -9,7 +9,7 @@ dir /bin 0755 0 0
 dir /sbin 0755 0 0
 dir /usr 0755 0 0
 dir /usr/bin 0755 0 0
-file /bin/busybox /home/exedev/erbium-emu/linux/rootfs/busybox 0755 0 0
+file /bin/busybox @R@/linux/rootfs/busybox 0755 0 0
 slink /bin/sh busybox 0777 0 0
 slink /bin/mount busybox 0777 0 0
 slink /bin/echo busybox 0777 0 0
@@ -32,6 +32,6 @@ slink /bin/tr busybox 0777 0 0
 slink /bin/od busybox 0777 0 0
 slink /sbin/poweroff /bin/busybox 0777 0 0
 slink /sbin/reboot /bin/busybox 0777 0 0
-file /init /home/exedev/erbium-emu/linux/rootfs/init 0755 0 0
-file /etc/erbium-test.sh /home/exedev/erbium-emu/linux/rootfs/erbium-test.sh 0755 0 0
-file /bin/erbctl /home/exedev/erbium-emu/build/erbctl 0755 0 0
+file /init @R@/linux/rootfs/init 0755 0 0
+file /etc/erbium-test.sh @R@/linux/rootfs/erbium-test.sh 0755 0 0
+file /bin/erbctl @R@/build/erbctl 0755 0 0

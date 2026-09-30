@@ -1,0 +1,99 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential git curl ninja-build meson pkg-config flex bison python3-venv python3-pip ccache \
+            libglib2.0-dev libpixman-1-dev libfdt-dev libslirp-dev zlib1g-dev libgcrypt20-dev \
+            cmake libgoogle-glog-dev liblz4-dev lz4 \
+            gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf \
+            gcc-aarch64-linux-gnu libssl-dev libelf-dev bc cpio kmod dwarves device-tree-compiler
+
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: build/ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('qemu-patches/*', 'sysemu-patches/*', 'linux/patches/*', 'scripts/fetch-sources.sh') }}
+          restore-keys: ccache-${{ runner.os }}-
+
+      - name: Fetch sources and apply patches
+        run: scripts/fetch-sources.sh
+
+      - name: Build QEMU (erbium-xspi)
+        run: scripts/build-all.sh qemu
+
+      - name: Build erbium_emu (sw-sysemu backend)
+        run: scripts/build-all.sh sysemu
+
+      - name: Build minion firmware
+        run: scripts/build-all.sh firmware
+
+      - name: Build Linux guest (kernel + initramfs + erbctl)
+        run: scripts/build-all.sh linux
+
+      - name: ccache stats
+        run: ccache -s || true
+
+      - name: End-to-end test (qtests + Linux guest against erbium_emu)
+        run: scripts/run-e2e.sh 2>&1 | tee build/e2e.log
+
+      - name: Package
+        run: |
+          V=${GITHUB_REF_NAME//\//-}
+          mkdir -p out dist/scripts dist/docs
+          cp scripts/env.sh scripts/run-linux.sh scripts/run-e2e.sh dist/scripts/
+          cp README.md linux/README.md docs/protocol.md docs/erbium-qemu-TODO.md dist/docs/ 2>/dev/null || true
+          cp linux/README.md dist/linux/README.md
+          cat > dist/README.md <<'MD'
+          # erbium-emu binary distribution
+          Built by GitHub Actions on ubuntu-24.04 (x86_64). Needs: libglib2.0-0 libpixman-1-0 libfdt1 libslirp0 libgcrypt20 libgoogle-glog0v6 liblz4-1
+          (`sudo apt-get install libglib2.0-0t64 libpixman-1-0 libfdt1 libslirp0 libgcrypt20 libgoogle-glog0v6t64 liblz4-1`).
+            scripts/run-e2e.sh          # qtests + Linux guest against erbium_emu with the mailbox worker
+            scripts/run-linux.sh        # interactive guest shell (built-in stub backend)
+            scripts/run-linux.sh --backend /tmp/erb.sock   # after starting bin/erbium_emu --api-socket /tmp/erb.sock --mram-file /tmp/mram.img
+          See docs/ for the design, protocol and open questions.
+          MD
+          sed -i 's/^          //' dist/README.md
+          tar -czf out/erbium-emu-dist-$V-ubuntu24.04-x86_64.tar.gz dist
+          ls -la out; du -sh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: erbium-emu-dist
+          path: out/*.tar.gz
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs
+          path: |
+            build/e2e.log
+            build/qemu-configure.log
+            /tmp/erbium_emu.log
+          if-no-files-found: ignore
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.tar.gz
+          generate_release_notes: true
