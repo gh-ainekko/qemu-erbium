@@ -32,6 +32,9 @@ build_qemu() {
   fi
   ninja -C "$R/ext/qemu/build" -j"$J" qemu-system-aarch64 tests/qtest/erbium-xspi-test
   ninja -C "$R/ext/qemu/build" install >/dev/null
+  # the Versal machine needs no firmware blobs; drop ~300 MB of edk2/seabios images
+  find "$R/dist/share/qemu" -maxdepth 1 -type f \( -name '*.fd' -o -name '*.bin' -o -name '*.rom' -o -name '*.img' -o -name '*.dtb' -o -name '*.bz2' \) -delete
+  rm -rf "$R/dist/share/applications" "$R/dist/share/icons" "$R/dist/include" "$R/dist/libexec" "$R/dist/var" 2>/dev/null || true
   mkdir -p "$R/dist/tests"; cp "$R/ext/qemu/build/tests/qtest/erbium-xspi-test" "$R/dist/tests/"
 }
 
