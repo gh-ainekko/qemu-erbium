@@ -29,25 +29,48 @@ UNIX socket that models the xSPI IP's AXI port into the NoC (`docs/protocol.md`)
 | `linux/` | guest kernel: patches (driver + cadence fix), config fragment, initramfs, `erbctl`, in-guest test — see `linux/README.md` |
 | `scripts/run-linux.sh` | boot the guest (`--test` for the autotest, `--backend SOCK` for erbium_emu) |
 
-`ext/` (Xilinx QEMU, core-et-erbium RTL) and `et-platform/` are separate clones, not tracked here.
+`ext/` (Xilinx QEMU, linux, core-et-erbium RTL) and `et-platform/` are fetched by `scripts/fetch-sources.sh`
+at pinned revisions and patched; they are not tracked here. `.github/workflows/build.yml` builds and tests
+everything on every push and attaches a `dist` tarball (release on `v*` tags).
 
 ## Quick start
 
+**From source (Ubuntu 24.04):**
+
 ```bash
-# QEMU (see docs/qemu-ospi-notes.md §0 for the configure line)
-ninja -C ext/qemu/build qemu-system-aarch64 tests/qtest/erbium-xspi-test
-(cd ext/qemu/build && QTEST_QEMU_BINARY=./qemu-system-aarch64 tests/qtest/erbium-xspi-test)   # stub backend
+git clone https://github.com/gh-ainekko/qemu-erbium.git && cd qemu-erbium
+./bootstrap.sh          # apt deps, fetch pinned Xilinx QEMU / et-platform / linux 6.12 + apply patches,
+                        # build everything into dist/, run the end-to-end test (~25-45 min)
+```
 
-# erbium_emu + worker firmware (docs/sysemu-notes.md §1-2), then:
-./scripts/run-e2e.sh                                                                          # real CPU backend
+**From a release tarball** (built by the GitHub Actions workflow, see the *Actions* tab or *Releases* for tags `v*`):
 
-# Running QEMU by hand
+```bash
+sudo apt-get install libglib2.0-0t64 libpixman-1-0 libfdt1 libslirp0 libgcrypt20 libgoogle-glog0v6t64 liblz4-1
+tar xzf erbium-emu-dist-*.tar.gz && cd dist
+scripts/run-e2e.sh          # 15 qtests + Linux guest test against erbium_emu (~30 s)
+scripts/run-linux.sh        # interactive guest shell; try: erbctl info, cat /proc/mtd, erbctl job 0x01000040
+```
+
+**Pieces** (all driven by `scripts/`):
+
+```bash
+scripts/fetch-sources.sh    # ext/qemu @59fb95c + qemu-patches, et-platform @836a4ab + sysemu-patches, linux + linux/patches
+scripts/build-all.sh [qemu|sysemu|firmware|linux]
+scripts/run-e2e.sh          # start erbium_emu with mailbox_worker.elf, run qtests (stub + backend), boot Linux --test
+scripts/run-linux.sh [--test] [--backend SOCK] [--mram FILE]
+```
+
+Running QEMU by hand:
+
+```bash
 erbium_emu -minions 0x1 -single_thread -elf mailbox_worker.elf --api-socket /tmp/erb.sock --mram-file /tmp/mram.img &
 qemu-system-aarch64 -M xlnx-versal-virt,ospi-flash=erbium-xspi \
   -object memory-backend-file,id=mram,size=16M,mem-path=/tmp/mram.img,share=on \
   -global erbium-xspi.memdev=mram \
   -chardev socket,id=erb,path=/tmp/erb.sock -global erbium-xspi.chardev=erb \
-  -global driver=xlnx.versal-ospi,property=faithful-frames,value=on ...
+  -global driver=xlnx.versal-ospi,property=faithful-frames,value=on \
+  -kernel Image -append 'console=ttyAMA0 erbium.backend' -display none -serial mon:stdio
 ```
 
 ## Status
