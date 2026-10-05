@@ -5,9 +5,14 @@ set -euo pipefail
 R=$(cd "$(dirname "$0")" && pwd)
 "$R/scripts/preflight.sh" checkout
 if [ -z "${SKIP_APT:-}" ]; then
-  sudo apt-get update -qq
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-    build-essential git curl patch xz-utils libc6-dev-arm64-cross ninja-build meson pkg-config flex bison python3-venv python3-pip ccache \
+  APT=()
+  if [ "$(id -u)" -ne 0 ]; then
+    command -v sudo >/dev/null || { echo "Install sudo or run bootstrap.sh as root to install dependencies." >&2; exit 1; }
+    APT=(sudo)
+  fi
+  "${APT[@]}" apt-get update -qq
+  "${APT[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+    ca-certificates build-essential git curl patch xz-utils libc6-dev-arm64-cross ninja-build meson pkg-config flex bison python3-venv python3-pip ccache \
     libglib2.0-dev libpixman-1-dev libfdt-dev libslirp-dev zlib1g-dev libgcrypt20-dev \
     cmake libgoogle-glog-dev liblz4-dev lz4 \
     gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf \

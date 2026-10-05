@@ -46,7 +46,9 @@ git clone https://github.com/gh-ainekko/qemu-erbium.git && cd qemu-erbium
 **From a release tarball** (built by the GitHub Actions workflow, see the *Actions* tab or *Releases* for tags `v*`):
 
 ```bash
-sudo apt-get install libglib2.0-0t64 libpixman-1-0 libfdt1 libslirp0 libgcrypt20 libgoogle-glog0v6t64 liblz4-1
+sudo apt-get update
+sudo apt-get install libglib2.0-0t64 libpixman-1-0 libfdt1 libslirp0 libgcrypt20 zlib1g libstdc++6 libgcc-s1
+sha256sum -c erbium-emu-dist-VERSION-ubuntu24.04-x86_64.tar.gz.sha256
 tar xzf erbium-emu-dist-*.tar.gz && cd dist
 scripts/run-e2e.sh          # 15 qtests + Linux guest test against erbium_emu (~30 s)
 scripts/run-linux.sh        # interactive guest shell; try: erbctl info, cat /proc/mtd, erbctl job 0x01000040
@@ -57,9 +59,16 @@ scripts/run-linux.sh        # interactive guest shell; try: erbctl info, cat /pr
 ```bash
 scripts/fetch-sources.sh    # ext/qemu @59fb95c + qemu-patches, et-platform @836a4ab + sysemu-patches, linux + linux/patches
 scripts/build-all.sh [qemu|sysemu|firmware|linux]
+scripts/package-dist.sh VERSION  # package the complete dist/ tree into out/ + SHA-256 checksum
 scripts/run-e2e.sh          # start erbium_emu with mailbox_worker.elf, run qtests (stub + backend), boot Linux --test
 scripts/run-linux.sh [--test] [--backend SOCK] [--mram FILE]
 ```
+
+Packaging requires all built binaries, firmware, the guest kernel, QEMU data directory,
+and shipped documentation; missing inputs fail rather than creating a partial release.
+The archive uses sorted entries, normalized ownership/permissions and timestamps, and
+timestamp-free gzip headers. `SOURCE_DATE_EPOCH` overrides the default timestamp (the
+latest checkout commit); identical `dist/` contents produce identical archives.
 
 Running QEMU by hand:
 
@@ -84,3 +93,12 @@ qemu-system-aarch64 -M xlnx-versal-virt,ospi-flash=erbium-xspi \
   6.12 + busybox initramfs boots in 0.5 s and `scripts/run-linux.sh --test [--backend SOCK]` runs
   the in-guest end-to-end test including a minion mailbox job. See `linux/README.md`.
 * HyperBus profile: not implemented (logged as unimplemented).
+
+## Pristine-container validation
+
+With Docker installed, run `J=2 scripts/test-pristine-docker.sh`. It tests **HEAD**
+(commit local changes first), using only tracked files in a fresh Ubuntu 24.04
+container, with no host build tools or caches. It runs `bootstrap.sh`, regression
+tests and packaging, then tests the tarball in a second container with only the
+listed runtime libraries. Both backend and stub guest tests must pass.
+Logs, image digest, tested commit and tarball are saved in `build/container-test/`.

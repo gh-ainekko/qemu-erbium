@@ -3,3 +3,5 @@ et-platform/
 build/
 *.img
 linux/rootfs/busybox
+dist/
+out/
