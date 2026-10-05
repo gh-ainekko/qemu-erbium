@@ -63,14 +63,9 @@ build_firmware() {
 
 build_linux() {
   aarch64-linux-gnu-gcc -O2 -static -Wall -o "$R/build/erbctl" "$R/linux/tools/erbctl.c"
-  # initramfs.list has absolute paths; rewrite for this checkout
-  sed "s|@R@|$R|g" "$R/linux/initramfs.list" > "$R/build/initramfs.list"
-  local MK="make -C $R/ext/linux ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=$R/build/linux"
-  [ -f "$R/build/linux/.config" ] || \
-    $MK KCONFIG_ALLCONFIG="$R/linux/erbium.config" allnoconfig >/dev/null
-  # point the config at the rewritten list
-  sed -i "s|^CONFIG_INITRAMFS_SOURCE=.*|CONFIG_INITRAMFS_SOURCE=\"$R/build/initramfs.list\"|" "$R/build/linux/.config"
-  $MK -j"$J" Image 2>&1 | tee "$R/build/linux-build.log"
+  "$R/scripts/configure-linux.sh"
+  make -C "$R/ext/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+    O="$R/build/linux" -j"$J" Image 2>&1 | tee "$R/build/linux-build.log"
   [ -f "$R/build/linux/arch/arm64/boot/Image" ]
   mkdir -p "$R/dist/linux"; cp "$R/build/linux/arch/arm64/boot/Image" "$R/dist/linux/"
 }

@@ -11,7 +11,7 @@ fail() { echo "preflight: ERROR: $*" >&2; errors=$((errors + 1)); }
 file() { [ -s "$R/$1" ] || fail "Missing or empty file: $R/$1"; }
 tool() { command -v "$1" >/dev/null 2>&1 || fail "Missing command: $1 (Ubuntu package: $2)"; }
 selected() { [ "$target" = all ] || [ "$target" = "$1" ]; }
-for f in bootstrap.sh scripts/env.sh scripts/preflight.sh scripts/fetch-sources.sh scripts/build-all.sh scripts/run-e2e.sh scripts/run-linux.sh linux/erbium.config linux/initramfs.list linux/rootfs/init linux/rootfs/erbium-test.sh linux/tools/erbctl.c linux/tools/erbium-xspi.h; do file "$f"; done
+for f in bootstrap.sh scripts/env.sh scripts/preflight.sh scripts/fetch-sources.sh scripts/build-all.sh scripts/configure-linux.sh scripts/run-e2e.sh scripts/run-linux.sh linux/erbium.config linux/initramfs.list linux/rootfs/init linux/rootfs/erbium-test.sh linux/tools/erbctl.c linux/tools/erbium-xspi.h; do file "$f"; done
 shopt -s nullglob
 for dir in qemu-patches sysemu-patches linux/patches; do
   patches=("$R/$dir/"*.patch)
@@ -60,7 +60,7 @@ if [ "$mode" = build ]; then
   if selected sysemu; then file et-platform/erbium-hal/CMakeLists.txt; file et-platform/sw-sysemu/CMakeLists.txt; fi
   if selected firmware; then file et-platform/sw-sysemu/tests/erbium/host/mailbox_worker.c; fi
   if selected linux; then
-    file ext/linux/Makefile; file ext/linux/drivers/mtd/devices/erbium-xspi.c; file ext/linux/include/uapi/linux/erbium-xspi.h; file linux/rootfs/busybox
+    file ext/linux/Makefile; file ext/linux/scripts/config; file ext/linux/drivers/mtd/devices/erbium-xspi.c; file ext/linux/include/uapi/linux/erbium-xspi.h; file linux/rootfs/busybox
   fi
 fi
 if [ "$errors" -ne 0 ]; then

@@ -43,6 +43,9 @@ jobs:
       - name: Fetch sources and apply patches
         run: scripts/fetch-sources.sh
 
+      - name: Linux configuration regression test
+        run: python3 tests/test_linux_config.py
+
       - name: Build QEMU (erbium-xspi)
         run: scripts/build-all.sh qemu
 

@@ -29,6 +29,12 @@ scripts/preflight.sh build linux
 scripts/build-all.sh linux
 ```
 
+The build expands `@R@` in both configuration templates before running Kconfig,
+and refreshes generated configuration on every retry. If an older build failed
+with `Cannot open '@R@/build/initramfs.list'`, update the checkout and rerun
+`scripts/build-all.sh linux`; deleting `build/linux` is not necessary. Avoid
+passing the unexpanded `linux/erbium.config` template directly to `make`.
+
 `linux/rootfs/busybox`, patch files, or `linux/tools/erbctl.c` reported missing by
 old manual commands usually means the wrong working directory or an incomplete
 checkout, not a missing apt package. Do not continue to `make` after an earlier
