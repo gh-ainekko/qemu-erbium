@@ -6,6 +6,7 @@
 #   linux/rootfs/busybox  static arm64 busybox from Ubuntu
 set -euo pipefail
 R=$(cd "$(dirname "$0")/.." && pwd)
+"$R/scripts/preflight.sh" fetch
 QEMU_URL=${QEMU_URL:-https://github.com/Xilinx/qemu.git}
 QEMU_SHA=${QEMU_SHA:-59fb95c62a25821b5bd8fc594af5b7a6bdaef4dd}
 ETP_URL=${ETP_URL:-https://github.com/aifoundry-org/et-platform.git}
@@ -28,7 +29,7 @@ git_at "$R/et-platform" "$ETP_URL" "$ETP_SHA" erbium-qemu-backend "$R/sysemu-pat
 
 if [ ! -d "$R/ext/linux" ]; then
   mkdir -p "$R/ext"
-  curl -sSL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$LINUX_VER.tar.xz" -o "$R/ext/linux.tar.xz"
+  curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$LINUX_VER.tar.xz" -o "$R/ext/linux.tar.xz"
   tar xf "$R/ext/linux.tar.xz" -C "$R/ext" && mv "$R/ext/linux-$LINUX_VER" "$R/ext/linux" && rm "$R/ext/linux.tar.xz"
   for p in "$R"/linux/patches/*.patch; do patch -s -p1 -d "$R/ext/linux" < "$p"; done
   echo "ext/linux: $LINUX_VER + $(ls "$R"/linux/patches | wc -l) patches"
@@ -37,7 +38,7 @@ else
 fi
 
 if [ ! -f "$R/linux/rootfs/busybox" ]; then
-  tmp=$(mktemp -d); curl -sSL "$BUSYBOX_DEB" -o "$tmp/bb.deb"; dpkg-deb -x "$tmp/bb.deb" "$tmp/x"
+  tmp=$(mktemp -d); curl -fsSL "$BUSYBOX_DEB" -o "$tmp/bb.deb"; dpkg-deb -x "$tmp/bb.deb" "$tmp/x"
   cp "$tmp/x/usr/bin/busybox" "$R/linux/rootfs/busybox"; rm -rf "$tmp"
   echo "busybox: fetched"
 fi

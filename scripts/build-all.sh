@@ -7,6 +7,7 @@ set -euo pipefail
 R=$(cd "$(dirname "$0")/.." && pwd)
 J=${J:-$(nproc)}
 ONLY=${1:-all}
+"$R/scripts/preflight.sh" build "$ONLY"
 export CCACHE_DIR=${CCACHE_DIR:-$R/build/ccache}
 command -v ccache >/dev/null && export CC="ccache gcc" CXX="ccache g++" || true
 
@@ -69,7 +70,7 @@ build_linux() {
     $MK KCONFIG_ALLCONFIG="$R/linux/erbium.config" allnoconfig >/dev/null
   # point the config at the rewritten list
   sed -i "s|^CONFIG_INITRAMFS_SOURCE=.*|CONFIG_INITRAMFS_SOURCE=\"$R/build/initramfs.list\"|" "$R/build/linux/.config"
-  $MK -j"$J" Image 2>&1 | grep -E 'error|warning: unmet|Kernel: ' || true
+  $MK -j"$J" Image 2>&1 | tee "$R/build/linux-build.log"
   [ -f "$R/build/linux/arch/arm64/boot/Image" ]
   mkdir -p "$R/dist/linux"; cp "$R/build/linux/arch/arm64/boot/Image" "$R/dist/linux/"
 }

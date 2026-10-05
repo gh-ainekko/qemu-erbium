@@ -17,11 +17,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Preflight regression tests
+        run: python3 tests/test_preflight.py
+
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            build-essential git curl ninja-build meson pkg-config flex bison python3-venv python3-pip ccache \
+            build-essential git curl patch xz-utils libc6-dev-arm64-cross ninja-build meson pkg-config flex bison python3-venv python3-pip ccache \
             libglib2.0-dev libpixman-1-dev libfdt-dev libslirp-dev zlib1g-dev libgcrypt20-dev \
             cmake libgoogle-glog-dev liblz4-dev lz4 \
             gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf \
@@ -33,6 +36,9 @@ jobs:
           path: build/ccache
           key: ccache-${{ runner.os }}-${{ hashFiles('qemu-patches/*', 'sysemu-patches/*', 'linux/patches/*', 'scripts/fetch-sources.sh') }}
           restore-keys: ccache-${{ runner.os }}-
+
+      - name: Check build dependencies
+        run: scripts/preflight.sh deps
 
       - name: Fetch sources and apply patches
         run: scripts/fetch-sources.sh

@@ -13,19 +13,27 @@ with the `erbium-xspi` device behind the Versal Cadence OSPI controller.
 
 ## Build
 
+Use the **complete source repository**, not a kernel tarball or binary distribution.
+The scripts resolve paths from their own location; no hand-written relative patch paths are needed.
+
 ```bash
-sudo apt-get install gcc-aarch64-linux-gnu libssl-dev libelf-dev bc cpio
-# static arm64 busybox for the initramfs (not tracked)
-curl -sSL -o /tmp/bb.deb http://ports.ubuntu.com/pool/main/b/busybox/busybox-static_1.36.1-6ubuntu3.1_arm64.deb \
-  && dpkg-deb -x /tmp/bb.deb /tmp/bbx && cp /tmp/bbx/usr/bin/busybox linux/rootfs/busybox
-mkdir -p ext && curl -sSLO https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.48.tar.xz \
-  && tar xf linux-6.12.48.tar.xz -C ext && mv ext/linux-6.12.48 ext/linux
-(cd ext/linux && for p in ../../linux/patches/*.patch; do patch -p1 < $p; done)
-aarch64-linux-gnu-gcc -O2 -static -o build/erbctl linux/tools/erbctl.c          # uses linux/tools/erbium-xspi.h
-make -C ext/linux ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=$PWD/build/linux \
-     KCONFIG_ALLCONFIG=$PWD/linux/erbium.config allnoconfig
-make -C ext/linux ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=$PWD/build/linux -j2 Image
+git clone https://github.com/gh-ainekko/qemu-erbium.git
+cd qemu-erbium
+./bootstrap.sh              # check checkout, install/check deps, fetch, build, test
 ```
+
+For a Linux-only rebuild after bootstrapping:
+
+```bash
+scripts/preflight.sh build linux
+scripts/build-all.sh linux
+```
+
+`linux/rootfs/busybox`, patch files, or `linux/tools/erbctl.c` reported missing by
+old manual commands usually means the wrong working directory or an incomplete
+checkout, not a missing apt package. Do not continue to `make` after an earlier
+step fails. `scripts/preflight.sh checkout` checks tracked inputs without
+installing anything; `scripts/preflight.sh deps` also checks tools and libraries.
 
 ## Run
 
