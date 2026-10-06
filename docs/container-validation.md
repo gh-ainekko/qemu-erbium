@@ -45,3 +45,24 @@ scripts/test-dist-docker.sh out/erbium-emu-dist-VERSION-ubuntu24.04-x86_64.tar.g
 Actions invokes the same packaging and runtime-validation scripts before
 uploading the artifact. This validates Ubuntu 24.04 x86_64; it is not a claim of
 support for other host distributions or architectures.
+
+## Clean rerun after the Linux-only recovery fixes — 2026-10-06
+
+Ran `J=2 scripts/test-pristine-docker.sh` against unmodified commit
+`a481de95af4d99b7a5e046761544bb4c37c5e29d`, using the Ubuntu digest above.
+No host build trees, compiler caches, or source edits were supplied. The test
+copied committed source into a new container and invoked `./bootstrap.sh` with
+`J=2`; the complete driver script exited **0**, without manual intervention.
+
+- Full source build: QEMU, backend, firmware, Linux/initramfs, and control tool.
+- Source-build execution: 15 qtests and an actual QEMU Linux boot with backend
+  mailbox jobs; `ALL TESTS PASSED` and `ERBIUM-TEST-RESULT 0`.
+- Regression checks: eight preflight/runtime cases plus the real Kconfig test.
+- Binary-only container: checksum verified, 15 qtests passed, actual Linux boots
+  against both the backend and stub passed.
+- Stub serial log confirmed `Linux version 6.12.48-erbium`, `Run /init as init
+  process`, `ERBIUM-TEST-RESULT 0`, and `reboot: Power down`.
+
+No additional code fixes were required. The complete build and serial-output
+logs are saved locally as `build/container-test/build.log` and
+`build/container-test/runtime.log`; the script regenerates these on each run.
