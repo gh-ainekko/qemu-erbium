@@ -22,6 +22,7 @@ UNIX socket that models the xSPI IP's AXI port into the NoC (`docs/protocol.md`)
 | `docs/qemu-ospi-notes.md` | how the Versal OSPI model frames transactions; build notes |
 | `docs/sysemu-notes.md` | building/running `erbium_emu`, test ELFs, socket backend |
 | `docs/protocol.md` | QEMU <-> erbium_emu socket protocol v1 |
+| `docs/kotama-integration-proposal.md` | proposed host ELF loading, CPU warm-reset boot, and separate UART console; standalone Kotama baseline verified |
 | `docs/erbium-qemu-TODO.md` | open questions |
 | `docs/sfdp-rtl.hex`, `tools/gen_sfdp_from_trm.py` | SFDP image from RTL / generator from TRM |
 | `scripts/run-e2e.sh` | start erbium_emu with the mailbox worker and run the qtests end-to-end |
