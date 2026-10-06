@@ -14,3 +14,30 @@ for d in "$R/share/qemu" "$R/dist/share/qemu"; do
     QEMU_ARGS=(-L "$d"); break
   fi
 done
+
+# Check runtime artifacts without requiring source or compiler dependencies.
+# Keep these functions here so source checkouts and release tarballs agree.
+runtime_hint() {
+  if [ -f "$R/bootstrap.sh" ]; then
+    echo "From $R: run J=2 ./bootstrap.sh to build the complete stack." >&2
+    echo "For just the stub guest, build both targets: scripts/build-all.sh qemu && scripts/build-all.sh linux" >&2
+  else
+    echo "Re-extract the complete binary distribution, or check QEMU/IMAGE overrides." >&2
+  fi
+}
+require_qemu() {
+  if ! command -v "$QEMU" >/dev/null 2>&1; then
+    echo "Missing or non-executable Erbium QEMU: $QEMU" >&2
+    echo "A Linux-only build produces the guest Image, not the emulator. Stock Ubuntu QEMU does not include this device." >&2
+    runtime_hint
+    return 1
+  fi
+}
+require_guest() {
+  require_qemu || return 1
+  if [ ! -s "$IMAGE" ]; then
+    echo "Missing or empty Linux guest Image: $IMAGE" >&2
+    runtime_hint
+    return 1
+  fi
+}

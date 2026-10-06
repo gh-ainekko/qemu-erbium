@@ -67,7 +67,9 @@ build_linux() {
   make -C "$R/ext/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
     O="$R/build/linux" -j"$J" Image 2>&1 | tee "$R/build/linux-build.log"
   [ -f "$R/build/linux/arch/arm64/boot/Image" ]
-  mkdir -p "$R/dist/linux"; cp "$R/build/linux/arch/arm64/boot/Image" "$R/dist/linux/"
+  mkdir -p "$R/dist/linux" "$R/dist/bin"
+  cp "$R/build/linux/arch/arm64/boot/Image" "$R/dist/linux/"
+  cp "$R/build/erbctl" "$R/dist/bin/erbctl-aarch64"
 }
 
 mkdir -p "$R/build" "$R/dist"
@@ -76,5 +78,9 @@ case "$ONLY" in
   qemu) build_qemu ;; sysemu) build_sysemu ;; firmware) build_firmware ;; linux) build_linux ;;
   *) echo "usage: $0 [all|qemu|sysemu|firmware|linux]"; exit 2 ;;
 esac
-cp "$R/build/erbctl" "$R/dist/bin/erbctl-aarch64" 2>/dev/null || true
-echo "dist/ ready:"; find "$R/dist" -maxdepth 2 -type f | grep -v share/qemu | sed "s|$R/||"
+echo "Build target '$ONLY' completed. Current dist/ contents:"
+find "$R/dist" -maxdepth 2 -type f | grep -v share/qemu | sed "s|$R/||"
+if [ "$ONLY" != all ]; then
+  echo "This was a partial build, not a full-stack readiness check."
+  echo "Run J=2 ./bootstrap.sh to complete the stack; a stub guest needs both qemu and linux targets."
+fi

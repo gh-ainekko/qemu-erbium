@@ -12,6 +12,7 @@ while [ $# -gt 0 ]; do
     *) EXTRA+=("$1"); shift;;
   esac
 done
+require_guest
 [ -f "$MRAM" ] || truncate -s 16M "$MRAM"
 CHR=()
 if [ -n "$SOCK" ]; then

@@ -22,12 +22,20 @@ cd qemu-erbium
 ./bootstrap.sh              # check checkout, install/check deps, fetch, build, test
 ```
 
-For a Linux-only rebuild after bootstrapping:
+For a Linux-only rebuild **after the complete bootstrap has succeeded**:
 
 ```bash
 scripts/preflight.sh build linux
 scripts/build-all.sh linux
 ```
+
+`build-all.sh linux` builds only the guest Image and `erbctl`; it does not build
+QEMU, the backend, or minion firmware. If `run-linux.sh` reports a missing
+`qemu-system-aarch64`, run `J=2 ./bootstrap.sh` to finish the full stack (existing
+build products are reused). For just a stub guest with sources/dependencies
+already installed, run `J=2 scripts/build-all.sh qemu`, then
+`scripts/run-linux.sh --test`. Do not substitute stock Ubuntu QEMU: it lacks
+our Erbium device.
 
 The build expands `@R@` in both configuration templates before running Kconfig,
 and refreshes generated configuration on every retry. If an older build failed

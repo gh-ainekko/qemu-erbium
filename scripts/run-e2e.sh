@@ -5,6 +5,7 @@ R=$(cd "$(dirname "$0")/.." && pwd); . "$R/scripts/env.sh"
 SOCK=${SOCK:-/tmp/erb.sock}
 MRAM=${MRAM:-/tmp/mram.img}
 
+require_qemu
 [ -x "$EMU" ] || { echo "erbium_emu not found ($EMU); run bootstrap.sh"; exit 1; }
 [ -f "$FW" ] || { echo "mailbox_worker.elf not found ($FW); run bootstrap.sh"; exit 1; }
 [ -x "$QTEST" ] || { echo "qtest not found ($QTEST); run bootstrap.sh"; exit 1; }
