@@ -47,7 +47,8 @@ void smallvm_platform_flush(void) {
 
 void hardwareInit(void) {
     write32(SYS_CONFIG, read32(SYS_CONFIG) | (1u << 6));
-    /* Erbium UART input clock is 200MHz/30; divisor rounded for 115200. */
+    /* Provisional divider for emulator bring-up. Stream emulation ignores baud;
+     * physical UART clock/divider/framing still require board qualification. */
     write32(UART_BASE, 58);
     write32(UART_BASE + 0x30, 0); /* no UART IRQ; cooperative polling */
     *(volatile uint64_t *)(uintptr_t)ESR_TIME_CONFIG = 20;

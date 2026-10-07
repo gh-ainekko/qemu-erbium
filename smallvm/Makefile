@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Isolated Erbium/LP64 C target. Source fetching/patches are managed separately.
 ROOT := $(abspath ..)
 SMALLVM_SRC ?= $(ROOT)/ext/smallvm
@@ -10,7 +11,7 @@ READELF := $(CROSS)readelf
 SIZE := $(CROSS)size
 PICOLIBC := $(DEPS)/usr/lib/picolibc/riscv64-unknown-elf
 LIBC := $(PICOLIBC)/lib/rv64im/lp64/libc.a
-SELFTEST_SOURCES ?= tests/vm_selftest.c
+SELFTEST_SOURCES ?= tests/vm_selftest.c tests/gc_regressions.c
 ERBIUM_TIMER_HZ ?= 2000000
 ARCH := -march=rv64imc_zicsr_zifencei -mabi=lp64 -mcmodel=medany
 CPPFLAGS := -I$(SMALLVM_SRC)/vm -Ierbium \
@@ -33,7 +34,7 @@ VPATH := $(SMALLVM_SRC)/vm:platform:erbium:$(sort $(dir $(SELFTEST_SOURCES)))
 LDFLAGS := $(ARCH) -nostartfiles -nostdlib -T erbium/erbium.ld \
 	-Wl,--gc-sections -Wl,--no-relax -Wl,--defsym=vfprintf=__i_vfprintf
 
-.PHONY: all firmware selftest deps clean host-selftest host-selftest-sanitize FORCE
+.PHONY: all firmware selftest deps clean host-selftest host-selftest-sanitize host-selftest-32 FORCE
 all: firmware
 firmware: $(BUILD)/smallvm.elf $(BUILD)/smallvm.dis $(BUILD)/smallvm.headers
 selftest: $(BUILD)/smallvm-selftest.elf $(BUILD)/smallvm-selftest.dis $(BUILD)/smallvm-selftest.headers
@@ -81,18 +82,35 @@ $(BUILD)/%.headers: $(BUILD)/%.elf
 HOSTCC ?= cc
 HOSTSOURCES := $(addprefix $(SMALLVM_SRC)/vm/,$(addsuffix .c,$(VM))) \
 	platform/stubs.c $(SELFTEST_SOURCES) tests/host_platform.c
-host-selftest: $(BUILD)/host-selftest
-	$(BUILD)/host-selftest
+host-selftest: $(BUILD)/host-selftest $(BUILD)/native-primitive.so
+	SMALLVM_NATIVE_LIBRARY=$(BUILD)/native-primitive.so timeout 60 $(BUILD)/host-selftest
+	timeout 10 $(BUILD)/host-selftest --reject-high-object
+	timeout 10 $(BUILD)/host-selftest --reject-unaligned-object
+$(BUILD)/native-primitive.so: tests/native_primitive.c
+	@mkdir -p $(@D)
+	$(HOSTCC) -shared -fPIC -O2 -g -o $@ $<
 $(BUILD)/host-selftest: $(HOSTSOURCES) $(HEADERS) $(BUILD)/host.flags Makefile
 	@mkdir -p $(@D)
 	$(HOSTCC) $(CPPFLAGS) $(CFLAGS) -fno-pie -no-pie -DSMALLVM_SELFTEST \
 		-Wl,--gc-sections -o $@ $(HOSTSOURCES)
-host-selftest-sanitize: $(BUILD)/host-selftest-sanitize
-	ASAN_OPTIONS=detect_leaks=1 $(BUILD)/host-selftest-sanitize
+host-selftest-sanitize: $(BUILD)/host-selftest-sanitize $(BUILD)/native-primitive.so
+	SMALLVM_NATIVE_LIBRARY=$(BUILD)/native-primitive.so \
+		ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+		timeout 60 $(BUILD)/host-selftest-sanitize
 $(BUILD)/host-selftest-sanitize: $(HOSTSOURCES) $(HEADERS) $(BUILD)/host.flags Makefile
 	@mkdir -p $(@D)
 	$(HOSTCC) $(CPPFLAGS) $(CFLAGS) -fno-pie -no-pie -DSMALLVM_SELFTEST \
 		-fsanitize=address,undefined -fno-omit-frame-pointer \
+		-Wl,--gc-sections -o $@ $(HOSTSOURCES)
+# Optional legacy-pointer regression (requires 32-bit libc/GCC support and qemu-user).
+HOST32_RUNNER ?= qemu-i386
+host-selftest-32: $(BUILD)/host-selftest-32
+	UBSAN_OPTIONS=halt_on_error=1 timeout 60 $(HOST32_RUNNER) $(BUILD)/host-selftest-32
+$(BUILD)/host-selftest-32: $(HOSTSOURCES) $(HEADERS) $(BUILD)/host.flags Makefile
+	@mkdir -p $(@D)
+	$(HOSTCC) -m32 $(filter-out -DSMALLVM_COMPACT_32=1,$(CPPFLAGS)) \
+		-DSMALLVM_COMPACT_32=0 $(CFLAGS) -fno-pie -no-pie -DSMALLVM_SELFTEST \
+		-fsanitize=undefined -fno-sanitize-recover=all \
 		-Wl,--gc-sections -o $@ $(HOSTSOURCES)
 clean:
 	rm -f $(FWOBJ) $(STOBJ) $(FWOBJ:.o=.d) $(STOBJ:.o=.d) \
@@ -100,5 +118,6 @@ clean:
 		$(BUILD)/smallvm-selftest.elf $(BUILD)/smallvm-selftest.map \
 		$(BUILD)/smallvm-selftest.dis $(BUILD)/smallvm-selftest.headers \
 		$(BUILD)/host-selftest $(BUILD)/host-selftest-sanitize \
+		$(BUILD)/host-selftest-32 $(BUILD)/native-primitive.so \
 		$(BUILD)/rv64.flags $(BUILD)/host.flags
 -include $(wildcard $(BUILD)/firmware/*.d $(BUILD)/selftest/*.d)

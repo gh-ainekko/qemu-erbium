@@ -1,0 +1,211 @@
+From b3e0be90e6a024474c3df9c9264d486be0408b10 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 7 Oct 2026 02:39:46 +0000
+Subject: [PATCH] Fix moving-GC sources and export heap-owned code literals
+
+Mark DFS nodes before scanning self edges, refresh allocating string primitives, and copy pushed binary literals to heap ownership so live code compaction cannot invalidate VM roots. Bound primitive-name components and parse hexadecimal/binary values with explicit overflow checks independent of ILP32 long saturation. Verified shared baseline and 385 GC regressions on LP64 ASan/UBSan, legacy 32-bit UBSan under qemu-i386, and RV64 emulator.
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ vm/PORTABILITY.md | 15 ++++++++++-----
+ vm/dataPrims.c    | 21 ++++-----------------
+ vm/interp.c       | 16 +++++++++++++++-
+ vm/mem.c          |  4 ++++
+ vm/miscPrims.c    | 35 +++++++++++++++++++++++++----------
+ vm/runtime.c      |  4 ++--
+ 6 files changed, 60 insertions(+), 35 deletions(-)
+
+diff --git a/vm/PORTABILITY.md b/vm/PORTABILITY.md
+index 23a48fa..8092642 100644
+--- a/vm/PORTABILITY.md
++++ b/vm/PORTABILITY.md
+@@ -48,8 +48,13 @@ needed, and this profile does not require libm or mbFont. Hardware reset uses
+ hooks and the interpreter's hardwired I/O entry points still need a backend;
+ unsupported user operations should report `primitiveNotImplemented`.
+ 
+-Heap GC forwards all VM roots and references. It does not relocate live
+-references into a moving code store. Code-store compaction therefore still
+-requires stopping tasks and clearing literal-bearing live state on platforms
+-that move code; this port does not claim arbitrary live-update relocation or
+-power-loss-safe persistence.
++`pushLiteral` copies packed string/byte-array literals into the heap before
++exporting them to the VM stack. Globals, lists, task stacks, and broadcast
++roots therefore never retain language-visible references into the moving code
++store. Lookup-only primitive-name operands still refer directly to code and
++are not exported. Native suspended-task code pointers are repaired by chunk
++index after code compaction; saved IPs and return addresses are offsets.
++Changing the contents of a currently executing chunk still needs the caller's
++usual stop/update policy; this port does not claim arbitrary live-update
++replacement or power-loss-safe persistence. Native extensions must not bypass
++this ownership policy by retaining code-store handles.
+diff --git a/vm/dataPrims.c b/vm/dataPrims.c
+index 9cc4b96..cc74569 100644
+--- a/vm/dataPrims.c
++++ b/vm/dataPrims.c
+@@ -74,11 +74,8 @@ OBJ charAt(OBJ stringObj, int i) {
+ 		start = nextUTF8(start);
+ 	}
+ 	int byteCount = nextUTF8(start) - start;
+-	OBJ result = newString(byteCount);
+-	if (result) {
+-		memcpy(obj2str(result), start, byteCount);
+-	}
+-	return result;
++	// The byte-copy allocator roots an interior heap source before it collects.
++	return newStringFromBytes(start, byteCount);
+ }
+ 
+ int unicodeCodePoint(char *s) {
+@@ -222,17 +219,7 @@ OBJ primAt(int argCount, OBJ *args) {
+ 	if (IS_TYPE(obj, ListType)) {
+ 		return FIELD(obj, i);
+ 	} else if (IS_TYPE(obj, StringType)) {
+-		char *start = obj2str(obj);
+-		while (i-- > 1) { // find start of the ith Unicode character
+-			if (!*start) return fail(indexOutOfRangeError); // end of string
+-			start = nextUTF8(start);
+-		}
+-		int byteCount = nextUTF8(start) - start;
+-		OBJ result = newString(byteCount);
+-		if (result) {
+-			memcpy(obj2str(result), start, byteCount);
+-		}
+-		return result;
++		return charAt(obj, i);
+ 	} else if (IS_TYPE(obj, ByteArrayType)) {
+ 		uint8 *bytes = (uint8 *) &FIELD(obj, 0);
+ 		return int2obj(bytes[i - 1]);
+@@ -861,7 +848,7 @@ OBJ primAsByteArray(int argCount, OBJ *args) {
+ 		result = newObj(ByteArrayType, (byteCount + 3) / 4, falseObj);
+ 		if (result) {
+ 			setByteCountAdjust(result, byteCount);
+-			memcpy(&FIELD(result, 0), obj2str(arg), byteCount);
++			memcpy(&FIELD(result, 0), obj2str(args[0]), byteCount); // forwarded argument
+ 		}
+ 	} else if (IS_TYPE(arg, ListType)) {
+ 		byteCount = obj2int(FIELD(arg, 0));
+diff --git a/vm/interp.c b/vm/interp.c
+index cba6ec0..3b9b213 100644
+--- a/vm/interp.c
++++ b/vm/interp.c
+@@ -652,7 +652,21 @@ static void runTask(Task *task) {
+ 	pushLiteral_op:
+ 		STACK_CHECK(1);
+ 		tmp = *ip; // offset to the literal is in the following 16-bit word
+-		*sp++ = ptrToObj(ip++ + tmp);
++		tmpObj = ptrToObj(ip++ + tmp);
++		// Export heap-owned binary literals, not references into the moving code
++		// store. Preserve the packed header (including byte-array size adjustment).
++		// Primitive-name operands below remain lookup-only code references.
++		{
++			int type = TYPE(tmpObj);
++			int words = WORDS(tmpObj);
++			if (type != StringType && type != ByteArrayType) {
++				fail(needsStringError);
++				goto error;
++			}
++			OBJ literal = newObj(type, words, falseObj);
++			if (literal) memcpy(objToPtr(literal), objToPtr(tmpObj), 4 * (words + 1));
++			*sp++ = literal;
++		}
+ 		DISPATCH();
+ 	pushGlobal_op:
+ 		STACK_CHECK(1);
+diff --git a/vm/mem.c b/vm/mem.c
+index 19f0887..13db53b 100644
+--- a/vm/mem.c
++++ b/vm/mem.c
+@@ -459,6 +459,9 @@ void mark(OBJ root) {
+ 
+ 	OBJ current = root;
+ 	int i = (TYPE(current) > BinaryObjectTypes) ? WORDS(current) : 0; // scan backwards from last field
++	// The forwarding field is also the "visiting" marker. Mark before scanning,
++	// including when no prior descent has recorded a parent field index.
++	SET_MARK(current);
+ 
+ 	while (1) {
+ 		if (i == 0) { // done processing fields of the current object
+@@ -484,6 +487,7 @@ void mark(OBJ root) {
+ 				i = WORDS(child); // scan backwards from last field of child
+ 				*objToPtr(child) = objBits(current); // backpointer to current
+ 				current = child; // process child
++				SET_MARK(current); // self/ancestor edges must not reverse this header again
+ 			} else {
+ 				SET_MARK(child);
+ 			}
+diff --git a/vm/miscPrims.c b/vm/miscPrims.c
+index 3f164bd..30d9452 100644
+--- a/vm/miscPrims.c
++++ b/vm/miscPrims.c
+@@ -36,26 +36,41 @@ OBJ primBLE_ID(int argCount, OBJ *args) {
+ 	return result;
+ }
+ 
++static OBJ parseBasedInteger(const char *s, unsigned base) {
++	// Do not rely on strtol saturation or native long width. Positive patterns
++	// use up to 31 bits; negative magnitudes must fit the signed VM range.
++	while (*s == ' ' || (*s >= '\t' && *s <= '\r')) s++;
++	int negative = 0;
++	if (*s == '-' || *s == '+') { negative = (*s == '-'); s++; }
++	if (base == 16 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
++	uint32_t result = 0;
++	uint32_t limit = negative ? UINT32_C(0x40000000) : UINT32_C(0x7FFFFFFF);
++	while (*s) {
++		unsigned digit;
++		if (*s >= '0' && *s <= '9') digit = *s - '0';
++		else if (*s >= 'a' && *s <= 'f') digit = *s - 'a' + 10;
++		else if (*s >= 'A' && *s <= 'F') digit = *s - 'A' + 10;
++		else break;
++		if (digit >= base) break;
++		if (result > (limit - digit) / base) return fail(hexRangeError);
++		result = result * base + digit;
++		s++;
++	}
++	return int2obj(negative ? (uint32_t)0 - result : result);
++}
++
+ OBJ primHexToInt(int argCount, OBJ *args) {
+ 	if (!IS_TYPE(args[0], StringType)) return fail(needsStringError);
+ 
+ 	char *s = obj2str(args[0]);
+ 	if ('#' == *s) s++; // skip leading # if there is one
+-	if (('0' == *s) && (('x' == s[1]) || ('X' == s[1]))) s += 2; // skip leading '0x' or '0X'
+-	long result = strtol(s, NULL, 16);
+-	// Interpret the low 31 bits as a signed VM integer, independent of C long.
+-	// Positive bit patterns with bit 30 set represent negative VM integers.
+-	if ((result < -0x40000000L) || (result > 0x7FFFFFFFL)) return fail(hexRangeError);
+-	return int2obj((uint32_t) result);
++	return parseBasedInteger(s, 16);
+ }
+ 
+ OBJ primBinaryToInt(int argCount, OBJ *args) {
+ 	if (!IS_TYPE(args[0], StringType)) return fail(needsStringError);
+ 
+-	char *s = obj2str(args[0]);
+-	long result = strtol(s, NULL, 2);
+-	if ((result < -0x40000000L) || (result > 0x7FFFFFFFL)) return fail(hexRangeError);
+-	return int2obj((uint32_t) result);
++	return parseBasedInteger(obj2str(args[0]), 2);
+ }
+ 
+ OBJ primRescale(int argCount, OBJ *args) {
+diff --git a/vm/runtime.c b/vm/runtime.c
+index 9d4252a..608b693 100644
+--- a/vm/runtime.c
++++ b/vm/runtime.c
+@@ -149,13 +149,13 @@ PrimitiveFunction findPrimitive(char *primName) {
+ 
+ 	// extract primitive set name
+ 	int count = colon - (primName + 1);
+-	if (count < 1) return NULL;
++	if (count < 1 || count >= (int)sizeof(setName)) return NULL;
+ 	strncpy(setName, primName + 1, count);
+ 	setName[count] = 0;
+ 
+ 	// extract primitive name
+ 	count = (primName + len - 1) - (colon + 1);
+-	if (count < 1) return NULL;
++	if (count < 1 || count >= (int)sizeof(opName)) return NULL;
+ 	strncpy(opName, colon + 1, count);
+ 	opName[count] = 0;
+ 

@@ -1,0 +1,1005 @@
+From 177eb3b6bc277112a7c446a408732eeeec0a7e31 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 7 Oct 2026 02:34:59 +0000
+Subject: [PATCH 1/2] Use checked compact VM objects with native code pointers
+
+Default LP64 builds to uint32_t handles while retaining legacy pointer-shaped OBJ for 32-bit C++ boards. Keep four-byte fields and GC forwarding words, protect allocator fill and byte-copy roots, and avoid signed tag/shift overflow. Make interpreter code and primitive pointers native-width and add a minimal C runtime profile.
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ vm/interp.c  |  82 +++++++++++--------
+ vm/interp.h  |  30 ++++++-
+ vm/mem.c     | 226 ++++++++++++++++++++++++++++++++-------------------
+ vm/mem.h     |  49 ++++++++---
+ vm/runtime.c |  29 ++++---
+ 5 files changed, 272 insertions(+), 144 deletions(-)
+
+diff --git a/vm/interp.c b/vm/interp.c
+index 77680ec..cba6ec0 100644
+--- a/vm/interp.c
++++ b/vm/interp.c
+@@ -12,7 +12,9 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#ifdef GNUBLOCKS
+ #include <unistd.h>
++#endif
+ 
+ #include "mem.h"
+ #include "interp.h"
+@@ -179,7 +181,7 @@ static OBJ primMSecsSince(int argCount, OBJ *args) {
+ 	int startTime = obj2int(args[0]);
+ 	int endTime = ((argCount > 1) && isInt(args[1])) ?
+ 		obj2int(args[1]) :
+-		((uint32) ((totalMicrosecs() / 1000))) & 0x3FFFFFFF;
++		(int)((totalMicrosecs() / 1000) & 0x3FFFFFFF);
+ 
+ 	int deltaTime = endTime - startTime;
+ 	if (deltaTime < 0) deltaTime += 0x40000000;
+@@ -190,7 +192,7 @@ static OBJ primUSecsSince(int argCount, OBJ *args) {
+ 	int startTime = obj2int(args[0]);
+ 	int endTime = ((argCount > 1) && isInt(args[1])) ?
+ 		obj2int(args[1]) :
+-		microsecs() & 0x3FFFFFFF;
++		(int)(microsecs() & 0x3FFFFFFF);
+ 
+ 	int deltaTime = endTime - startTime;
+ 	if (deltaTime < 0) deltaTime += 0x40000000;
+@@ -211,7 +213,7 @@ OBJ primBoardType() {
+ 	strncpy(boardTypeObj.body, boardType(), BOARD_TYPE_SIZE - 1);
+ 	int wordCount = (strlen(boardTypeObj.body) + 4) / 4;
+ 	boardTypeObj.header = HEADER(StringType, wordCount);
+-	return (OBJ) &boardTypeObj;
++	return ptrToObj(&boardTypeObj);
+ }
+ 
+ // Misc primitives
+@@ -241,8 +243,9 @@ static OBJ primRandom(int argCount, OBJ *args) {
+ 		first = last;
+ 		last = tmp;
+ 	}
+-	int range = (last + 1) - first; // if first == last range is 1 and first is returned
+-	return int2obj(first + (rand() % range)); // result range is [first..last], inclusive
++	uint32_t range = (uint32_t)last - (uint32_t)first + 1u;
++	if (!range) return int2obj(rand()); // full 32-bit range from numeric strings
++	return int2obj((uint32_t)first + ((uint32_t)rand() % range));
+ }
+ 
+ static OBJ primMinimum(int argCount, OBJ *args) {
+@@ -270,7 +273,7 @@ static OBJ primMaximum(int argCount, OBJ *args) {
+ }
+ 
+ static inline OBJ primSum(int argCount, OBJ *args) {
+-	int result = 0;
++	uint32_t result = 0; // wrap explicitly; tagged integers retain the low 31 bits
+ 	if ((1 == argCount) && IS_TYPE(args[0], ListType)) {
+ 		OBJ *src = &FIELD(args[0], 0);
+ 		int count = obj2int(*src++); // list item count
+@@ -299,11 +302,11 @@ static inline int compareObjects(OBJ obj1, OBJ obj2) {
+ 	if (IS_TYPE(obj1, StringType) && IS_TYPE(obj2, StringType)) {
+ 		return strcmp(obj2str(obj1), obj2str(obj2));
+ 	} else if (IS_TYPE(obj1, StringType) && isInt(obj2)) {
+-		n1 = strtol(obj2str(obj1), NULL, 10);
++		n1 = evalInt(obj1);
+ 		n2 = obj2int(obj2);
+ 	} else if (isInt(obj1) && IS_TYPE(obj2, StringType)) {
+ 		n1 = obj2int(obj1);
+-		n2 = strtol(obj2str(obj2), NULL, 10);
++		n2 = evalInt(obj2);
+ 	} else if (isInt(obj1) && isInt(obj2)) {
+ 		// Note: For efficiency, caller should handle this special case
+ 		n1 = obj2int(obj1);
+@@ -393,16 +396,12 @@ int chunkIndexForFunction(char *functionName) {
+ 
+ PrimitiveFunction findPrimitive(char *namedPrimitive);
+ 
+-static int findCallee(char *functionOrPrimitiveName) {
+-	// Look for a primitive match first since that is fast
+-	PrimitiveFunction f = findPrimitive(functionOrPrimitiveName);
+-	if (f) return (int) f;
+-
+-	// Look for a user-defined function match (slow if no match found!)
+-	int result = chunkIndexForFunction(functionOrPrimitiveName);
+-	if (result >= 0) return (0xFFFFFF00 | result); // set top 24 bits to show callee is a chunk
+-	// assume: result < 256 (MAX_CHUNKS) so it fits in low 8 bits
+-
++// C function pointers are native-width and never encoded in VM values.
++static int findCallee(char *name, PrimitiveFunction *primitive) {
++	*primitive = findPrimitive(name);
++	if (*primitive) return 0;
++	int chunk = chunkIndexForFunction(name);
++	if (chunk >= 0) return chunk;
+ 	fail(primitiveNotImplemented);
+ 	return -1;
+ }
+@@ -424,6 +423,7 @@ static int findCallee(char *functionOrPrimitiveName) {
+ // Macros to support function calls
+ #define IN_CALL() (fp > task->stack)
+ 
++#ifdef SMALLVM_INTERP_DEBUG
+ static void interpDebug(int ip, int cmd, int arg, int sp) {
+ 	// Show interpreter state for debugging.
+ 
+@@ -432,6 +432,8 @@ static void interpDebug(int ip, int cmd, int arg, int sp) {
+ 	outputString(tmpStr); \
+ }
+ 
++#endif
++
+ // Macro to inline dispatch in the end of each opcode (avoiding a jump back to the top)
+ #define DISPATCH() { \
+ 	if (errorCode) goto error; \
+@@ -644,13 +646,13 @@ static void runTask(Task *task) {
+ 	pushLargeInteger_op:
+ 		// push an integer object that fits into 24 bits
+ 		STACK_CHECK(1);
+-		tmp = (*ip++ << 8) | (arg & 0xFF); // most significant bits are in the following 16-bit word
++		tmp = (int32_t)(((uint32_t)(int32_t)*ip++ << 8) | (arg & 0xFF)); // most significant bits are in the following 16-bit word
+ 		*sp++ = (OBJ) tmp;
+ 		DISPATCH();
+ 	pushLiteral_op:
+ 		STACK_CHECK(1);
+ 		tmp = *ip; // offset to the literal is in the following 16-bit word
+-		*sp++ = (OBJ) (ip++ + tmp);
++		*sp++ = ptrToObj(ip++ + tmp);
+ 		DISPATCH();
+ 	pushGlobal_op:
+ 		STACK_CHECK(1);
+@@ -1012,15 +1014,15 @@ static void runTask(Task *task) {
+ 		POP_ARGS_REPORTER();
+ 		DISPATCH();
+ 	add_op:
+-		*(sp - arg) = int2obj(evalInt(*(sp - 2)) + evalInt(*(sp - 1)));
++		*(sp - arg) = int2obj((uint32_t)evalInt(*(sp - 2)) + (uint32_t)evalInt(*(sp - 1)));
+ 		POP_ARGS_REPORTER();
+ 		DISPATCH();
+ 	subtract_op:
+-		*(sp - arg) = int2obj(evalInt(*(sp - 2)) - evalInt(*(sp - 1)));
++		*(sp - arg) = int2obj((uint32_t)evalInt(*(sp - 2)) - (uint32_t)evalInt(*(sp - 1)));
+ 		POP_ARGS_REPORTER();
+ 		DISPATCH();
+ 	multiply_op:
+-		*(sp - arg) = int2obj(evalInt(*(sp - 2)) * evalInt(*(sp - 1)));
++		*(sp - arg) = int2obj((uint32_t)evalInt(*(sp - 2)) * (uint32_t)evalInt(*(sp - 1)));
+ 		POP_ARGS_REPORTER();
+ 		DISPATCH();
+ 	divide_op:
+@@ -1063,11 +1065,17 @@ static void runTask(Task *task) {
+ 		POP_ARGS_REPORTER();
+ 		DISPATCH();
+ 	bitShiftLeft_op:
+-		*(sp - arg) = int2obj(evalInt(*(sp - 2)) << evalInt(*(sp - 1)));
++		*(sp - arg) = int2obj((uint32_t)evalInt(*(sp - 2)) << ((uint32_t)evalInt(*(sp - 1)) & 31));
+ 		POP_ARGS_REPORTER();
+ 		DISPATCH();
+ 	bitShiftRight_op:
+-		*(sp - arg) = int2obj(evalInt(*(sp - 2)) >> evalInt(*(sp - 1)));
++		{
++			int n = evalInt(*(sp - 2));
++			unsigned shift = (uint32_t)evalInt(*(sp - 1)) & 31;
++			// Explicit arithmetic right shift without relying on signed-shift semantics.
++			uint32_t result = (n < 0) ? ~(~(uint32_t)n >> shift) : (uint32_t)n >> shift;
++			*(sp - arg) = int2obj(result);
++		}
+ 		POP_ARGS_REPORTER();
+ 		DISPATCH();
+ 
+@@ -1078,8 +1086,9 @@ static void runTask(Task *task) {
+ 	longMultiply_op:
+ 		{
+ 			long long product = (long long) (evalInt(*(sp - 3))) * (long long) (evalInt(*(sp - 2)));
+-			tmp = (int) ((product >> (evalInt(*(sp - 1)))) & 0xFFFFFFFF);
+-			*(sp - arg) = int2obj(tmp);
++			unsigned shift = (uint32_t)evalInt(*(sp - 1)) & 63;
++			uint64_t shifted = (product < 0) ? ~(~(uint64_t)product >> shift) : (uint64_t)product >> shift;
++			*(sp - arg) = int2obj((uint32_t)shifted);
+ 		}
+ 		POP_ARGS_REPORTER();
+ 		DISPATCH();
+@@ -1272,14 +1281,14 @@ static void runTask(Task *task) {
+ 		// push integer object that requires 32 bits
+ 		STACK_CHECK(1);
+ 		tmp = (uint16) *ip++; // least significant bits
+-		tmp |= (uint16) *ip++ << 16; // most significant bits
++		tmp = (int32_t)((uint32_t)tmp | ((uint32_t)(uint16)*ip++ << 16)); // most significant bits
+ 		*sp++ = (OBJ) tmp;
+ 		DISPATCH();
+ 
+ 	// new primitive call ops:
+ 	commandPrimitive_op:
+ 		tmp = (*ip >> 10) & 0x3F; // primitive set index
+-		tmpObj = (OBJ) (ip + (*ip & 0x3FF)); // primitive name object
++		tmpObj = ptrToObj(ip + (*ip & 0x3FF)); // primitive name object
+ 		ip++; // skip second instruction word
+ 		arg = arg & 0xFF; // argument count
+ 		doPrimitiveCall(tmp, obj2str(tmpObj), arg, sp - arg);
+@@ -1287,7 +1296,7 @@ static void runTask(Task *task) {
+ 		DISPATCH();
+ 	reporterPrimitive_op:
+ 		tmp = (*ip >> 10) & 0x3F; // primitive set index
+-		tmpObj = (OBJ) (ip + (*ip & 0x3FF)); // primitive name object
++		tmpObj = ptrToObj(ip + (*ip & 0x3FF)); // primitive name object
+ 		ip++; // skip second instruction word
+ 		arg = arg & 0xFF; // argument count
+ 		*(sp - arg) = doPrimitiveCall(tmp, obj2str(tmpObj), arg, sp - arg);
+@@ -1299,13 +1308,14 @@ static void runTask(Task *task) {
+ 	callCustomReporter_op:
+ 		if (arg > 0) {
+ 			taskSleep(-1); // do background VM tasks sooner
+-			uint32 callee = -1;
++			int callee = -1;
++			PrimitiveFunction calleePrimitive = NULL;
+ 			OBJ params = *(sp - 1); // save the parameters array, if any
+ 			// look up the function or primitive name
+ 			if ((arg == 1) && (IS_TYPE(*(sp - 1), StringType))) {
+-				callee = findCallee(obj2str(*(sp - 1)));
++				callee = findCallee(obj2str(*(sp - 1)), &calleePrimitive);
+ 			} else if ((arg == 2) && (IS_TYPE(*(sp - 2), StringType))) {
+-				callee = findCallee(obj2str(*(sp - 2)));
++				callee = findCallee(obj2str(*(sp - 2)), &calleePrimitive);
+ 			}
+ 			POP_ARGS_COMMAND();
+ 			if (callee != -1) { // found a callee
+@@ -1325,12 +1335,12 @@ static void runTask(Task *task) {
+ 
+ 				// invoke the callee
+ 				task->sp = sp - task->stack; // record the stack pointer in case callee does a GC
+-				if ((callee & 0xFFFFFF00) == 0xFFFFFF00) { // callee is a MicroBlocks function (i.e. a chunk index)
++				if (!calleePrimitive) { // callee is a MicroBlocks function (i.e. a chunk index)
+ 					arg = ((callee & 0xFF) << 8) | paramCount;
+ 					goto callFunctionByName;
+ 				} else { // callee is a named primitive (i.e. a pointer to a C function)
+-					tmpObj = ((PrimitiveFunction) callee)(paramCount, sp - paramCount); // call the primitive
+-					tempGCRoot = NULL; // clear tempGCRoot in case it was used
++					tmpObj = calleePrimitive(paramCount, sp - paramCount); // call the primitive
++					tempGCRoot = falseObj; // clear tempGCRoot in case it was used
+ 					sp -= paramCount;
+ 					*sp++ = tmpObj; // push primitive return value
+ 					DISPATCH();
+diff --git a/vm/interp.h b/vm/interp.h
+index 032a45b..fb7767a 100644
+--- a/vm/interp.h
++++ b/vm/interp.h
+@@ -55,7 +55,7 @@ typedef enum {
+ } ChunkType_t;
+ 
+ typedef struct {
+-	OBJ code;
++	int *code; // native pointer to packed 32-bit persistent record
+ 	uint8 chunkType;
+ } CodeChunkRecord;
+ 
+@@ -95,7 +95,7 @@ typedef struct {
+ 	uint8 taskChunkIndex; // chunk index of the top-level stack for this task
+ 	uint8 currentChunkIndex; // chunk index when inside a function
+ 	uint32 wakeTime;
+-	OBJ code;
++	int *code; // native pointer to packed 32-bit persistent record
+ 	int ip; // ip offset in code
+ 	int sp;
+ 	int fp;
+@@ -256,15 +256,37 @@ void consoleReportNum(const char *label, int n);
+ 
+ // Integer Evaluation
+ 
++// strtol's range follows native long, which changes on LP64. Match the old
++// 32-bit decimal conversion, and never read past a byte array's logical end.
++static inline int parseInt32(const char *s, int byteCount) {
++	while (byteCount > 0 && (*s == ' ' || (*s >= '\t' && *s <= '\r'))) {
++		s++; byteCount--;
++	}
++	int negative = 0;
++	if (byteCount > 0 && (*s == '-' || *s == '+')) {
++		negative = (*s == '-'); s++; byteCount--;
++	}
++	uint32_t result = 0;
++	uint32_t limit = negative ? UINT32_C(0x80000000) : UINT32_C(0x7FFFFFFF);
++	while (byteCount > 0 && *s >= '0' && *s <= '9') {
++		unsigned digit = *s++ - '0';
++		byteCount--;
++		if (result > (limit - digit) / 10) { result = limit; break; }
++		result = 10 * result + digit;
++	}
++	if (negative && result == UINT32_C(0x80000000)) return (-2147483647 - 1);
++	return negative ? -(int)result : (int)result;
++}
++
+ static inline int evalInt(OBJ obj) {
+ 	if (isInt(obj)) {
+ 		return obj2int(obj);
+ 	} else if (IS_TYPE(obj, StringType)) {
+ 		// try to parse an int out of a string
+-		return strtol(obj2str(obj), NULL, 10); // returns 0 if string is not a number
++		return parseInt32(obj2str(obj), 4 * WORDS(obj)); // non-numbers return zero
+ 	} else if (IS_TYPE(obj, ByteArrayType)) {
+ 		// try to parse an int out of a byte array (treating it as a string)
+-		return strtol((char *) &FIELD(obj, 0), NULL, 10); // returns 0 if string is not a number
++		return parseInt32((char *) &FIELD(obj, 0), BYTES(obj));
+ 	} else {
+ 		fail(needsIntegerError);
+ 		return 0;
+diff --git a/vm/mem.c b/vm/mem.c
+index fe685bb..19f0887 100644
+--- a/vm/mem.c
++++ b/vm/mem.c
+@@ -37,7 +37,9 @@
+ // word of each chunk. That field is used by the marking phase of the garbage collector and to
+ // update (forward) references of objects that move during compaction and object resizing.
+ 
+-#if defined(NRF51)
++#if defined(SMALLVM_OBJSTORE_BYTES)
++	#define OBJSTORE_BYTES SMALLVM_OBJSTORE_BYTES
++#elif defined(NRF51)
+ 	#define OBJSTORE_BYTES 1048
+ #elif defined(ARDUINO_BBC_MICROBIT_V2) || defined(ARDUINO_CALLIOPE_MINI_V3)
+ 	#define OBJSTORE_BYTES 45000
+@@ -80,45 +82,66 @@
+ 	// max that compiles for all boards is 16886 (17624 NodeMCU)
+ #endif
+ 
++#if (OBJSTORE_BYTES < 16) || (OBJSTORE_BYTES > 262100) || ((OBJSTORE_BYTES % 4) != 0)
++#error "object store must be 16..262100 bytes, a multiple of four"
++#endif
++
+ #define OBJSTORE_WORDS ((OBJSTORE_BYTES / 4) + 4)
+ 
+ #if defined(ARDUINO_ARCH_ESP32)
+-	static OBJ *objstore = NULL; // allocated from heap on ESP32
++	static uint32_t *objstore = NULL; // allocated from heap on ESP32
+ 
+ 	#include <esp_heap_caps.h>
+ 	int hasPSRAM() {
+ 		return heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
+ 	}
+ #else
+-	static OBJ objstore[OBJSTORE_WORDS];
++	static uint32_t objstore[OBJSTORE_WORDS];
+ 
+ 	int hasPSRAM() { return false; }
+ #endif
+ 
+-static OBJ memStart = NULL;
+-static OBJ memEnd = NULL;
+-static OBJ freeChunk = NULL;
++static uint32_t *memStart = NULL;
++static uint32_t *memEnd = NULL;
++static uint32_t *freeChunk = NULL;
++static OBJ allocationFillRoot = falseObj;
++static OBJ byteSourceRoot = falseObj;
++
++// Range tests use integer addresses: external literals are not in the heap array.
++static int inHeap(OBJ obj) {
++	uintptr_t addr = (uintptr_t)obj;
++	return addr >= (uintptr_t)(memStart + 1) && addr < (uintptr_t)memEnd;
++}
++
++OBJ ptrToObj(const void *ptr) {
++	uintptr_t addr = (uintptr_t)ptr;
++	if (addr && ((addr <= 4) || (addr > UINT32_MAX) || (addr & 3)))
++		vmPanic("Object address must be aligned and below 4GB");
++	return (OBJ)addr;
++}
+ 
+-OBJ tempGCRoot = NULL; // used during resizeObj() and primitives that allocate multiple objects
++OBJ tempGCRoot = falseObj; // used during resizeObj() and primitives that allocate multiple objects
+ 
+ extern OBJ lastBroadcast; // an additional GC root
+ 
+ // Initialization
+ 
+ void memInit() {
+-	// verify 32-bit architecture
+-	if (!(sizeof(int) == 4 && sizeof(int*) == 4 && sizeof(float) == 4)) {
+-		vmPanic("MicroBlocks expects int, int*, and float to all be 32-bits");
++	// Verify cell layout independently of native C pointer width.
++	if (!(sizeof(int) == 4 && sizeof(OBJ) == 4 && sizeof(float) == 4)) {
++		vmPanic("MicroBlocks expects int, OBJ, and float to be 32-bits");
+ 	}
+ 
+ 	#if defined(ARDUINO_ARCH_ESP32)
+-		objstore = (OBJ *) heap_caps_malloc(4 * OBJSTORE_WORDS, MALLOC_CAP_INTERNAL);
++		objstore = (uint32_t *) heap_caps_malloc(4 * OBJSTORE_WORDS, MALLOC_CAP_INTERNAL);
+ 		if (!objstore) vmPanic("ESP32 could not allocate objectstore");
+ 	#endif
+ 
+ 	// initialize object heap memory
+-	memStart = (OBJ) objstore;
+-	memEnd = (OBJ) (objstore + OBJSTORE_WORDS);
++	memStart = objstore;
++	memEnd = objstore + OBJSTORE_WORDS;
++	ptrToObj(memStart);
++	ptrToObj(memEnd - 1);
+ 	memClear();
+ }
+ 
+@@ -128,18 +151,21 @@ void memClear() {
+ 	// clear global variables
+ 	for (int i = 0; i < MAX_VARS; i++) vars[i] = zeroObj;
+ 	lastBroadcast = zeroObj;
++	tempGCRoot = falseObj;
++	allocationFillRoot = falseObj;
++	byteSourceRoot = falseObj;
+ 
+ 	// zero objectstore memory (not essential)
+ 	memset(objstore, 0, 4 * OBJSTORE_WORDS);
+ 
+ 	// create the free chunk (prefixed by a forwarding word)
+-	objstore[0] = (OBJ) 0; // forwarding word
+-	objstore[1] = (OBJ) HEADER(FREE_CHUNK, OBJSTORE_WORDS - 2); // free chunk
+-	freeChunk = (OBJ) &objstore[1];
++	objstore[0] = 0; // forwarding word
++	objstore[1] = HEADER(FREE_CHUNK, OBJSTORE_WORDS - 2); // free chunk
++	freeChunk = &objstore[1];
+ }
+ 
+ int wordsFree() {
+-	int result = WORDS(freeChunk) - 2;
++	int result = WORDS(ptrToObj(freeChunk)) - 2;
+ 	return (result < 0) ? 0 : result;
+ }
+ 
+@@ -164,23 +190,31 @@ void gc();
+ OBJ newObj(int type, int wordCount, OBJ fill) {
+ 	// Allocate a new object of the given size.
+ 
++	// Reject sizes that cannot be represented by the packed header.
++	if (wordCount < 0 || wordCount > 0xFFFF) return fail(insufficientMemoryError);
++
+ 	// check available space
+-	int available = WORDS(freeChunk);
++	int available = WORDS(ptrToObj(freeChunk));
+ 	if (available < (wordCount + 2)) {
++		// A pointer-valued fill must survive and follow a moving collection.
++		// Do not borrow tempGCRoot: resizeObj already uses it for the old object.
++		allocationFillRoot = (type > BinaryObjectTypes) ? fill : falseObj;
+ 		gc();
+-		available = WORDS(freeChunk); // retry after garbage collection
++		if (type > BinaryObjectTypes) fill = allocationFillRoot;
++		allocationFillRoot = falseObj;
++		available = WORDS(ptrToObj(freeChunk)); // retry after garbage collection
+ 		if (available < (wordCount + 2)) return fail(insufficientMemoryError);
+ 	}
+ 
+ 	// allocate result and update freeChunk
+-	OBJ result = (OBJ) freeChunk;
++	OBJ result = ptrToObj(freeChunk);
+ 	freeChunk += wordCount + 2;
+ 	*freeChunk = HEADER(FREE_CHUNK, available - (wordCount + 2));
+ 
+ 	// initialize and return the new object
+-	*(result - 1) = 0; // clear its forwarding word
+-	*result = HEADER(type, wordCount); // set header word
+-	OBJ *ptr = (OBJ *) result + 1;
++	*(objToPtr(result) - 1) = 0; // clear its forwarding word
++	*objToPtr(result) = HEADER(type, wordCount); // set header word
++	OBJ *ptr = (OBJ *) objToPtr(result) + 1;
+ 	OBJ *end = ptr + wordCount;
+ 	while (ptr < end) { *ptr++ = fill; }
+ 	return result;
+@@ -190,23 +224,23 @@ OBJ resizeObj(OBJ oldObj, int wordCount) {
+ 	// Change the size of the given object to wordCount and return the new object.
+ 
+ 	if (isInt(oldObj)) return oldObj;
+-	if ((oldObj < memStart) || (oldObj >= memEnd)) return oldObj; // object must be in object store
++	if (!inHeap(oldObj)) return oldObj; // object must be in object store
+ 
+ 	tempGCRoot = oldObj; // record oldObj in case newObj() triggers GC that moves it
+ 	OBJ result = newObj(TYPE(oldObj), wordCount, zeroObj);
+ 	oldObj = tempGCRoot; // restore oldObj
+-	tempGCRoot = NULL;
++	tempGCRoot = falseObj;
+ 	if (!result) return oldObj;
+ 
+ 	int copyCount = WORDS(oldObj);
+ 	if (wordCount < copyCount) copyCount = wordCount; // new size is smaller
+-	memcpy(result + 1, oldObj + 1, 4 * copyCount); // copy from the old to the new body
++	memcpy(objToPtr(result) + 1, objToPtr(oldObj) + 1, 4 * copyCount); // copy from the old to the new body
+ 
+ 	clearForwardingFields();
+-	*(oldObj - 1) = (uint32) result; // point forwarding field of oldObj to result
++	*(objToPtr(oldObj) - 1) = objBits(result); // point forwarding field of oldObj to result
+ 	applyForwarding();
+-	*(oldObj - 1) = 0; // clear forwarding field
+-	*oldObj = HEADER(FREE_CHUNK, WORDS(oldObj)); // mark oldObj free
++	*(objToPtr(oldObj) - 1) = 0; // clear forwarding field
++	*objToPtr(oldObj) = HEADER(FREE_CHUNK, WORDS(oldObj)); // mark oldObj free
+ 
+ 	return result;
+ }
+@@ -216,6 +250,7 @@ OBJ resizeObj(OBJ oldObj, int wordCount) {
+ OBJ newString(int byteCount) {
+ 	// Allocate a string that can hold byteCount bytes.
+ 
++	if (byteCount < 0 || byteCount >= (4 * 0xFFFF)) return fail(insufficientMemoryError);
+ 	int wordCount = ((byteCount + 1) + 3) / 4; // leave room for terminator byte
+ 	return newObj(StringType, wordCount, 0);
+ }
+@@ -224,10 +259,31 @@ OBJ newStringFromBytes(const char *bytes, int byteCount) {
+ 	// Create a new string object with the given bytes.
+ 	// Round up to an even number of words and pad with nulls.
+ 
++	// A caller may supply an interior pointer into a moving heap object (e.g.
++	// JSON or split). Root its owner and retain the byte offset across allocation.
++	size_t sourceOffset = 0;
++	uintptr_t source = (uintptr_t)bytes;
++	if (byteCount > 0 && source >= (uintptr_t)memStart && source < (uintptr_t)memEnd) {
++		uint32_t *next = memStart + 1;
++		while (next < memEnd) {
++			int words = WORDS(ptrToObj(next));
++			if (TYPE(ptrToObj(next)) && source >= (uintptr_t)(next + 1) &&
++				source < (uintptr_t)(next + words + 1)) {
++				if ((size_t)byteCount > (uintptr_t)(next + words + 1) - source)
++					return fail(insufficientMemoryError);
++				byteSourceRoot = ptrToObj(next);
++				sourceOffset = source - (uintptr_t)next;
++				break;
++			}
++			next += words + 2;
++		}
++	}
+ 	OBJ result = newString(byteCount);
++	if (byteSourceRoot) bytes = (const char *)objToPtr(byteSourceRoot) + sourceOffset;
++	byteSourceRoot = falseObj;
+ 	if (!result) return result; // insufficient room to allocate string (newObj reported failure)
+ 
+-	char *dst = (char *) &result[HEADER_WORDS];
++	char *dst = (char *) (objToPtr(result) + HEADER_WORDS);
+ 	for (int i = 0; i < byteCount; i++) *dst++ = *bytes++;
+ 	*dst = 0; // null terminator byte
+ 	return result;
+@@ -236,7 +292,7 @@ OBJ newStringFromBytes(const char *bytes, int byteCount) {
+ char* obj2str(OBJ obj) {
+ 	if (isInt(obj)) return (char *) "<Integer>";
+ 	if (isBoolean(obj)) return (char *) ((trueObj == obj) ? "true" : "false");
+-	if (IS_TYPE(obj, StringType)) return (char *) &obj[HEADER_WORDS];
++	if (IS_TYPE(obj, StringType)) return (char *) (objToPtr(obj) + HEADER_WORDS);
+ 	if (IS_TYPE(obj, ListType)) return (char *) "<List>";
+ 	if (IS_TYPE(obj, ByteArrayType)) return (char *) "<ByteArray>";
+ 	return (char *) "<Object>";
+@@ -282,22 +338,22 @@ void dumpObjectStore() {
+ 	char s[100];
+ 
+ 	outputString("Object store:");
+-	uint32 *end = (uint32 *) &objstore[OBJSTORE_WORDS];
+-	uint32 *next = (uint32 *) objstore + 1;
+-	uint32 *base = (uint32 *) objstore;
++	uint32_t *end = (uint32_t *) &objstore[OBJSTORE_WORDS];
++	uint32_t *next = (uint32_t *) objstore + 1;
++	uint32_t *base = (uint32_t *) objstore;
+ 	while (next < end) {
+-		int wordCount = WORDS(next);
+-		int type = TYPE(next);
++		int wordCount = WORDS(ptrToObj(next));
++		int type = TYPE(ptrToObj(next));
+ 		if (type) {
+-			uint32 *fwd = (uint32 *) *(next - 1);
++			uint32_t fwd = *(next - 1);
+ 			if (fwd) {
+-				if (fwd > base) fwd = (uint32 *) (fwd - base); // word offset in objstore
+-				sprintf(s, "%d type: %d words: %d fwd: %d", (next - base), type, wordCount, (int) fwd);
++				if (fwd > (uintptr_t)base) fwd = (fwd - (uintptr_t)base) / 4; // word offset in objstore
++				sprintf(s, "%d type: %d words: %d fwd: %d", (int)(next - base), type, wordCount, (int) fwd);
+ 			} else {
+-				sprintf(s, "%d type: %d words: %d", (next - base), type, wordCount);
++				sprintf(s, "%d type: %d words: %d", (int)(next - base), type, wordCount);
+ 			}
+ 		} else {
+-			sprintf(s, "%d FREE %d", (next - base), wordCount);
++			sprintf(s, "%d FREE %d", (int)(next - base), wordCount);
+ 		}
+ 		outputString(s);
+ 		next = next + wordCount + 2;
+@@ -308,7 +364,7 @@ void dumpObjectStore() {
+ void memDumpObj(OBJ obj) {
+ 	char s[100];
+ 
+-	if ((obj < memStart) || (obj >= memEnd)) {
++	if (!inHeap(obj)) {
+ 		sprintf(s, "bad object at %x", (int) obj);
+ 		outputString(s);
+ 		return;
+@@ -318,11 +374,11 @@ void memDumpObj(OBJ obj) {
+ 	sprintf(s, "%x: %d words, typeID %d", (int) obj, wordCount, typeID);
+ 	outputString(s);
+ 
+-	sprintf(s, "Header: %x", obj[0]);
++	sprintf(s, "Header: %x", (unsigned int)objToPtr(obj)[0]);
+ 	outputString(s);
+ 
+ 	for (int i = 0; i < wordCount; i++) {
+-		sprintf(s, "	0x%x,", obj[HEADER_WORDS + i]);
++		sprintf(s, "	0x%x,", (unsigned int)objToPtr(obj)[HEADER_WORDS + i]);
+ 		outputString(s);
+ 	}
+ }
+@@ -333,18 +389,18 @@ void clearForwardingFields() {
+ 	// Set all forwarding fields to zero. This may not be needed if we maintain the invariant
+ 	// that forward fields are zero except during garbage collection or forwarding operations.
+ 
+-	uint32 *end = (uint32 *) &objstore[OBJSTORE_WORDS];
+-	uint32 *next = (uint32 *) objstore + 1;
++	uint32_t *end = (uint32_t *) &objstore[OBJSTORE_WORDS];
++	uint32_t *next = (uint32_t *) objstore + 1;
+ 	while (next < end) {
+ 		*(next - 1) = 0; // clear forwarding field
+-		next += WORDS(next) + 2;
++		next += WORDS(ptrToObj(next)) + 2;
+ 	}
+ }
+ 
+ static inline OBJ forward(OBJ obj) {
+ 	if (isInt(obj)) return obj;
+-	if ((obj < memStart) || (obj > memEnd)) return obj; // outside the object store
+-	OBJ fwd = (OBJ) *(obj - 1);
++	if (!inHeap(obj)) return obj; // outside the object store
++	OBJ fwd = (OBJ)(uintptr_t)*(objToPtr(obj) - 1);
+ 	return fwd ? fwd : obj; // forward if the forwarding field is not zero
+ }
+ 
+@@ -354,6 +410,8 @@ static void forwardRoots(void) {
+ 	lastBroadcast = forward(lastBroadcast);
+ 
+ 	if (tempGCRoot) tempGCRoot = forward(tempGCRoot);
++	if (allocationFillRoot) allocationFillRoot = forward(allocationFillRoot);
++	if (byteSourceRoot) byteSourceRoot = forward(byteSourceRoot);
+ 
+ 	// forward objects on Task stacks
+ 	for (int i = 0; i < taskCount; i++) {
+@@ -369,62 +427,62 @@ static void forwardRoots(void) {
+ void applyForwarding() {
+ 	// Update all forwarded references.
+ 
+-	uint32 *end = (uint32 *) &objstore[OBJSTORE_WORDS];
+-	uint32 *next = (uint32 *) objstore + 1;
++	uint32_t *end = (uint32_t *) &objstore[OBJSTORE_WORDS];
++	uint32_t *next = (uint32_t *) objstore + 1;
+ 	while (next < end) {
+-		if (TYPE(next) > BinaryObjectTypes) { // non-free chunk with OBJ fields (not a string)
+-			for (int i = WORDS(next); i > 0; i--) {
+-				OBJ child = (OBJ) next[i];
++		if (TYPE(ptrToObj(next)) > BinaryObjectTypes) { // non-free chunk with OBJ fields (not a string)
++			for (int i = WORDS(ptrToObj(next)); i > 0; i--) {
++				OBJ child = (OBJ)(uintptr_t)next[i];
+ 				if (!isInt(child) && // child is not an integer
+-					((memStart < child) && (child <= memEnd)) && // child is in the object store
+-					*(child - 1)) { // child has a non-zero forwarding field
+-						next[i] = *(child - 1); // update the forwarded OBJ
++					inHeap(child) && // child is in the object store
++					*(objToPtr(child) - 1)) { // child has a non-zero forwarding field
++						next[i] = *(objToPtr(child) - 1); // update the forwarded OBJ
+ 				}
+ 			}
+ 		}
+-		next += WORDS(next) + 2;
++		next += WORDS(ptrToObj(next)) + 2;
+ 	}
+ 	forwardRoots();
+ }
+ 
+ // Mark-Sweep-Compact Garbage Collector
+ 
+-#define SET_MARK(obj) ((*(((uint32 *) (obj)) - 1)) = 1)
+-#define IS_MARKED(obj) (*(((uint32 *) (obj)) - 1))
++#define SET_MARK(obj) ((*(objToPtr(obj) - 1)) = 1)
++#define IS_MARKED(obj) (*(objToPtr(obj) - 1))
+ 
+ void mark(OBJ root) {
+ 	// Mark all objects reachable from the given root.
+ 
+ 	if (isInt(root)) return;
+-	if ((root < memStart) || (root > memEnd)) return; // ignore objects outside the object store
++	if (!inHeap(root)) return; // ignore objects outside the object store
+ 	if (IS_MARKED(root)) return; // already marked
+ 
+ 	OBJ current = root;
+-	int i = WORDS(current); // scan backwards from last field
++	int i = (TYPE(current) > BinaryObjectTypes) ? WORDS(current) : 0; // scan backwards from last field
+ 
+ 	while (1) {
+ 		if (i == 0) { // done processing fields of the current object
+ 			SET_MARK(current);
+ 			if (current == root) return; // we're done!
+-			OBJ parent = (OBJ) *current; // backpointer to parent was stored in header
+-			i = *(parent - 1); // restore field index in parent
+-			*current = parent[i]; // restore header of child
+-			parent[i] = (int) current; // restore pointer to child in parent[i]
++			OBJ parent = (OBJ)(uintptr_t)*objToPtr(current); // backpointer to parent was stored in header
++			i = *(objToPtr(parent) - 1); // restore field index in parent
++			*objToPtr(current) = objToPtr(parent)[i]; // restore header of child
++			objToPtr(parent)[i] = objBits(current); // restore pointer to child in parent[i]
+ 			current = parent;
+ 			i--; // process the next field of parent
+ 			continue;
+ 		}
+ 
+ 		// process next child
+-		OBJ child = (OBJ) current[i];
+-		if (!isInt(child) && (memStart <= child) && (child <= memEnd) && !IS_MARKED(child)) {
++		OBJ child = (OBJ)(uintptr_t)objToPtr(current)[i];
++		if (!isInt(child) && inHeap(child) && !IS_MARKED(child)) {
+ 			// child an unmarked, non-integer object in the object store
+ 			if (TYPE(child) > BinaryObjectTypes) { // child has pointer fields to process
+ 				// reverse pointers before processing child
+-				current[i] = *child; // store child's header it ith field of current
+-				*(current - 1) = i; // store i in forwarding field of current
++				objToPtr(current)[i] = *objToPtr(child); // store child's header it ith field of current
++				*(objToPtr(current) - 1) = i; // store i in forwarding field of current
+ 				i = WORDS(child); // scan backwards from last field of child
+-				*child = (int) current; // backpointer to current
++				*objToPtr(child) = objBits(current); // backpointer to current
+ 				current = child; // process child
+ 			} else {
+ 				SET_MARK(child);
+@@ -442,6 +500,8 @@ static void markRoots(void) {
+ 
+ 	// mark temporary object used during object resizing
+ 	if (tempGCRoot) mark(tempGCRoot);
++	if (allocationFillRoot) mark(allocationFillRoot);
++	if (byteSourceRoot) mark(byteSourceRoot);
+ 
+ 	// mark objects on Task stacks
+ 	for (int i = 0; i < taskCount; i++) {
+@@ -457,14 +517,14 @@ static void markRoots(void) {
+ void sweep() {
+ 	// Scan object memory and set the forwarding fields of surviving objects that will move.
+ 
+-	uint32 *end = (uint32 *) &objstore[OBJSTORE_WORDS];
+-	uint32 *next = (uint32 *) objstore + 1;
+-	uint32 *dst = next;
++	uint32_t *end = (uint32_t *) &objstore[OBJSTORE_WORDS];
++	uint32_t *next = (uint32_t *) objstore + 1;
++	uint32_t *dst = next;
+ 	while (next < end) {
+-		uint32 wordCount = WORDS(next);
++		uint32 wordCount = WORDS(ptrToObj(next));
+ 		if (*(next - 1)) { // surviving object
+ 			// set the forwarding field to dst if the object will move, zero if not
+-			*(next - 1) = (dst != next) ? (uint32) dst : 0;
++			*(next - 1) = (dst != next) ? objBits(ptrToObj(dst)) : 0;
+ 			dst += wordCount + 2;
+ 		} else { // inaccessible object or free chunk
+ 			// mark chunk as free by clearing its type field
+@@ -477,12 +537,12 @@ void sweep() {
+ void compact() {
+ 	// Consolidate free space into a single free chunk.
+ 
+-	uint32 *next = (uint32 *) objstore + 1;
+-	uint32 *end = (uint32 *) &objstore[OBJSTORE_WORDS];
+-	uint32 *dst = next;
++	uint32_t *next = (uint32_t *) objstore + 1;
++	uint32_t *end = (uint32_t *) &objstore[OBJSTORE_WORDS];
++	uint32_t *dst = next;
+ 	while (next < end) {
+-		uint32 wordCount = WORDS(next);
+-		if (TYPE(next)) { // live object chunk
++		uint32 wordCount = WORDS(ptrToObj(next));
++		if (TYPE(ptrToObj(next))) { // live object chunk
+ 			if (dst != next) memmove(dst, next, 4 * (wordCount + 1)); // move object, if necessary
+ 			dst += wordCount + 1;
+ 			*dst++ = 0; // forwarding word
+@@ -491,7 +551,7 @@ void compact() {
+ 	}
+ 	uint32 freeWords = (end - dst) - 1;
+ 	*dst = HEADER(FREE_CHUNK, freeWords);
+-	freeChunk = (OBJ) dst;
++	freeChunk = dst;
+ }
+ 
+ void gc() {
+@@ -512,7 +572,7 @@ void gc() {
+ 	usecs = microsecs() - usecs;
+ 
+ 	char s[100];
+-	sprintf(s, "GC took %d usecs; free %d words", usecs, WORDS(freeChunk) - 2);
++	sprintf(s, "GC took %d usecs; free %d words", usecs, WORDS(ptrToObj(freeChunk)) - 2);
+ 	outputString(s);
+ 
+ 	captureIncomingBytes();
+diff --git a/vm/mem.h b/vm/mem.h
+index 832cd65..38b8d29 100644
+--- a/vm/mem.h
++++ b/vm/mem.h
+@@ -10,6 +10,9 @@
+ #ifndef _MEM_H_
+ #define _MEM_H_
+ 
++#include <stdint.h>
++#include <stddef.h>
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -98,7 +101,26 @@ typedef signed short int int16;
+ 
+ // Object reference type (32-bits)
+ 
+-typedef int * OBJ;
++// LP64 builds use checked, absolute low-address handles. Legacy 32-bit boards
++// keep pointer-shaped OBJ by default so peripheral C++ sources remain compatible.
++#ifndef SMALLVM_COMPACT_32
++#define SMALLVM_COMPACT_32 (UINTPTR_MAX > UINT32_MAX)
++#endif
++#if SMALLVM_COMPACT_32
++typedef uint32_t OBJ;
++#else
++typedef int *OBJ;
++#endif
++// Required even for legacy mode: objects and downloaded literals have 4-byte cells.
++typedef char SmallVMObjMustBe32Bits[(sizeof(OBJ) == 4) ? 1 : -1];
++typedef char SmallVMIntMustBe32Bits[(sizeof(int) == 4) ? 1 : -1];
++
++void vmPanic(const char *errorMessage);
++OBJ ptrToObj(const void *ptr);
++static inline uint32_t *objToPtr(OBJ obj) {
++	return (uint32_t *)(uintptr_t)obj;
++}
++static inline uint32_t objBits(OBJ obj) { return (uint32_t)(uintptr_t)obj; }
+ 
+ // Type IDs
+ 
+@@ -125,9 +147,14 @@ typedef int * OBJ;
+ // Integers are encoded in object references; they have no memory object.
+ // They have a 1 in their lowest bit and a signed value in their top 31 bits.
+ 
+-#define isInt(obj) (((int) (obj)) & 1)
+-#define int2obj(n) ((OBJ) (((n) << 1) | 1))
+-#define obj2int(obj) ((int)(obj) >> 1)
++#define isInt(obj) (objBits(obj) & 1u)
++#define int2obj(n) ((OBJ)(uintptr_t)(((uint32_t)(n) << 1) | 1u))
++// Decode without negative signed shifts or implementation-defined unsigned casts.
++static inline int obj2int(OBJ obj) {
++	uint32_t bits = objBits(obj);
++	return (int)((bits >> 1) & UINT32_C(0x3FFFFFFF))
++		- ((bits & UINT32_C(0x80000000)) ? 0x40000000 : 0);
++}
+ #define zeroObj ((OBJ) 1)
+ 
+ // Memory Objects
+@@ -136,9 +163,9 @@ typedef int * OBJ;
+ // Memory objects start with one or more header words.
+ 
+ #define HEADER_WORDS 1
+-#define HEADER(typeID, wordCount) (((wordCount) << 4) | ((typeID) & 0xF))
+-#define WORDS(obj) ((*((uint32*) (obj)) >> 4) & 0xFFFF)
+-#define TYPE(obj) (*((uint32*) (obj)) & 0xF)
++#define HEADER(typeID, wordCount) (((uint32_t)(wordCount) << 4) | ((typeID) & 0xF))
++#define WORDS(obj) ((int)((*objToPtr(obj) >> 4) & 0xFFFF))
++#define TYPE(obj) ((int)(*objToPtr(obj) & 0xF))
+ 
+ static inline int objWords(OBJ obj) {
+ 	if (isInt(obj) || isBoolean(obj)) return 0;
+@@ -151,13 +178,13 @@ static inline int objWords(OBJ obj) {
+ // they are not limited to multiples of four bytes. To get the size in bytes, this field
+ // is subtracted from 4 * WORDS(obj).
+ 
+-#define BYTECOUNT_ADJUST(obj) ((*((uint32*) (obj)) >> 29) & 0x3)
++#define BYTECOUNT_ADJUST(obj) ((int)((*objToPtr(obj) >> 29) & 0x3))
+ #define BYTES(obj) (4 * WORDS(obj) - BYTECOUNT_ADJUST(obj))
+ 
+ static inline void setByteCountAdjust(OBJ obj, int byteCount) {
+ 	if (isInt(obj) || isBoolean(obj) || (ByteArrayType != TYPE(obj))) return;
+ 	int delta = 4 - (byteCount & 3); // # of bytes to subtract from 4 * WORDS(obj)
+-	*obj = ((delta & 3) << 29) | ((*obj) & 0x9FFFFFFF);
++	*objToPtr(obj) = ((uint32_t)(delta & 3) << 29) | (*objToPtr(obj) & UINT32_C(0x9FFFFFFF));
+ }
+ 
+ // Types
+@@ -171,11 +198,11 @@ static inline int objType(OBJ obj) {
+ // Type check for non-integer/boolean objects
+ // (Note: Use isInt() and isBoolean() to test for integers and booleans)
+ 
+-#define IS_TYPE(obj, typeID) (((((int) obj) & 1) == 0) && ((obj) > trueObj) && (TYPE(obj) == typeID))
++#define IS_TYPE(obj, typeID) (!isInt(obj) && (objBits(obj) > 4u) && (TYPE(obj) == typeID))
+ 
+ // FIELD() macro can be used either to get or set an object field (zero-based)
+ 
+-#define FIELD(obj, i) (((OBJ *) obj)[HEADER_WORDS + (i)])
++#define FIELD(obj, i) (((OBJ *) objToPtr(obj))[HEADER_WORDS + (i)])
+ 
+ // Global temporary GC root for use by primitives that do multiple allocations.
+ 
+diff --git a/vm/runtime.c b/vm/runtime.c
+index f54b5cf..9d4252a 100644
+--- a/vm/runtime.c
++++ b/vm/runtime.c
+@@ -179,7 +179,7 @@ OBJ doPrimitiveCall(PrimitiveSetIndex setIndex, const char *primName, int argCou
+ 	PrimitiveFunction primFunc = findInSet(&primSets[setIndex], primName);
+ 	if (primFunc) {
+ 		OBJ result = primFunc(argCount, args); // call the primitive
+-		tempGCRoot = NULL; // clear tempGCRoot in case it was used
++		tempGCRoot = falseObj; // clear tempGCRoot in case it was used
+ 		return result;
+ 	}
+ 	char s[200];
+@@ -193,7 +193,11 @@ void primsInit() {
+ 
+ 	memset(primSets, 0, sizeof(primSets));
+ 
+-#if defined(DUELink)
++#if defined(SMALLVM_MINIMAL)
++	addDataPrims();
++	addMiscPrims();
++	addVarPrims();
++#elif defined(DUELink)
+ 	addDataPrims();		// ~5600 bytes
+ 	addDisplayPrims();	// ~1500 bytes
+ //	addFilePrims();
+@@ -353,9 +357,9 @@ int broadcastMatches(uint8 chunkIndex, char *msg, int byteCount) {
+ 			return false;
+ 	}
+ 	code++; // skip initLocals
+-	char *s = obj2str((OBJ) (code + *(code + 1) + 1));
++	char *s = obj2str(ptrToObj(code + *(code + 1) + 1));
+ 	if (strlen(s) == 0) return true; // empty parameter in the receiver means "any message"
+-	if (strlen(s) != byteCount) return false;
++	if (strlen(s) != (size_t)byteCount) return false;
+ 	for (int i = 0; i < byteCount; i++) {
+ 		if (s[i] != msg[i]) return false;
+ 	}
+@@ -567,6 +571,7 @@ static void softReset(int clearMemoryFlag) {
+ 	stopAllTasks();
+ 	resumeCodeFileUpdates();
+ 
++#if !defined(SMALLVM_MINIMAL)
+ 	OBJ off = falseObj;
+ 	if (!useTFT) primSetUserLED(&off);
+ 
+@@ -581,11 +586,14 @@ static void softReset(int clearMemoryFlag) {
+ 	stopPWM();
+ 	stopServos();
+ 	stopTone();
+-	boardStopAll();
+ 	#if !(defined(DATABOT) || defined(DATABOT_V3))
+ 		turnOffInternalNeoPixels();
+ 	#endif
+ 	turnOffPins();
++#endif
++	// Minimal platforms own their reset surface through the board hook. Calling
++	// unsupported hardware opcodes here would poison the next task's error flag.
++	boardStopAll();
+ 	if (clearMemoryFlag) {
+ 		memClear();
+ 		outputString("Memory cleared");
+@@ -848,11 +856,12 @@ static void sendValueOfVariableNamed(uint8 chunkIndex, int byteCount, uint8 *dat
+ }
+ 
+ static void setVariableValue(int varID, int byteCount, uint8 *data) {
+-	if ((varID >= 0) && (varID < MAX_VARS)) {
++	if ((byteCount > 0) && (varID >= 0) && (varID < MAX_VARS)) {
+ 		int type = data[0];
+ 		switch (type) {
+ 		case 1: // integer
+-			vars[varID] = int2obj((data[4] << 24) | (data[3] << 16) | (data[2] << 8) | data[1]);
++			if (byteCount >= 5) vars[varID] = int2obj(((uint32_t)data[4] << 24) |
++				((uint32_t)data[3] << 16) | ((uint32_t)data[2] << 8) | data[1]);
+ 			break;
+ 		case 2: // string
+ 			if (byteCount >= 1) {
+@@ -951,7 +960,7 @@ static void sendChunkCRC(int chunkID) {
+ 	// Send the 4-byte CRC-32 for the given chunk. Do nothing if the chunk is not in use.
+ 
+ 	if ((chunkID < 0) || (chunkID >= MAX_CHUNKS)) return;
+-	OBJ code = chunks[chunkID].code;
++	int *code = chunks[chunkID].code;
+ 	if (code) {
+ 		int wordCount = *(code + 1); // size is the second word in the persistent store record
+ 		uint8_t *chunkData = (uint8_t *) (code + PERSISTENT_HEADER_WORDS);
+@@ -983,7 +992,7 @@ void sendAllCRCs() {
+ 	int delayPerCRC = extraByteDelay / 250; // msec delay for 4 bytes (extraByteDelay is in usecs)
+ 	for (int i = 0; i < MAX_CHUNKS; i++) {
+ 		if (chunks[i].code) {
+-			OBJ code = chunks[i].code;
++			int *code = chunks[i].code;
+ 			int wordCount = *(code + 1); // size is the second word in the persistent store record
+ 			uint8_t *chunkData = (uint8_t *) (code + PERSISTENT_HEADER_WORDS);
+ 			uint32_t crc = crc32(chunkData, (4 * wordCount));
+@@ -1022,7 +1031,7 @@ static void sendAllCode() {
+ 
+ 	int delayPerWord = extraByteDelay / 250; // derive from extraByteDelay
+ 	for (int chunkID = 0; chunkID < MAX_CHUNKS; chunkID++) {
+-		OBJ code = chunks[chunkID].code;
++		int *code = chunks[chunkID].code;
+ 		if (NULL == code) continue; // skip unused chunk entry
+ 
+ 		int chunkType = chunks[chunkID].chunkType;

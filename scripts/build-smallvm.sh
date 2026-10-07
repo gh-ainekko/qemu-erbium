@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Build the opt-in SmallVM target; no Arduino, no system libc installation.
 set -euo pipefail
 R=$(cd "$(dirname "$0")/.." && pwd)
@@ -17,7 +18,8 @@ if [[ ${1:-} == --prepare-libc ]]; then
   # Select only RV64IM softfloat LP64 libc and common headers (~7MB).
   ar p "$D/picolibc.deb" data.tar.zst | tar --zstd -xf - -C "$D" \
     ./usr/lib/picolibc/riscv64-unknown-elf/include \
-    ./usr/lib/picolibc/riscv64-unknown-elf/lib/rv64im/lp64/libc.a
+    ./usr/lib/picolibc/riscv64-unknown-elf/lib/rv64im/lp64/libc.a \
+    ./usr/share/doc/picolibc-riscv64-unknown-elf/copyright
   test -f "$P/include/stdio.h" && test -f "$P/lib/rv64im/lp64/libc.a"
   printf 'Ubuntu picolibc-riscv64-unknown-elf 1.8.6-2\nsha256=%s\n' "$SHA" > "$D/picolibc.lock"
   exit 0

@@ -1,0 +1,616 @@
+From 3dccacccfa303506468cd2c4406e7d08561294d0 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 7 Oct 2026 02:34:59 +0000
+Subject: [PATCH 2/2] Audit LP64 primitives and packed persistent records
+
+Refresh moving heap sources, bound integer/record conversions, zero-pad partial payloads, and preserve the RAM erased-tail invariant after compaction. Offer the same integer/JSON misc core without libm in the minimal profile, and document compact absolute handles and legacy-board compatibility.
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ vm/PORTABILITY.md |  55 +++++++++++++++++++++
+ vm/dataPrims.c    |  39 ++++++++-------
+ vm/miscPrims.c    |  32 +++++++++---
+ vm/persist.c      | 122 +++++++++++++++++++++++++++++-----------------
+ vm/tinyJSON.c     |  14 +++---
+ 5 files changed, 185 insertions(+), 77 deletions(-)
+ create mode 100644 vm/PORTABILITY.md
+
+diff --git a/vm/PORTABILITY.md b/vm/PORTABILITY.md
+new file mode 100644
+index 0000000..23a48fa
+--- /dev/null
++++ b/vm/PORTABILITY.md
+@@ -0,0 +1,55 @@
++# Compact objects on LP64 targets
++
++The C core keeps the existing bytecode, literal, object header, field, and
++persistent-record formats. An object cell is always four bytes; integers are
++signed 31-bit values and booleans remain the immediate values 0 and 4.
++
++`SMALLVM_COMPACT_32=1` selects `uint32_t OBJ`. It is the default when native
++pointers are wider than 32 bits. `ptrToObj(const void *)` is the only conversion
++from a native object address to a handle: it rejects addresses above
++`UINT32_MAX`, misalignment, and reserved immediate addresses. NULL maps to
++`falseObj`. `objToPtr(OBJ)` decodes an address through `uintptr_t`, without sign
++extension. Use it only for memory objects, not integers or booleans.
++`FIELD(obj, i)` remains a writable OBJ lvalue at byte offset `4 * (i + 1)`.
++
++This is an **absolute-address**, not an arena-offset, representation. All heap
++objects, static objects, and downloaded literals/code must reside below 4 GiB.
++The heap and persistent-store ranges are checked at initialization, and static
++and code literal addresses are checked when encoded. Firmware linkers should
++also enforce low placement for their complete image/data and VM stores.
++Host regression executables must use `-fno-pie -no-pie`; ordinary host malloc
++or stack addresses are not suitable object storage. Native C argument arrays,
++instruction pointers, persistent-record pointers, and primitive function
++pointers do not need to be compact handles. Never encode MMIO or a C function
++pointer as an OBJ.
++
++On existing 32-bit boards, the default is `SMALLVM_COMPACT_32=0`, keeping the old
++`int *OBJ` source interface used by Arduino C++ peripherals. The same C core
++uses the checked conversion helpers in either mode. Both modes require
++`sizeof(OBJ) == sizeof(int) == 4`. Selecting legacy mode on LP64 is rejected at
++compile time; it is not a way to bypass the representation requirement.
++Peripheral sources that dereference OBJ or cast native pointers directly
++must be converted before enabling compact mode for those peripherals.
++
++`SMALLVM_OBJSTORE_BYTES` overrides the board's heap size (16 through 262100
++bytes, a multiple of four). Allocation word counts are explicitly bounded by
++the packed 16-bit object size field. `newObj`'s `fill` argument is a raw cell
++for binary objects, but a GC-tracked OBJ for objects containing references.
++The collector does not interpret string/byte-array contents as references.
++Integer construction and bit operations use unsigned bit arithmetic to retain
++31-bit wrapping without negative signed left shifts; shift counts use the
++low five bits (six for the 64-bit long-multiply operation).
++
++`SMALLVM_MINIMAL` registers the existing data, integer/JSON misc, and variable
++primitive sets, preserving their set indices. Floating math/color/sensor and
++font operations are omitted from misc. No alternate implementation of misc is
++needed, and this profile does not require libm or mbFont. Hardware reset uses
++`boardStopAll`, rather than invoking unavailable hardware opcodes. Platform
++hooks and the interpreter's hardwired I/O entry points still need a backend;
++unsupported user operations should report `primitiveNotImplemented`.
++
++Heap GC forwards all VM roots and references. It does not relocate live
++references into a moving code store. Code-store compaction therefore still
++requires stopping tasks and clearing literal-bearing live state on platforms
++that move code; this port does not claim arbitrary live-update relocation or
++power-loss-safe persistence.
+diff --git a/vm/dataPrims.c b/vm/dataPrims.c
+index 5eca901..9cc4b96 100644
+--- a/vm/dataPrims.c
++++ b/vm/dataPrims.c
+@@ -148,13 +148,8 @@ static int substringIsInteger(char *start, char *end) {
+ static int substringToInteger(char *start, char *end) {
+ 	// Return the integer represented by the substring from start up to end.
+ 
+-	char s[20];
+ 	while ((start < end) && (*start <= 32)) start++; // skip leading white space, if any
+-	int count = end - start;
+-	if (count > 19) count = 19;
+-	strncpy(s, start, count);
+-	s[count] = 0;
+-	return strtol(s, NULL, 10);
++	return parseInt32(start, (int)(end - start));
+ }
+ 
+ // Growable Lists:
+@@ -460,12 +455,12 @@ OBJ primCopyFromTo(int argCount, OBJ *args) {
+ 		if (endIndex > srcLen) endIndex = srcLen;
+ 		if (startIndex > endIndex) return newObj(ByteArrayType, 0, falseObj);
+ 
+-		char *base = (char *) (&FIELD(src, 0));
+ 		int byteCount = (endIndex - startIndex) + 1;
+ 		int wordCount = (byteCount + 3) / 4;
+ 		OBJ result = newObj(ByteArrayType, wordCount, falseObj);
+ 		if (result) {
+ 			setByteCountAdjust(result, byteCount);
++			char *base = (char *) &FIELD(args[0], 0); // refreshed after possible moving GC
+ 			memcpy(&FIELD(result, 0), base + startIndex - 1, byteCount);
+ 		}
+ 		return result;
+@@ -572,11 +567,11 @@ OBJ primSplit(int argCount, OBJ *args) {
+ 	if (delimLen == 0) {
+ 		resultCount = countUTF8(s);
+ 	} else {
+-		if (strstr(s, delim) == s) resultCount++; // s begins with a delimiter
++		resultCount = 1;
+ 		char *match = s;
+-		while (match) {
++		while ((match = strstr(match, delim))) {
+ 			resultCount++;
+-			match = strstr(match + delimLen, delim);
++			match += delimLen;
+ 		}
+ 	}
+ 
+@@ -585,6 +580,8 @@ OBJ primSplit(int argCount, OBJ *args) {
+ 	tempGCRoot = newObj(ListType, resultCount + 1, zeroObj);
+ 	if (!tempGCRoot) return tempGCRoot; // allocation failed
+ 	FIELD(tempGCRoot, 0) = int2obj(resultCount);
++	s = obj2str(args[0]); // allocation may have moved either input string
++	delim = obj2str(args[1]);
+ 
+ 	// add substrings to the result list
+ 	if ((delimLen == 0) && !convertNums) {
+@@ -594,10 +591,12 @@ OBJ primSplit(int argCount, OBJ *args) {
+ 		for (int i = 0; i < resultCount; i++) {
+ 			// allocate string and save in list
+ 			int byteCount = next - last;
++			int nextOffset = next - s;
+ 			OBJ item = newStringFromBytes(last, byteCount);
+ 			if (!item) return falseObj; // allocation failed
+ 			FIELD(tempGCRoot, i + 1) = item;
+-			last = next;
++			s = obj2str(args[0]);
++			last = s + nextOffset;
+ 			next = nextUTF8(last);
+ 		}
+ 	} else if (1 == resultCount) { // no delimiter found; return list with unsplit source string
+@@ -606,10 +605,12 @@ OBJ primSplit(int argCount, OBJ *args) {
+ 		int i = 1;
+ 		char *last = s;
+ 		char *end = s + strlen(s);
+-		char *next = (delimLen == 0) ? last + 1 : strstr(last, delim);
++		int endOffset = end - s;
++		char *next = (delimLen == 0) ? nextUTF8(last) : strstr(last, delim);
+ 		while (next && (i <= resultCount)) {
+ 			OBJ item;
+ 			int byteCount = next - last;
++			int nextOffset = next - s;
+ 			if (convertNums && substringIsInteger(last, next)) {
+ 				item = int2obj(substringToInteger(last, next));
+ 			} else {
+@@ -617,8 +618,12 @@ OBJ primSplit(int argCount, OBJ *args) {
+ 				if (!item) return falseObj; // allocation failed
+ 			}
+ 			FIELD(tempGCRoot, i++) = item;
+-			last = next + delimLen;
+-			next = (delimLen == 0) ? last + 1 : strstr(last, delim);
++			if (nextOffset == endOffset) break;
++			s = obj2str(args[0]);
++			delim = obj2str(args[1]);
++			end = s + endOffset;
++			last = s + nextOffset + delimLen;
++			next = (delimLen == 0) ? nextUTF8(last) : strstr(last, delim);
+ 			if (!next) next = end; // handle string after final delimiter
+ 		}
+ 	}
+@@ -824,15 +829,15 @@ OBJ primNewByteArray(int argCount, OBJ *args) {
+ 	int byteCount = obj2int(args[0]);
+ 	if (byteCount < 0) byteCount = 0;
+ 
+-	int fillWord = 0;
++	uint32_t fillWord = 0;
+ 	if (argCount > 1) {
+ 		if (!isInt(args[1])) return fail(needsIntegerError);
+ 		int fillByte = obj2int(args[1]);
+ 		if ((fillByte < 0) || (fillByte > 255)) return fail(byteArrayStoreError);
+-		fillWord = (fillByte << 24) | (fillByte << 16) | (fillByte << 8) | fillByte;
++		fillWord = (uint32_t) fillByte * UINT32_C(0x01010101);
+ 	}
+ 
+-	OBJ result = newObj(ByteArrayType, (byteCount + 3) / 4, (OBJ) fillWord);
++	OBJ result = newObj(ByteArrayType, (byteCount + 3) / 4, (OBJ)(uintptr_t) fillWord);
+ 	if (result) setByteCountAdjust(result, byteCount);
+ 	return result;
+ }
+diff --git a/vm/miscPrims.c b/vm/miscPrims.c
+index 5ac3460..3f164bd 100644
+--- a/vm/miscPrims.c
++++ b/vm/miscPrims.c
+@@ -43,9 +43,10 @@ OBJ primHexToInt(int argCount, OBJ *args) {
+ 	if ('#' == *s) s++; // skip leading # if there is one
+ 	if (('0' == *s) && (('x' == s[1]) || ('X' == s[1]))) s += 2; // skip leading '0x' or '0X'
+ 	long result = strtol(s, NULL, 16);
+-	result = (result << 1) >> 1; // extend sign bit if bit 31 is set
+-	if ((result < -0x40000000) || (result > 0x3FFFFFFF)) return fail(hexRangeError);
+-	return int2obj(result);
++	// Interpret the low 31 bits as a signed VM integer, independent of C long.
++	// Positive bit patterns with bit 30 set represent negative VM integers.
++	if ((result < -0x40000000L) || (result > 0x7FFFFFFFL)) return fail(hexRangeError);
++	return int2obj((uint32_t) result);
+ }
+ 
+ OBJ primBinaryToInt(int argCount, OBJ *args) {
+@@ -53,9 +54,8 @@ OBJ primBinaryToInt(int argCount, OBJ *args) {
+ 
+ 	char *s = obj2str(args[0]);
+ 	long result = strtol(s, NULL, 2);
+-	result = (result << 1) >> 1; // extend sign bit if bit 31 is set
+-	if ((result < -0x40000000) || (result > 0x3FFFFFFF)) return fail(hexRangeError);
+-	return int2obj(result);
++	if ((result < -0x40000000L) || (result > 0x7FFFFFFFL)) return fail(hexRangeError);
++	return int2obj((uint32_t) result);
+ }
+ 
+ OBJ primRescale(int argCount, OBJ *args) {
+@@ -68,10 +68,13 @@ OBJ primRescale(int argCount, OBJ *args) {
+ 
+ 	if (inMax == inMin) return fail(zeroDivide);
+ 
+-	int result = outMin + (((inVal - inMin) * (outMax - outMin)) / (inMax - inMin));
++	int64_t result = outMin + (((int64_t)inVal - inMin) * ((int64_t)outMax - outMin)) /
++		((int64_t)inMax - inMin);
+ 	return int2obj(result);
+ }
+ 
++// Optional peripheral/math primitives are not part of the minimal C profile.
++#if !defined(SMALLVM_MINIMAL)
+ // HSV Colors
+ 
+ static float clampedPercent(int percent) {
+@@ -177,6 +180,8 @@ OBJ primColorBrightness(int argCount, OBJ *args) {
+ 	return int2obj((int) (100.0 * v));
+ }
+ 
++#endif // !SMALLVM_MINIMAL
++
+ static int16 sineTable[91] = {
+ 	0, 286, 572, 857, 1143, 1428, 1713, 1997, 2280, 2563, 2845,
+ 	3126, 3406, 3686, 3964, 4240, 4516, 4790, 5063, 5334, 5604,
+@@ -255,6 +260,7 @@ static OBJ primIntSqrt(int argCount, OBJ *args) {
+ 	return int2obj(x0);
+ }
+ 
++#if !defined(SMALLVM_MINIMAL)
+ static OBJ primArctan(int argCount, OBJ *args) {
+ 	// Returns angle (in hundredths of a degree) of vector dx, dy.
+ 
+@@ -279,6 +285,8 @@ static OBJ primPressureToAltitude(int argCount, OBJ *args) {
+ 	return int2obj((int) (1000.0 * result)); // return result in millimeters
+ }
+ 
++#endif // !SMALLVM_MINIMAL
++
+ static OBJ primConnectedToIDE(int argCount, OBJ *args) {
+ 	return ideConnected() ? trueObj : falseObj;
+ }
+@@ -408,6 +416,7 @@ static OBJ primJSONKeyAt(int argCount, OBJ *args) {
+ 	return newStringFromBytes(key, strlen(key));
+ }
+ 
++#if !defined(SMALLVM_MINIMAL)
+ static OBJ primBMP680GasResistance(int argCount, OBJ *args) {
+ 	if (argCount < 3) return fail(notEnoughArguments);
+ 	int gas_res_adc = evalInt(args[0]);
+@@ -481,6 +490,8 @@ static OBJ primShapeforChar(int argCount, OBJ *args) {
+ 	return result;
+ }
+ 
++#endif // !SMALLVM_MINIMAL
++
+ static OBJ primClearGraph(int argCount, OBJ *args) {
+ 	if (!ideConnected()) return falseObj; // do nothing if not connected to IDE
+ 	waitAndSendMessage(clearGraphMsg, 0, 0, NULL);
+@@ -516,10 +527,13 @@ static OBJ primLaunchCodeSnapshot(int argCount, OBJ *args) {
+ 	return falseObj;
+ }
+ 
++#if defined(DUELink)
+ static OBJ primDUELinkPID(int argCount, OBJ *args) {
+ 	return int2obj(*((uint32 *) 0x1FFF7004) & 0xFFFFFF);
+ }
+ 
++#endif
++
+ static OBJ primDeepSleep(int argCount, OBJ *args) {
+ 	// Deep sleep for N seconds. When that time elapses, the ESP32 will reset/boot.
+ 	// Currently does nothing on non-ESP boards; may be extended to other boards later.
+@@ -772,7 +786,9 @@ static PrimEntry entries[] = {
+ 	{"rescale", primRescale},
+ 	{"connectedToIDE", primConnectedToIDE},
+ 	{"broadcastToIDE", primBroadcastToIDEOnly},
++#if !defined(SMALLVM_MINIMAL)
+ 	{"shapeforChar", primShapeforChar},
++#endif
+ 	{"clearGraph", primClearGraph},
+ 	{"functionExists", primFunctionExists},
+ 	{"launchCodeSnapshot", primLaunchCodeSnapshot},
+@@ -783,7 +799,7 @@ static PrimEntry entries[] = {
+ 	{"dueSetTime", primDUESetTime},
+ 	{"dueSetDate", primDUESetDate},
+ //	{"dueSetAlarm", primDUESetAlarm}, // commented out to save space
+-#else
++#elif !defined(SMALLVM_MINIMAL)
+ 	{"hsvColor", primHSVColor},
+ 	{"hue", primColorHue},
+ 	{"saturation", primColorSaturation},
+diff --git a/vm/persist.c b/vm/persist.c
+index 3b05cf2..5690bce 100644
+--- a/vm/persist.c
++++ b/vm/persist.c
+@@ -100,10 +100,10 @@
+ 	static void flashWriteData(int *dst, int wordCount, uint8 *src) {
+ 		NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Wen; // enable Flash write
+ 		for ( ; wordCount > 0; wordCount--) {
+-			int n = *src++;
+-			n |= *src++ << 8;
+-			n |= *src++ << 16;
+-			n |= *src++ << 24;
++			uint32_t n = *src++;
++			n |= (uint32_t)*src++ << 8;
++			n |= (uint32_t)*src++ << 16;
++			n |= (uint32_t)*src++ << 24;
+ 			while (NRF_NVMC->READY == NVMC_READY_READY_Busy){}
+ 			*dst++ = n;
+ 		}
+@@ -153,10 +153,10 @@
+ 
+ 		*NVMC_CTRLB = *NVMC_CTRLB & ~MANW; // automatically write pages at page boundaries
+ 		for ( ; wordCount > 0; wordCount--) {
+-			int n = *src++;
+-			n |= *src++ << 8;
+-			n |= *src++ << 16;
+-			n |= *src++ << 24;
++			uint32_t n = *src++;
++			n |= (uint32_t)*src++ << 8;
++			n |= (uint32_t)*src++ << 16;
++			n |= (uint32_t)*src++ << 24;
+ 			*dst++ = n;
+ 		}
+ 		*NVMC_CTRLA = CMD_WRITE_PAGE; // write final partial page
+@@ -553,10 +553,10 @@ static void flashWriteData(int *dst, int wordCount, uint8 *src) {
+ 
+ 	static void flashWriteData(int *dst, int wordCount, uint8 *src) {
+ 		for ( ; wordCount > 0; wordCount--) {
+-			int n = *src++;
+-			n |= *src++ << 8;
+-			n |= *src++ << 16;
+-			n |= *src++ << 24;
++			uint32_t n = *src++;
++			n |= (uint32_t)*src++ << 8;
++			n |= (uint32_t)*src++ << 16;
++			n |= (uint32_t)*src++ << 24;
+ 			*dst++ = n;
+ 		}
+ 	}
+@@ -628,6 +628,20 @@ static void setCycleCount(int halfSpace, int cycleCount) {
+ 	#endif
+ }
+ 
++// Validate both header words and the full payload before pointer arithmetic.
++static int recordSpan(int *p, int *start, int *end) {
++	uintptr_t addr = (uintptr_t)p;
++	if (addr < (uintptr_t)start || addr >= (uintptr_t)end || (addr & 3)) return 0;
++	if ((end - p) < 2 || ((uint32_t)*p >> 24) != 'R') return 0;
++	int words = p[1];
++	if (words < 0 || words > (end - p) - 2) return 0;
++	int span = words + 2;
++	#if defined(DUELink)
++		if (words & 1) span++;
++	#endif
++	return (span <= (end - p)) ? span : 0;
++}
++
+ static void initPersistentMemory() {
+ 	// Figure out which is the current half-space and find freeStart.
+ 	// If neither half-space has a valid cycle counter, initialize persistent memory.
+@@ -642,6 +656,12 @@ static void initPersistentMemory() {
+ 		initESP32Flash();
+ 	#endif
+ 
++	// Code literals use the same checked compact address space as heap objects.
++	ptrToObj(start0);
++	ptrToObj(end0 - 1);
++	ptrToObj(start1);
++	ptrToObj(end1 - 1);
++
+ 	int c0 = cycleCount(0);
+ 	int c1 = cycleCount(1);
+ 
+@@ -666,17 +686,13 @@ static void initPersistentMemory() {
+ 	}
+ 
+ 	while ((freeStart < end) && (-1 != *freeStart)) {
+-		int header = *freeStart;
+-		if ('R' != ((header >> 24) & 0xFF)) {
++		int span = recordSpan(freeStart, (current == 0) ? start0 : start1, end);
++		if (!span) {
+ 			outputString("Bad record found during initialization");
+ 			clearPersistentMemory();
+ 			return;
+ 		}
+-		int wordCount = *(freeStart + 1); // size word of header
+-		freeStart += wordCount + 2; // increment by the record length plus 2-word header
+-		#if defined(DUELink)
+-			if (wordCount & 1) freeStart++; // wordCount is odd; round up to double-word boundary
+-		#endif
++		freeStart += span;
+ 	}
+ 	if (freeStart >= end) freeStart = end;
+ }
+@@ -693,19 +709,13 @@ int * recordAfter(int *lastRecord) {
+ 		start = start1;
+ 		end = end1;
+ 	}
+-	int *p = lastRecord;
+-	if (NULL == lastRecord) { // return the first record
+-		p = start + CYCLE_COUNT_WORDS;
+-		return ('R' == ((*p >> 24) & 0xFF)) ? p : NULL;
++	int *p = start + CYCLE_COUNT_WORDS;
++	if (lastRecord) {
++		int span = recordSpan(lastRecord, start + CYCLE_COUNT_WORDS, end);
++		if (!span) return NULL;
++		p = lastRecord + span;
+ 	}
+-	if ((p >= end) || ('R' != ((*p >> 24) & 0xFF))) return NULL; // should not happen
+-	int wordCount = *(p + 1);
+-	p += wordCount + 2; // increment by wordCount plus 2-word header
+-	#if defined(DUELink)
+-		if (wordCount & 1) p++; // wordCount is odd; round up to double-word boundary
+-	#endif
+-	if ((p >= end) || 'R' != ((*p >> 24) & 0xFF)) return NULL; // bad header; probably start of free space
+-	return p;
++	return recordSpan(p, start + CYCLE_COUNT_WORDS, end) ? p : NULL;
+ }
+ 
+ void outputRecordHeaders() {
+@@ -756,10 +766,10 @@ void eraseCheck() {
+ 	int *start = (0 == current) ? start1 : start0; // inactive half space
+ 	int *end = (0 == current) ? end1 : end0;
+ 	for (int *p = start; p < end; p++) {
+-		if (*p != 0xFFFFFFFF) badCount++;
+-		if (*p != 0xFFFFFFFF) {
++		if (*p != -1) badCount++;
++		if (*p != -1) {
+ 			char s[200];
+-			sprintf(s, "bad %d: %x", (p - start), *p);
++			sprintf(s, "bad %d: %x", (int)(p - start), *p);
+ 			outputString(s);
+ 		}
+ 	}
+@@ -772,7 +782,7 @@ void dumpHex() {
+ 	for (int *p = start; p <= end; ) {
+ 		char s[200];
+ 		sprintf(s, "%d: %x %x %x %x %x %x %x %x %x %x",
+-			(p - start), p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9]);
++			(int)(p - start), p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9]);
+ 		outputString(s);
+ 		p += 10;
+ 	}
+@@ -829,7 +839,7 @@ static void updateChunkTable() {
+ 	// update code pointers for tasks
+ 	for (int i = 0; i < MAX_TASKS; i++) {
+ 		if (tasks[i].status) { // task entry is in use
+-			tasks[i].code = chunks[tasks[i].taskChunkIndex].code;
++			tasks[i].code = chunks[tasks[i].currentChunkIndex].code;
+ 		}
+ 	}
+ }
+@@ -948,7 +958,7 @@ static void compactFlash() {
+ 
+ 	char s[100];
+ 	int bytesUsed = 4 * (freeStart - ((0 == current) ? start0 : start1));
+-	sprintf(s, "Compacted Flash code store (%lu msecs)\n%d bytes used (%d%%) of %d",
++	sprintf(s, "Compacted Flash code store (%u msecs)\n%d bytes used (%d%%) of %d",
+ 		millisecs() - startT,
+ 		bytesUsed, (100 * bytesUsed) / HALF_SPACE, HALF_SPACE);
+ 	outputString(s);
+@@ -1028,7 +1038,7 @@ static void compactRAM(int printStats) {
+ 	}
+ 
+ 	freeStart = dst;
+-	memset(freeStart, 0, (4 * (end0 - freeStart))); // clear everything following freeStart
++	memset(freeStart, 0xFF, (4 * (end0 - freeStart))); // clear everything following freeStart
+ 
+ 	updateChunkTable();
+ 
+@@ -1044,7 +1054,7 @@ static void compactRAM(int printStats) {
+ 		char s[100];
+ 		int bytesUsed = 4 * (freeStart - ((0 == current) ? start0 : start1));
+ 
+-		sprintf(s, "Compacted RAM code store (%lu msecs)\n%d bytes used (%d%%) of %d",
++		sprintf(s, "Compacted RAM code store (%u msecs)\n%d bytes used (%d%%) of %d",
+ 			millisecs() - startT,
+ 			bytesUsed, (100 * bytesUsed) / HALF_SPACE, HALF_SPACE);
+ 		outputString(s);
+@@ -1074,13 +1084,17 @@ int * appendPersistentRecord(int recordType, int id, int extra, int byteCount, u
+ 	// Append the given record at the end of the current half-space and return its address.
+ 	// Header word: <tag = 'R'><record type><id of chunk/variable/comment><extra> (8-bits each)
+ 	// Perform a compaction if necessary.
++	if (byteCount < 0 || byteCount > HALF_SPACE - 24 || (byteCount && !data)) {
++		sendCodeStoreFull();
++		return NULL;
++	}
+ 	int wordCount = (byteCount + 3) / 4;
+ 	int needed = wordCount + 2 + 4; // add 4 extra words for DUELink rounding
+ 	int *end = (0 == current) ? end0 : end1;
+-	if ((freeStart + needed) > end) {
++	if ((end - freeStart) < needed) {
+ 		compactCodeStore(NULL, NULL);
+ 		end = (0 == current) ? end0 : end1;
+-		if ((freeStart + needed) > end) {
++		if ((end - freeStart) < needed) {
+ 			sendCodeStoreFull();
+ 			return NULL;
+ 		}
+@@ -1103,7 +1117,11 @@ int * appendPersistentRecord(int recordType, int id, int extra, int byteCount, u
+ 		if (!suspendFileUpdates) {
+ 			writeCodeFileWord(header);
+ 			writeCodeFileWord(wordCount);
+-			writeCodeFile(data, 4 * wordCount);
++			writeCodeFile(data, byteCount);
++			if (byteCount & 3) {
++				uint8 padding[4] = {0};
++				writeCodeFile(padding, 4 - (byteCount & 3));
++			}
+ 		}
+ 	#endif
+ 
+@@ -1115,7 +1133,21 @@ int * appendPersistentRecord(int recordType, int id, int extra, int byteCount, u
+ 		flashWriteWord(freeStart++, header);
+ 		flashWriteWord(freeStart++, wordCount);
+ 	#endif
+-	if (wordCount) flashWriteData(freeStart, wordCount, data);
++	if (wordCount) {
++		// Never read beyond the caller's logical payload when rounding to words.
++		if ((byteCount & 3) == 0) {
++			flashWriteData(freeStart, wordCount, data);
++		} else {
++			int fullWords = byteCount / 4;
++			#if defined(DUELink)
++				fullWords &= ~1; // final write must start on a double-word boundary
++			#endif
++			if (fullWords) flashWriteData(freeStart, fullWords, data);
++			uint8 tail[8] = {0};
++			memcpy(tail, data + (4 * fullWords), byteCount - (4 * fullWords));
++			flashWriteData(freeStart + fullWords, wordCount - fullWords, tail);
++		}
++	}
+ 	#if defined(DUELink)
+ 		if (wordCount & 1) wordCount++; // wordCount is odd; round up to double-word boundary
+ 	#endif
+@@ -1243,7 +1275,7 @@ static void showRecordHeaders() {
+ 	int *p = recordAfter(NULL);
+ 	while (p) {
+ 		sprintf(s, "Record at offset %d: %d %d %d %d (%d words)",
+-			(p - start0),
++			(int)(p - start0),
+ 			(*p >> 24) & 0xFF, (*p >> 16) & 0xFF, (*p >> 8) & 0xFF, *p & 0xFF, *(p + 1));
+ 		outputString(s);
+ 		p = recordAfter(p);
+@@ -1298,7 +1330,7 @@ void persistTest() {
+ 	char s[100];
+ 	sprintf(s, "Final: current %d used %d c0 %d c1 %d",
+ 		current,
+-		freeStart - ((0 == current) ? start0 : start1),
++		(int)(freeStart - ((0 == current) ? start0 : start1)),
+ 		cycleCount(0), cycleCount(1));
+ 	outputString(s);
+ }
+diff --git a/vm/tinyJSON.c b/vm/tinyJSON.c
+index 1027526..771cb1e 100644
+--- a/vm/tinyJSON.c
++++ b/vm/tinyJSON.c
+@@ -140,7 +140,7 @@ char * tjr_atPath(char *p, char *pathString) {
+ 	char *propName = pathString;
+ 	while (*propName) {
+ 		char *nextDot = strchr(propName, '.');
+-		int propNameLen = nextDot ? (nextDot - propName) : strlen(propName);
++		int propNameLen = nextDot ? (int)(nextDot - propName) : (int)strlen(propName);
+ 		if (isDigit(*propName)) {
+ 			int index = tjr_readInteger(propName);
+ 			p = tjr_atIndex(p, index);
+@@ -219,15 +219,15 @@ int tjr_readInteger(char *p) {
+ 	int result = 0;
+ 	int sign = 1;
+ 	if ('-' == *p) { sign = -1; p++; }
++	int limit = (sign < 0) ? 1073741824 : 1073741823;
+ 	while (isDigit(*p)) {
+-		// 107374181 is the largest result for which result*10 + 9 still fits in
+-		// a signed 31-bit int (INT_MAX = 2^30 - 1, i.e. INT_MAX/10 with room for
+-		// the next digit); beyond it the multiply-add below would overflow (UB).
+-		if (result > 107374181) {
+-			result = 1073741823; // saturate at INT_MAX
++		int digit = *p++ - '0';
++		// Saturate exactly at the signed 31-bit bounds, including -2^30.
++		if (result > (limit - digit) / 10) {
++			result = limit;
+ 			break;
+ 		}
+-		result = (10 * result) + (*p++ - '0');
++		result = (10 * result) + digit;
+ 	}
+ 	return sign * result;
+ }
