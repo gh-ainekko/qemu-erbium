@@ -87,6 +87,28 @@ method inform Page details title yesLabel nonBlocking {
 	}
 }
 
+// The current picker names browser virtual roots ("Downloads", "Libraries")
+// and its Computer shortcut invokes browserReadFile. Resolve those roots to
+// native directories, keeping the same actual picker widgets and callbacks.
+method showFolder MicroBlocksFilePicker path isTop {
+	if (path == 'Examples') { path = '../Examples' }
+	if (path == 'Libraries') { path = '../Libraries' }
+	if (path == 'Downloads') {
+		path = (join (userHomePath) '/Downloads')
+		makeDirectory path
+	}
+	useEmbeddedFS = false
+	currentDir = path
+	if isTop { topDir = path }
+	setText folderReadout (localizeDir this (filePart path))
+	updateParentAndNewFolderButtons this
+	setCollection (contents listPane) (folderContents this)
+	changeScrollOffset listPane -100000 -100000
+	if (notNil onFolderSelect) { call onFolderSelect path }
+}
+
+method setComputer MicroBlocksFilePicker { showFolder this '/' true }
+
 // Running highlights and drag shadows use Canvas-only primitives upstream.
 // Render the same silhouette as a native bitmap instead, before attaching it
 // to the target (so fullCostume cannot recursively include this new effect).
@@ -221,7 +243,7 @@ method libraryMenu SmallvmNativeToolbar {
 method connectionMenu SmallvmNativeToolbar {
 	runtime = (smallRuntime)
 	menu = (menu 'Erbium serial')
-	addItem menu 'Connect to Erbium emulator' (action 'setPort' runtime '/run/smallvm-ide/erbium-serial')
+	addItem menu 'Connect to Erbium emulator' (action 'setPort' runtime '/run/smallvm-ide/erbium-pts')
 	addItem menu 'Disconnect IDE' (action 'setPort' runtime 'disconnect')
 	addItem menu 'Enter port name…' (action 'setPort' runtime 'other...')
 	popUpAtHand menu (global 'page')
@@ -237,7 +259,7 @@ method step SmallvmNativeToolbar {
 			closePort (smallRuntime)
 			setField (smallRuntime) 'disconnected' true
 		} (request == 'reconnect') {
-			setPort (smallRuntime) '/run/smallvm-ide/erbium-serial'
+			setPort (smallRuntime) '/run/smallvm-ide/erbium-pts'
 		}
 	}
 	state = (updateConnection (smallRuntime))
@@ -259,7 +281,7 @@ method step SmallvmNativeToolbar {
 	atPut info 'connection' state
 	atPut info 'project' name
 	atPut info 'vmVersion' (vmVersion (smallRuntime))
-	atPut info 'serialPath' '/run/smallvm-ide/erbium-serial'
+	atPut info 'serialPath' '/run/smallvm-ide/erbium-pts'
 	writeFile '/run/smallvm-ide/ide-status.json' (jsonStringify info)
 	setGlobal 'nativeConnecting' false
 }

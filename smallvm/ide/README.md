@@ -58,13 +58,16 @@ native prompts/save dialogs, and bitmap running highlights/drag shadows.
 It provides inert browser-only notifications and local persisted preferences;
 the editor, project parser, compiler, decompiler, bytecode protocol, and serial
 primitives remain the real upstream implementation. It also loads current SVG
-assets from the pinned source rather than older embedded icons. No upstream
+assets from the pinned source rather than older embedded icons. Browser picker
+roots resolve to native filesystem folders, and Computer opens the native root
+instead of invoking a nonexistent browser upload primitive. No upstream
 files are modified by this service setup. Background upgrade checks are
 disabled: the service intentionally uses the pinned source.
 
-`launch.gp` preserves the selected serial port across `closePort`, permits our
-exact stable symlink alongside upstream enumerated ports/PTYs, and selects it
-before entering the native event loop.
+`launch.gp` only starts the UI and auto-selects the stable serial alias before
+entering the native event loop. The real upstream IDE's `openPortAndSendPing`
+fix is carried by the parent's SmallVM patch04, not duplicated in launch glue.
+The alias contains `pts`, as accepted by the upstream native `ensurePortOpen`.
 
 ## The serial wire and local control
 
@@ -72,7 +75,7 @@ The IDE and emulator open **different raw PTY slaves**. The supervisor holds
 both master fds and transparently relays bytes to the *opposite* master. They
 must never open the same slave: that is not a UART connection.
 
-- IDE: `/run/smallvm-ide/erbium-serial` (stable symlink).
+- IDE: `/run/smallvm-ide/erbium-pts` (stable symlink).
 - Emulator: opposite slave, also linked at `/run/smallvm-ide/emulator-serial`.
 - Partial writes are retained. Each destination has a 1 MiB bounded queue;
   reads stop when it fills, applying backpressure instead of dropping bytes.
@@ -138,6 +141,17 @@ partial writes, both queues reaching their exact capacity, and binary
 transcripts. It transfers 4.86 MB with no loss/change, then verifies cleanup.
 Parent-owned `smallvm/tests/ide_integration.*` test the real compiler/VM path
 separately and do not share this live desktop's PTYs.
+
+Native widget validation exercised File/New accept and cancel, File/Open's
+actual picker callback, File/Save cancel and a real `.ubp` disk write, editable
+port-name prompts, confirmation cancellation, and native information dialogs.
+It used the actual `Prompter`/picker widgets in an isolated X display, not
+browser-API no-ops. Logs are `/tmp/smallvm-native-widget-tests/gp.log`.
+An isolated real-emulator test also replayed the exact original snapshot's
+broken open-port body (under a test-only method name): it cleared `portName`
+and opened no port. The actual upstream patch04 then preserved a `pts` alias,
+connected through the production paired-PTY relay, and received VM version 416.
+Evidence: `/tmp/smallvm-native-port-test/logs/porttest.stdout.log`.
 
 ## Reproducible teardown
 

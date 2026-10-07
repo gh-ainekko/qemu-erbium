@@ -40,7 +40,7 @@ class Session:
             self.masters.append(master)
             # Keep slaves open through IDE reconnects: no EIO/spin on masters.
             self.slaves.append(slave)
-        self.link(self.runtime / "erbium-serial", Path(os.ttyname(self.slaves[0])))
+        self.link(self.runtime / "erbium-pts", Path(os.ttyname(self.slaves[0])))
         self.link(self.runtime / "emulator-serial", Path(os.ttyname(self.slaves[1])))
         self.uart_logs = [
             self.open_log("uart-ide-to-emulator.bin"),
@@ -115,7 +115,7 @@ class Session:
             ide = None
         return dict(
             started=self.started, logs=str(self.logs),
-            ide_serial=str(self.runtime / "erbium-serial"),
+            ide_serial=str(self.runtime / "erbium-pts"),
             ide_pty=os.ttyname(self.slaves[0]),
             emulator_pty=os.ttyname(self.slaves[1]),
             emulator_enabled=self.enabled, emulator_restarts=self.emulator_restarts,
@@ -276,7 +276,7 @@ class Session:
         self.control.close()
         for fd in self.masters + self.slaves:
             os.close(fd)
-        for name in ("control.sock", "erbium-serial", "emulator-serial"):
+        for name in ("control.sock", "erbium-pts", "emulator-serial"):
             (self.runtime / name).unlink(missing_ok=True)
         for handle in self.handles:
             handle.close()

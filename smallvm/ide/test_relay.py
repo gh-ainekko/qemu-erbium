@@ -53,7 +53,7 @@ def main():
                   "backpressure; partial writes; exact binary transcripts")
         finally:
             session.close()
-        assert not (root / "run/erbium-serial").exists()
+        assert not (root / "run/erbium-pts").exists()
         assert not (root / "run/control.sock").exists()
         print("PASS: owned PTYs, symlinks and control socket cleaned up")
 
