@@ -1,0 +1,34 @@
+From fd4a4e2d33a73bd4c8c74fcebf7729e3e8b25a89 Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Wed, 7 Oct 2026 03:21:31 +0000
+Subject: [PATCH] qtest: wait for Erbium firmware readiness after asynchronous
+ reset
+
+Signed-off-by: exe.dev user <exedev@erbium-qemu.exe.xyz>
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ tests/qtest/erbium-xspi-test.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/tests/qtest/erbium-xspi-test.c b/tests/qtest/erbium-xspi-test.c
+index 6883411..1e0e1f1 100644
+--- a/tests/qtest/erbium-xspi-test.c
++++ b/tests/qtest/erbium-xspi-test.c
+@@ -448,9 +448,11 @@ static void test_backend_mailbox(const void *data)
+     uint32_t v;
+ 
+     ospi_setup(t);
+-    /* worker announces itself */
+-    v = mem_read8(t, XSPI_MAILBOX1);
+-    g_assert(v == 0xC0FFEE00u || v == 1 || (v >> 24) == 0x7c || v != 0);
++    /* The preceding reset is acknowledged before firmware has executed its
++     * boot sequence. Wait for readiness; a single immediate read is a race
++     * against the independently scheduled CPU backend (especially in CI). */
++    v = mailbox1_wait(t, 0);
++    g_assert_cmphex(v, ==, 0xC0FFEE00u);
+ 
+     /* fill 4 KiB at MRAM+0x8000 with a known pattern via xSPI */
+     for (unsigned i = 0; i < sizeof(pattern); i++) {
+-- 
+2.43.0
+
