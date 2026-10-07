@@ -45,7 +45,7 @@ class UartGuestClient(unittest.TestCase):
     def tearDownClass(cls):
         cls.directory.cleanup()
 
-    def exercise(self, mode="echo", elf_override=None, wrapper=False):
+    def exercise(self, mode="echo", elf_override=None, wrapper=False, original_echo=False):
         kotama = mode.startswith("kotama")
         expected_elf = elf_override or (
             "/firmware/host-payload.elf" if kotama else "/firmware/uart-smoke.elf")
@@ -76,9 +76,20 @@ if os.environ["TEST_MODE"] == "loader-hang":
             master, slave = pty.openpty()
             tty_name = os.ttyname(slave)
             original = termios.tcgetattr(slave)
+            # This PTY models a serial endpoint, not a login terminal. Early
+            # rejection restores termios BEFORE the process exits; checking
+            # process.poll() cannot prevent our next fragmented peer write
+            # from racing that restore. Keep the endpoint's original echo off
+            # so late SoC/banner bytes cannot be reflected back into "traffic".
+            # Do not filter received bytes or weaken any response assertion.
+            # A separate successful-echo case checks ECHO-on restoration when
+            # the peer has no unsent output at the client's cleanup boundary.
+            if original_echo:
+                original[3] |= termios.ECHO
+            else:
+                original[3] &= ~(termios.ECHO | termios.ECHONL)
+            termios.tcsetattr(slave, termios.TCSANOW, original)
             if mode == "pre-release-stale":
-                original[3] &= ~termios.ECHO
-                termios.tcsetattr(slave, termios.TCSANOW, original)
                 os.write(master, b"\x00")
             os.set_blocking(master, False)
             env = dict(os.environ, TEST_TTY=tty_name, TEST_RELEASES=str(event),
@@ -191,6 +202,15 @@ if os.environ["TEST_MODE"] == "loader-hang":
             BINARY + bytes((i + round_number * 37) % 256 for i in range(1024))
             for round_number in range(2))
         self.assertEqual(traffic, expected)
+
+    def test_original_echo_on_is_restored_after_success(self):
+        rc, stdout, stderr, releases, traffic = self.exercise(original_echo=True)
+        self.assertEqual(rc, 0, stderr.decode())
+        self.assertEqual(stdout, b"ALL UART TESTS PASSED\n")
+        self.assertEqual(releases, 2)
+        self.assertEqual(traffic, b"".join(
+            BINARY + bytes((i + round_number * 37) % 256 for i in range(1024))
+            for round_number in range(2)))
 
     def test_wrong_banner_is_not_searched_past(self):
         rc, stdout, stderr, releases, _ = self.exercise("wrong-banner")
