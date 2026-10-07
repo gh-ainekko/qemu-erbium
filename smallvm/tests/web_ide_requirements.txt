@@ -1,0 +1,2 @@
+# Browser automation only. The backend uses distro /usr/bin/python3 + aiohttp.
+playwright==1.63.0
