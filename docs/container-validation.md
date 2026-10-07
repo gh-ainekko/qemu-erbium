@@ -92,3 +92,45 @@ instead of accepting any nonzero value. The fresh rerun above includes that fix.
 Recorded outputs include `ERBIUM-TEST-RESULT 0`,
 `ERBIUM-LOAD-TEST-RESULT 0`, and `Binary-only container tests PASSED`.
 Logs/artifacts remain under `build/container-test/` until the next run.
+
+## Direct UART wiring — 2026-10-07
+
+`J=2 scripts/test-pristine-docker.sh` passed from immutable source snapshot
+`560baae711c542e85a1c30b190f999fe8a2c323f` with the Ubuntu 24.04 digest recorded
+above. Fresh source acquisition applied eight QEMU patches and seventeen backend
+patches. Both the full build container and the separate binary-only runtime
+container exited **0**.
+
+Both containers passed the existing mailbox/ELF-loader tests plus the new real
+Linux UART1 test: empty MRAM, CPU held, ELF uploaded through guest xSPI, startup
+banner on the independent serial cable, byte-transparent IRQ-driven echo and
+repeated load on the same open tty. The runtime container also passed the stub
+guest tests. Output included `ERBIUM-UART-TEST-RESULT 0` and
+`Binary-only container tests PASSED`.
+
+The source container additionally passed 154 loader, 35 console, 25 guest-UART
+client, six runner/lifecycle, 28 source-update and eight preflight tests; real
+Kconfig refresh; seven RTL-register sanitizer groups; socket lifecycle sanitizer
+checks; endpoint/reset-domain integration; all six existing CPU-reset groups;
+and two real-backend IRQ-fixture tests. IRQ fixture rounds each recorded three
+UART interrupt claims and four WFI entries, including negative checks with UART
+mask or PLIC routing disabled. These unit counters are not a console transport.
+
+Outside the hermetic default image, the previously studied Kotama ELF also
+passed both full guest paths with the new backend:
+
+- `scripts/run-uart-test.sh --kotama`: guest xSPI upload/verify/start, UART1 banner,
+  command `info`, fresh Erbium/RAM response and returned prompt.
+- Interactive `erbctl console /dev/ttyAMA1 --load /firmware/host-payload.elf`:
+  same early attachment/loading path, complete `info` response, Ctrl-] exit,
+  restored Linux shell and clean shutdown. No development-host UART shortcut.
+
+Implementation-session transcripts: `/tmp/erbium-uart-kotama-test.log` and
+`/tmp/erbium-uart-interactive-kotama.log`. These temporary files are not release
+artifacts. Pristine logs/archive remain under `build/container-test/` until the
+next run. The ordinary release image contains hermetic fixtures, not Kotama.
+
+Existing SmallVM transport regression also passed with the corrected sticky IRQ
+acknowledgment: 135176 echoed bytes including a 131072-byte backpressure transfer.
+The UART transport remains explicitly functional, not electrical/baud-bit-timed;
+see `uart-console.md` for the exact scope and limitations.

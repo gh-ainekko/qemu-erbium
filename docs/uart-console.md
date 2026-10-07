@@ -189,3 +189,12 @@ Source-only focused tests: `scripts/test-uart-backend.sh`,
 `tests/test_erbctl_console.py`, `tests/test_erbium_uart_client.py`, and
 `tests/test_uart_runner.py`. Existing loader/reset and SmallVM transport tests
 remain part of regression validation.
+
+### Verified release snapshot
+
+The pristine source build and binary-only Ubuntu 24.04 distribution tests passed
+for `560baae711c542e85a1c30b190f999fe8a2c323f`, including the Linux UART1 IRQ/WFI
+fixture and repeat upload. Real Kotama also passed the guest `info` acceptance
+and interactive combined-console/load path. See `container-validation.md` for
+suite counts, evidence and the distinction between hermetic release tests and
+the optional external Kotama payload.
