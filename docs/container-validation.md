@@ -134,3 +134,44 @@ Existing SmallVM transport regression also passed with the corrected sticky IRQ
 acknowledgment: 135176 echoed bytes including a 131072-byte backpressure transfer.
 The UART transport remains explicitly functional, not electrical/baud-bit-timed;
 see `uart-console.md` for the exact scope and limitations.
+
+## Host shared folders — 2026-10-07
+
+Implementation snapshot `31903bf` adds optional read-only `--share DIR` and
+explicit read-write `--share-rw DIR`, automatically mounted at `/mnt/host`.
+QEMU and Linux were rebuilt sequentially with `J=2`; configuration tests cover
+both fresh and previously cached builds. Required packages now include
+`libattr1-dev` for builds and `libattr1` for runtime.
+
+Validation passed:
+
+- Seven host-share argument/lifecycle tests, six existing UART-runner tests,
+  eight preflight tests and three real-Kconfig/QEMU configure-cache tests.
+- Real guest RO protection, including a guest-root RW remount attempt; RW file
+  creation/appending verified on the host; directory names containing spaces;
+  atomic host-side file replacement visible to an already-mounted guest.
+- Complete existing qtest/mailbox/ELF-loader/UART E2E, plus both share modes and
+  concurrent read/pipe workers in the RW share regression.
+- Actual Kotama loaded from `/mnt/host/kotama.elf` through guest xSPI, with UART
+  `info` response, Ctrl-] exit and restored guest shell. The default initramfs
+  did not contain Kotama; no payload-specific initramfs rebuild was required.
+- Packaged binaries from `31903bf` in a fresh Ubuntu 24.04 runtime-only container:
+  full E2E, both share modes and stub guest tests, exit **0**. This was a fresh
+  binary-runtime test, not an additional pristine source rebuild.
+
+**Observed issue and mitigation:** an early multithreaded-TCG test hit a guest
+queued-spinlock oops during a 9P-backed `cat`/pipe operation. A subsequent
+4,000-operation concurrent read/pipe stress run under the default MTTCG setting
+also stalled. Shared-folder sessions therefore explicitly select
+`-accel tcg,thread=single`, retaining both guest CPUs while serializing their
+execution. The same 4,000-operation workload completed with all four workers
+passing under this setting, and all final E2E/package checks passed. This is a
+validated workaround; the underlying QEMU/kernel SMP failure is not claimed
+fixed. Non-shared sessions retain their previous accelerator defaults.
+
+Implementation-session evidence: `/tmp/erbium-share-final-e2e.log`,
+`/tmp/erbium-share-runtime.log`, `/tmp/erbium-share-interactive-kotama.log`,
+`/tmp/share-stress-default.log` (final mitigated run), and
+`build/virtio9p-share-test.log` (initial oops). Temporary logs are not release
+artifacts. The share regressions are shipped as `scripts/run-share-test.sh` and
+run in normal CI and binary-distribution tests.
