@@ -1,0 +1,238 @@
+From d65fb02f6c29ad81867d3001c4c50391566e4683 Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Wed, 7 Oct 2026 05:42:54 +0000
+Subject: [PATCH 14/17] erbium: regress serial endpoint reset domains and wide
+ UART transactions
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ sw-sysemu/sys_emu/uart_socket.md              |  13 +-
+ .../tests/erbium/host/test_uart_endpoint.py   | 138 ++++++++++++++++--
+ 2 files changed, 135 insertions(+), 16 deletions(-)
+
+diff --git a/sw-sysemu/sys_emu/uart_socket.md b/sw-sysemu/sys_emu/uart_socket.md
+index 2701610..be4ec37 100644
+--- a/sw-sysemu/sys_emu/uart_socket.md
++++ b/sw-sysemu/sys_emu/uart_socket.md
+@@ -45,7 +45,10 @@ electrical levels, framing errors, break, or physical RX overruns.
+ `--uart_rx_file PATH` and `--uart_tx_file PATH` (including existing single-dash
+ spellings and PTY paths) remain available without `--uart-socket`. They cannot be
+ combined with socket mode. UART and xSPI must use distinct socket pathnames.
+-Attach the host/capture before releasing CPU reset to retain the boot banner.
++Attach the host/capture before firmware enables UART pads/releasing CPU reset to
++retain the boot banner. Allow the device to observe an idle RX boundary after
++enabling pads: fresh input sent before the conservative reenable flush finishes
++may also be discarded (the stream has no per-byte pinmux timestamps).
+ 
+ ## Endpoint regressions
+ 
+@@ -68,5 +71,9 @@ python3 et-platform/sw-sysemu/tests/erbium/host/test_uart_endpoint.py \
+   --emu build/sw-sysemu/erbium_emu
+ ```
+ 
+-These tests are endpoint/FD-lifecycle tests, not the UART register-fidelity
+-suite and not the guest `erbctl load --start`/Kotama console acceptance test.
++The integration test also checks whole-POR FIFO/register/PLIC clearing,
++CPU-only hold/release/cold and xSPI-only state preservation, same-connection
++resets, and native-width replication in 32/64-bit backend transactions (a wide
++RX transaction must pop once). These are endpoint/reset-integration tests,
++not the standalone UART register-fidelity suite and not the guest
++`erbctl load --start`/Kotama console acceptance test.
+diff --git a/sw-sysemu/tests/erbium/host/test_uart_endpoint.py b/sw-sysemu/tests/erbium/host/test_uart_endpoint.py
+index 1f3775d..6a138c8 100644
+--- a/sw-sysemu/tests/erbium/host/test_uart_endpoint.py
++++ b/sw-sysemu/tests/erbium/host/test_uart_endpoint.py
+@@ -32,6 +32,15 @@ TX = 0x02004008
+ RX = 0x02004010
+ STATUS = 0x02004018
+ BAUD = 0x02004000
++DELAY = 0x02004020
++CONTROL = 0x02004028
++IQC = 0x02004030
++THRESHOLD = 0x02004038
++RAW = 0x02004048
++IEN = 0x02004050
++IRQ_STATUS = 0x02004058
++PLIC_PENDING = 0xA0001000
++UART_SOURCE = 1 << 3
+ CODE = 0x40001000
+ SENTINEL = 0x40010000
+ 
+@@ -64,6 +73,79 @@ def u32(client, addr):
+     return struct.unpack("<I", read(client, addr, 4))[0]
+ 
+ 
++def u64(client, addr):
++    return struct.unpack("<Q", read(client, addr, 8))[0]
++
++
++def duplicate(value, width, bits):
++    return sum(value << bit for bit in range(0, bits, width))
++
++
++def install_wfi(client):
++    code = struct.pack("<6I", 0x400102B7, 0x06500313, 0x0062B023,
++                       0x30405073, 0x10500073, 0xFFDFF06F)
++    check(client.write(CODE, code) == 0, "upload WFI program")
++    check(client.write(MINION_BOOT, struct.pack("<Q", CODE)) == 0, "set boot PC")
++    check(client.write(SENTINEL, bytes(8)) == 0, "clear WFI sentinel")
++
++
++def wide_access(client, peer):
++    # xSPI's eight-byte memory transactions must reach a single UART register,
++    # not split into an unsupported +4 register or pop RX twice.
++    for addr, value, width in ((BAUD, 0x1234, 16), (DELAY, 0x4567, 16),
++                               (CONTROL, 0x5A0, 16), (IQC, 0x5A, 8),
++                               (THRESHOLD, 31, 8), (IEN, 0, 16)):
++        w32(client, addr, value)
++        check(u32(client, addr) == duplicate(value, width, 32), "UART 32-bit replication")
++        check(u64(client, addr) == duplicate(value, width, 64), "UART 64-bit replication")
++    status = u32(client, STATUS) & 0xFFFF
++    check(u64(client, STATUS) == duplicate(status, 16, 64), "STATUS 64-bit replication")
++    check(u64(client, RAW) >> 32 == 0, "RAW upper 32 bits not initialized/zero-extended")
++    check(u64(client, IRQ_STATUS) == 0, "IRQ_STATUS upper bits not initialized/zero-extended")
++    peer.sendall(b"\x11\x22")
++    until(lambda: u32(client, STATUS) & 4, "wide RX transaction")
++    check(u64(client, RX) == 0x0000001100000011, "wide RX replication/pop")
++    until(lambda: u32(client, STATUS) & 4, "second byte survived wide RX")
++    check(u32(client, RX) == 0x22, "wide RX consumed more than one FIFO entry")
++    check(client.write(TX, struct.pack("<Q", 0x8877665544332211)) == 0, "wide TX write")
++    check(receive(peer, 1) == b"\x11", "wide TX emitted wrong/duplicate byte")
++
++
++def reset_domains(client, peer):
++    install_wfi(client)
++    registers = ((BAUD, 0x1234, 0xFFFF), (DELAY, 0x4567, 0xFFFF),
++                 (CONTROL, 0x5A0, 0xFFFF), (IQC, 0x5A, 0xFF),
++                 (THRESHOLD, 31, 0xFF), (IEN, 0x10, 0xFFFF))
++    for addr, value, _ in registers:
++        w32(client, addr, value)
++    # RAW XOR can software-set a zero bit. Use the parity-error sticky bit as
++    # a stable reset-domain probe, NOT as a simulated physical framing error.
++    if not (u32(client, RAW) & 0x10):
++        w32(client, RAW, 0x10)
++    until(lambda: u32(client, PLIC_PENDING) & UART_SOURCE, "UART PLIC source asserted")
++    check(u64(client, IEN) == duplicate(0x10, 16, 64), "wide interrupt mask read")
++    check(u64(client, IRQ_STATUS) == 0x10, "wide IRQ_STATUS is not zero-extended")
++    domains = (
++        ("release", lambda: w32(client, SOFT_RESET, 4)),
++        ("warm-hold", lambda: w32(client, SOFT_RESET, 6)),
++        ("CPU-cold", lambda: w32(client, SOFT_RESET, 0xE)),
++        ("xSPI-only", lambda: check(client.reset(1) == 0, "xSPI-only reset")),
++    )
++    for name, reset in domains:
++        payload = name.encode()
++        peer.sendall(payload)
++        until(lambda: u32(client, STATUS) & 4, f"RX queued before {name}")
++        reset()
++        if name == "release":
++            until(lambda: u64(client, SENTINEL) == 101, "CPU released into WFI")
++        for addr, value, mask in registers:
++            check(u32(client, addr) & mask == value, f"{name} reset UART register {addr:#x}")
++        check(u32(client, RAW) & 0x10, f"{name} reset sticky UART RAW")
++        check(u32(client, PLIC_PENDING) & UART_SOURCE, f"{name} cleared UART PLIC source")
++        serial_rx(client, payload)
++        serial_tx(client, peer, payload)
++
++
+ def enable_pads(client):
+     w32(client, CONFIG, u32(client, CONFIG) | 64)
+     # Device-side disconnected-pad backlog discard/reenable is serviced on a
+@@ -152,9 +234,12 @@ def backend(emu, directory, api=True):
+ def exercise(emu):
+     with tempfile.TemporaryDirectory(prefix="erbium-uart-endpoint-") as tmp:
+         with backend(emu, tmp) as (client, path, _):
+-            enable_pads(client)
+             peer = connect(path)
+             try:
++                # Attach capture before enabling pads, so the device can
++                # observe an idle boundary for its disconnected RX flush.
++                enable_pads(client)
++                wide_access(client, peer)
+                 # Full duplex, burst >16, all values including NUL, LF, CR,
+                 # high-bit bytes, escape, and the xSPI framing magic.
+                 payload = bytes(range(256)) + b"UERB\r\n\x1b\x00"
+@@ -171,27 +256,23 @@ def exercise(emu):
+                 serial_tx(client, peer, b"retained-first-client")
+ 
+                 # Target-only resets never close/recreate the serial connection.
+-                w32(client, BAUD, 0x1234)
+-                peer.sendall(b"warm-state")
+-                until(lambda: u32(client, STATUS) & 4, "RX queued before warm reset")
+-                w32(client, SOFT_RESET, 6)
+-                check(u32(client, BAUD) & 0xFFFF == 0x1234, "CPU warm reset reset UART registers")
+-                serial_rx(client, b"warm-state")
+-                serial_tx(client, peer, b"held-warm-reset")
++                reset_domains(client, peer)
+                 peer.sendall(b"POR-state")
+                 until(lambda: u32(client, STATUS) & 4, "RX queued before POR")
+                 check(client.reset(0) == 0, "POR failed")
+-                check(u32(client, BAUD) & 0xFFFF == 5, "POR did not reset UART registers")
++                for addr, value, mask in ((BAUD, 5, 0xFFFF), (DELAY, 0, 0xFFFF),
++                                          (CONTROL, 256, 0xFFFF), (IQC, 0, 0xFF),
++                                          (THRESHOLD, 5, 0xFF), (IEN, 0, 0xFFFF)):
++                    check(u32(client, addr) & mask == value, f"POR UART defaults {addr:#x}")
++                check(not (u32(client, RAW) & 0x10), "POR did not clear sticky UART RAW")
++                check(not (u32(client, PLIC_PENDING) & UART_SOURCE), "POR did not clear UART PLIC source")
+                 check(not (u32(client, STATUS) & 4), "POR did not reset internal UART RX FIFO")
+                 enable_pads(client)  # POR disables the pinmux
+                 serial_tx(client, peer, b"same-peer-after-POR")
+ 
+                 # A real hart reaches WFI; peripheral serial service remains
+                 # live without any UART/timer interrupt enabled.
+-                code = struct.pack("<6I", 0x400102B7, 0x06500313, 0x0062B023,
+-                                   0x30405073, 0x10500073, 0xFFDFF06F)
+-                check(client.write(CODE, code) == 0, "upload WFI program")
+-                check(client.write(MINION_BOOT, struct.pack("<Q", CODE)) == 0, "set boot PC")
++                install_wfi(client)
+                 w32(client, SOFT_RESET, 4)
+                 until(lambda: read(client, SENTINEL, 8) == struct.pack("<Q", 101),
+                       "hart executes uploaded WFI program")
+@@ -211,6 +292,18 @@ def exercise(emu):
+             for byte in deferred:
+                 w32(client, TX, byte)
+             check(u32(client, STATUS) & 2, "disconnected TX did not retain bounded FIFO")
++            install_wfi(client)
++            w32(client, BAUD, 0x2468)
++            for name, reset in (
++                    ("release", lambda: w32(client, SOFT_RESET, 4)),
++                    ("hold", lambda: w32(client, SOFT_RESET, 6)),
++                    ("CPU-cold", lambda: w32(client, SOFT_RESET, 0xE)),
++                    ("xSPI-only", lambda: check(client.reset(1) == 0, "xSPI-only reset"))):
++                reset()
++                if name == "release":
++                    until(lambda: u64(client, SENTINEL) == 101, "CPU released with queued TX")
++                check(u32(client, STATUS) & 2, f"{name} cleared queued UART TX")
++                check(u32(client, BAUD) & 0xFFFF == 0x2468, f"{name} cleared UART baud")
+             peer = connect(path)
+             try:
+                 check(receive(peer, 16) == deferred, "reconnect lost queued UART TX")
+@@ -227,6 +320,25 @@ def exercise(emu):
+             finally:
+                 peer.close()
+ 
++            # Reset an actually full internal TX FIFO, not bytes which have
++            # already left it for a live client's kernel socket queue.
++            time.sleep(0.1)
++            for byte in range(16):
++                w32(client, TX, byte)
++            check(u32(client, STATUS) & 2, "TX FIFO not full before POR")
++            inode = path.stat().st_ino
++            check(client.reset(0) == 0, "POR with disconnected peer")
++            check(path.stat().st_ino == inode, "POR recreated the UART listener")
++            check(u32(client, STATUS) & 3 == 1, "POR did not clear internal UART TX FIFO")
++            peer = connect(path)
++            try:
++                enable_pads(client)
++                serial_tx(client, peer, b"fresh-after-TX-reset")
++                peer.sendall(b"fresh-RX")
++                serial_rx(client, b"fresh-RX")
++            finally:
++                peer.close()
++
+     # UART-only CPU-held operation also keeps serving/cleans up gracefully.
+     with tempfile.TemporaryDirectory(prefix="erbium-uart-only-") as tmp:
+         with backend(emu, tmp, api=False) as (_, path, _):
+-- 
+2.43.0
+

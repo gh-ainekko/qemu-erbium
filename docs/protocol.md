@@ -64,3 +64,14 @@ whole-chip POR (including QEMU device reset). The listener remains usable with
 no ELF and no running harts. Kind 0 resets boot configuration/reapplies the CLI
 startup profile; kind 1 continues to leave CPU/hold/boot configuration unchanged.
 A CPU-only warm release does not reapply CLI settings or erase MRAM.
+
+## Separate UART wiring (not protocol v1 payload)
+
+`erbium_emu --uart-socket PATH` owns a raw full-duplex serial-peer connection,
+separate from `--api-socket`. QEMU's existing second PL011 connects that stream
+to host Linux `/dev/ttyAMA1`. No UART data, injection/extraction opcode or console
+RPC is added to this framed control protocol. CPU-facing UART MMIO remains
+ordinary hardware register access, not the host's console endpoint. The serial
+peer survives CPU reset and its listener survives whole-chip reset; reset still
+clears the appropriate UART device state. See `uart-console.md` for lifecycle,
+functional-stream limitations and host-driven load/UART acceptance tests.

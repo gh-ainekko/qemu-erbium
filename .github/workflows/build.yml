@@ -32,10 +32,13 @@ jobs:
             gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf \
             gcc-aarch64-linux-gnu libssl-dev libelf-dev bc cpio kmod dwarves device-tree-compiler
 
-      - name: Offline ELF loader and source-update tests
+      - name: Offline loader, console, UART wiring and source-update tests
         run: |
           python3 -m unittest discover -s tests -p 'test_erbctl_loader.py'
           python3 -m unittest discover -s tests -p 'test_fetch_sources.py'
+          python3 tests/test_erbctl_console.py
+          python3 tests/test_erbium_uart_client.py
+          python3 tests/test_uart_runner.py
 
       - name: ccache
         uses: actions/cache@v4
@@ -61,6 +64,9 @@ jobs:
 
       - name: CPU reset and host-start regression tests
         run: python3 et-platform/sw-sysemu/tests/erbium/host/test_cpu_reset.py --emu build/sw-sysemu/erbium_emu
+
+      - name: UART RTL registers and serial endpoint regression tests
+        run: scripts/test-uart-backend.sh
 
       - name: Build minion firmware
         run: scripts/build-all.sh firmware

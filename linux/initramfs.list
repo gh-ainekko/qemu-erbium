@@ -38,3 +38,6 @@ file /bin/erbctl @R@/build/erbctl 0755 0 0
 dir /firmware 0755 0 0
 file /firmware/loader-smoke.elf @R@/build/loader-smoke.elf 0644 0 0
 file /etc/erbium-load-test.sh @R@/linux/rootfs/erbium-load-test.sh 0755 0 0
+file /firmware/uart-smoke.elf @R@/build/uart-smoke.elf 0644 0 0
+file /usr/bin/erbium-uart-test @R@/build/erbium-uart-test 0755 0 0
+file /etc/erbium-uart-test.sh @R@/linux/rootfs/erbium-uart-test.sh 0755 0 0

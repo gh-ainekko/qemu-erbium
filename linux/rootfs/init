@@ -4,7 +4,17 @@ mount -t sysfs none /sys
 mount -t debugfs none /sys/kernel/debug 2>/dev/null
 mount -t devtmpfs none /dev
 echo "erbium guest up"
-if grep -q erbium.loadtest /proc/cmdline; then
+if grep -q erbium.kotamatest /proc/cmdline; then
+    sh /etc/erbium-uart-test.sh --kotama
+    RC=$?
+    echo "ERBIUM-KOTAMA-UART-TEST-RESULT $RC"
+    if grep -q erbium.poweroff /proc/cmdline; then poweroff -f; fi
+elif grep -q erbium.uarttest /proc/cmdline; then
+    sh /etc/erbium-uart-test.sh
+    RC=$?
+    echo "ERBIUM-UART-TEST-RESULT $RC"
+    if grep -q erbium.poweroff /proc/cmdline; then poweroff -f; fi
+elif grep -q erbium.loadtest /proc/cmdline; then
     sh /etc/erbium-load-test.sh
     RC=$?
     echo "ERBIUM-LOAD-TEST-RESULT $RC"

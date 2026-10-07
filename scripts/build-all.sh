@@ -63,13 +63,16 @@ build_firmware() {
 
 build_linux() {
   "$R/scripts/build-load-test.sh"
+  "$R/scripts/build-uart-test.sh"
   aarch64-linux-gnu-gcc -O2 -static -Wall -Wextra -Werror -o "$R/build/erbctl" \
-    "$R/linux/tools/erbctl.c" "$R/linux/tools/erbium-loader.c"
+    "$R/linux/tools/erbctl.c" "$R/linux/tools/erbium-loader.c" "$R/linux/tools/erbium-console.c"
   if [ -n "${ERBIUM_ELF:-}" ]; then
     gcc -O2 -Wall -Wextra -Werror -o "$R/build/erbctl-native" \
-      "$R/linux/tools/erbctl.c" "$R/linux/tools/erbium-loader.c"
+      "$R/linux/tools/erbctl.c" "$R/linux/tools/erbium-loader.c" "$R/linux/tools/erbium-console.c"
     "$R/build/erbctl-native" load "$ERBIUM_ELF" --check
   fi
+  aarch64-linux-gnu-gcc -O2 -static -Wall -Wextra -Werror -o "$R/build/erbium-uart-test" \
+    "$R/linux/tools/erbium-uart-test.c"
   "$R/scripts/configure-linux.sh"
   make -C "$R/ext/linux" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
     O="$R/build/linux" -j"$J" Image 2>&1 | tee "$R/build/linux-build.log"
@@ -78,7 +81,7 @@ build_linux() {
   cp "$R/build/linux/arch/arm64/boot/Image" "$R/dist/linux/"
   cp "$R/build/erbctl" "$R/dist/bin/erbctl-aarch64"
   mkdir -p "$R/dist/firmware"
-  cp "$R/build/loader-smoke.elf" "$R/dist/firmware/"
+  cp "$R/build/loader-smoke.elf" "$R/build/uart-smoke.elf" "$R/dist/firmware/"
 }
 
 mkdir -p "$R/build" "$R/dist"

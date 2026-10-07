@@ -109,6 +109,11 @@ static void rx_burst() {
         assert(rd(uart, Uart::SHAKTI_UART_RCV_REG) == expected);
     }
     assert(!(status(uart) & Uart::STATUS_RX_NOT_EMPTY));
+    // Built RTL latches threshold STATUS and RAW separately. Emptying RX does
+    // not acknowledge an already-raised interrupt; clear both sticky states.
+    assert(chip.irq);
+    wr(uart, Uart::SHAKTI_UART_STATUS, 0);
+    wr(uart, Uart::SHAKTI_UART_RAW, rd(uart, Uart::SHAKTI_UART_RAW));
     assert(!chip.irq);
     close(pipefd[1]);
     assert(!(status(uart) & Uart::STATUS_RX_NOT_EMPTY));

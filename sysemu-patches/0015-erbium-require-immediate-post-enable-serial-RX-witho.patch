@@ -1,0 +1,67 @@
+From ed884e8b3b1e1aa55f2a129b830f7ccbb699cc05 Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Wed, 7 Oct 2026 05:44:54 +0000
+Subject: [PATCH 15/17] erbium: require immediate post-enable serial RX without
+ settling delays
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ sw-sysemu/sys_emu/uart_socket.md                  | 9 +++++----
+ sw-sysemu/tests/erbium/host/test_uart_endpoint.py | 7 ++-----
+ 2 files changed, 7 insertions(+), 9 deletions(-)
+
+diff --git a/sw-sysemu/sys_emu/uart_socket.md b/sw-sysemu/sys_emu/uart_socket.md
+index be4ec37..5d94cda 100644
+--- a/sw-sysemu/sys_emu/uart_socket.md
++++ b/sw-sysemu/sys_emu/uart_socket.md
+@@ -32,7 +32,9 @@ electrical levels, framing errors, break, or physical RX overruns.
+   The normal device reset/pinmux rules still apply; a POR can disable the pads.
+   Whole-chip POR clears UART registers/FIFOs/interrupt state; CPU-only warm,
+   cold, and debug resets do not. Host bytes sent while pads are disabled are
+-  discarded by the device's bounded RX service; reenable may also flush backlog.
++  discarded when the device's bounded RX service samples disabled pads. Bytes
++  unread at reenable may arrive later because the stream has no per-byte pinmux
++  timestamps; no deferred flush discards fresh post-enable input.
+ * No client means RX/TX attach to `-1`, not stdin/stdout. Device FIFO
+   backpressure governs queued TX; this is not a guarantee of lossless output
+   across unlimited disconnection or target FIFO-full writes.
+@@ -46,9 +48,8 @@ electrical levels, framing errors, break, or physical RX overruns.
+ spellings and PTY paths) remain available without `--uart-socket`. They cannot be
+ combined with socket mode. UART and xSPI must use distinct socket pathnames.
+ Attach the host/capture before firmware enables UART pads/releasing CPU reset to
+-retain the boot banner. Allow the device to observe an idle RX boundary after
+-enabling pads: fresh input sent before the conservative reenable flush finishes
+-may also be discarded (the stream has no per-byte pinmux timestamps).
++retain the boot banner. Fresh input after enabling pads needs no artificial
++settling delay.
+ 
+ ## Endpoint regressions
+ 
+diff --git a/sw-sysemu/tests/erbium/host/test_uart_endpoint.py b/sw-sysemu/tests/erbium/host/test_uart_endpoint.py
+index 6a138c8..e7dccb1 100644
+--- a/sw-sysemu/tests/erbium/host/test_uart_endpoint.py
++++ b/sw-sysemu/tests/erbium/host/test_uart_endpoint.py
+@@ -148,9 +148,6 @@ def reset_domains(client, peer):
+ 
+ def enable_pads(client):
+     w32(client, CONFIG, u32(client, CONFIG) | 64)
+-    # Device-side disconnected-pad backlog discard/reenable is serviced on a
+-    # peripheral tick; do not race incoming test data with that pinmux edge.
+-    time.sleep(0.1)
+ 
+ 
+ def connect(path):
+@@ -236,8 +233,8 @@ def exercise(emu):
+         with backend(emu, tmp) as (client, path, _):
+             peer = connect(path)
+             try:
+-                # Attach capture before enabling pads, so the device can
+-                # observe an idle boundary for its disconnected RX flush.
++                # Attach capture before enabling pads. Fresh input immediately
++                # after enable must not be lost to deferred disabled-pad work.
+                 enable_pads(client)
+                 wide_access(client, peer)
+                 # Full duplex, burst >16, all values including NUL, LF, CR,
+-- 
+2.43.0
+

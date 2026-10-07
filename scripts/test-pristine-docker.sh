@@ -24,6 +24,10 @@ docker create --name "$NAME-build" --cpus "$J" -e J="$J" \
     python3 -m unittest discover -s tests -p "test_erbctl_loader.py"
     python3 -m unittest discover -s tests -p "test_fetch_sources.py"
     python3 et-platform/sw-sysemu/tests/erbium/host/test_cpu_reset.py --emu build/sw-sysemu/erbium_emu
+    python3 tests/test_erbctl_console.py
+    python3 tests/test_erbium_uart_client.py
+    python3 tests/test_uart_runner.py
+    scripts/test-uart-backend.sh
     python3 tests/test_linux_config.py
     scripts/package-dist.sh pristine
   ' >/dev/null

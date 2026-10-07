@@ -1,0 +1,1216 @@
+From e0e96d13c82d11f1408837f7f31d393c40063a1c Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Wed, 7 Oct 2026 05:35:15 +0000
+Subject: [PATCH 11/17] erbium: wire a dedicated nonblocking serial-peer UART
+ socket
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ sw-sysemu/CMakeLists.txt                      |   2 +
+ sw-sysemu/sw-sysemu/main.cpp                  |  21 +-
+ sw-sysemu/sys_emu/sys_emu.cpp                 |  88 ++++--
+ sw-sysemu/sys_emu/sys_emu.h                   |  11 +-
+ sw-sysemu/sys_emu/sys_emu_main.cpp            |   9 +-
+ sw-sysemu/sys_emu/sys_emu_parse_args.cpp      |  32 +-
+ sw-sysemu/sys_emu/uart_socket.cpp             | 184 ++++++++++++
+ sw-sysemu/sys_emu/uart_socket.h               |  52 ++++
+ sw-sysemu/sys_emu/uart_socket.md              |  72 +++++
+ .../tests/erbium/host/test_uart_endpoint.py   | 278 ++++++++++++++++++
+ .../tests/erbium/host/test_uart_socket.cpp    | 219 ++++++++++++++
+ 11 files changed, 936 insertions(+), 32 deletions(-)
+ create mode 100644 sw-sysemu/sys_emu/uart_socket.cpp
+ create mode 100644 sw-sysemu/sys_emu/uart_socket.h
+ create mode 100644 sw-sysemu/sys_emu/uart_socket.md
+ create mode 100644 sw-sysemu/tests/erbium/host/test_uart_endpoint.py
+ create mode 100644 sw-sysemu/tests/erbium/host/test_uart_socket.cpp
+
+diff --git a/sw-sysemu/CMakeLists.txt b/sw-sysemu/CMakeLists.txt
+index 2cfd10f..0f4a956 100644
+--- a/sw-sysemu/CMakeLists.txt
++++ b/sw-sysemu/CMakeLists.txt
+@@ -435,6 +435,8 @@ target_sources(sw-erbium PRIVATE
+     # SW wrapper
+     sw-sysemu/socket_agent.cpp
+     sw-sysemu/socket_agent.h
++    sys_emu/uart_socket.cpp
++    sys_emu/uart_socket.h
+ )
+ target_include_directories(sw-erbium
+     PUBLIC
+diff --git a/sw-sysemu/sw-sysemu/main.cpp b/sw-sysemu/sw-sysemu/main.cpp
+index 2c5cafe..ee77c5f 100644
+--- a/sw-sysemu/sw-sysemu/main.cpp
++++ b/sw-sysemu/sw-sysemu/main.cpp
+@@ -78,14 +78,19 @@ int main(int argc, char *argv[])
+     }
+ #endif
+ 
+-    auto emu = std::make_unique<sys_emu>(cmd_options, api_comm.get());
++    try {
++        auto emu = std::make_unique<sys_emu>(cmd_options, api_comm.get());
+ #if EMU_ERBIUM
+-    if (socket_agent) {
+-        socket_agent->set_emu(emu.get());
+-    }
++        if (socket_agent) {
++            socket_agent->set_emu(emu.get());
++        }
+ #endif
+-    int rv = emu.get()->main_internal();
+-    // Tear the emulator down before the API listener it references
+-    emu.reset();
+-    return rv;
++        int rv = emu.get()->main_internal();
++        // Tear the emulator down before the API listener it references.
++        emu.reset();
++        return rv;
++    } catch (const std::exception& e) {
++        std::cerr << argv[0] << ": " << e.what() << std::endl;
++        return EXIT_FAILURE;
++    }
+ }
+diff --git a/sw-sysemu/sys_emu/sys_emu.cpp b/sw-sysemu/sys_emu/sys_emu.cpp
+index ef879aa..b44361e 100644
+--- a/sw-sysemu/sys_emu/sys_emu.cpp
++++ b/sw-sysemu/sys_emu/sys_emu.cpp
+@@ -15,6 +15,7 @@
+ #include <iostream>
+ #include <list>
+ #include <locale>
++#include <stdexcept>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <tuple>
+@@ -35,6 +36,9 @@
+ #include "preload.h"
+ #include "sys_emu.h"
+ #include "support/lz4_stream.h"
++#if EMU_HAS_SHAKTI_UART
++#include "uart_socket.h"
++#endif
+ #ifdef HAVE_BACKTRACE
+ #include "crash_handler.h"
+ #endif
+@@ -190,6 +194,16 @@ sys_emu::disconnect_gdbstub()
+ 
+ sys_emu::sys_emu(const sys_emu_cmd_options &cmd_options, api_communicate *api_comm)
+ {
++#if EMU_HAS_SHAKTI_UART
++    if (!cmd_options.uart_socket_path.empty() &&
++        (!cmd_options.uart_rx_file.empty() || !cmd_options.uart_tx_file.empty()
++#if EMU_ERBIUM
++         || UartSocket::same_path(cmd_options.uart_socket_path, cmd_options.api_socket_path)
++#endif
++        )) {
++        throw std::invalid_argument("UART socket conflicts with UART files or API socket path");
++    }
++#endif
+     this->cmd_options = cmd_options;
+     this->api_listener = api_comm;
+ 
+@@ -260,6 +274,9 @@ sys_emu::sys_emu(const sys_emu_cmd_options &cmd_options, api_communicate *api_co
+         cmd_options.mem_desc_file.empty() && cmd_options.api_comm_path.empty() && g_preload->empty()
+ #if EMU_ERBIUM
+         && cmd_options.api_socket_path.empty()
++#endif
++#if EMU_HAS_SHAKTI_UART
++        && cmd_options.uart_socket_path.empty()
+ #endif
+         ) {
+         LOG_AGENT(FTL, agent, "%s", "Need an ELF file, a file load, a mem_desc file or runtime API!");
+@@ -445,24 +462,35 @@ sys_emu::sys_emu(const sys_emu_cmd_options &cmd_options, api_communicate *api_co
+ #endif // EMU_HAS_SPIO
+ 
+ #if EMU_HAS_SHAKTI_UART
+-    if (!cmd_options.uart_rx_file.empty()) {
+-        int fd = open(cmd_options.uart_rx_file.c_str(), O_RDONLY | O_NONBLOCK);
+-        if (fd < 0) {
+-            LOG_AGENT(FTL, agent, "Error opening \"%s\"", cmd_options.uart_rx_file.c_str());
+-        }
+-        chip.uart_set_rx_fd(fd);
++    if (!cmd_options.uart_socket_path.empty()) {
++        uart_socket_ = std::make_unique<UartSocket>(cmd_options.uart_socket_path,
++            [this](int fd) {
++                chip.uart_set_rx_fd(fd);
++                chip.uart_set_tx_fd(fd);
++                // The fd interface caches attachment metadata. Service a
++                // detached attachment before its owner closes/reuses the fd.
++                if (fd < 0) chip.memory.uart_clock_tick(agent, 0);
++            });
+     } else {
+-        chip.uart_set_rx_fd(STDIN_FILENO);
+-    }
++        if (!cmd_options.uart_rx_file.empty()) {
++            int fd = open(cmd_options.uart_rx_file.c_str(), O_RDONLY | O_NONBLOCK);
++            if (fd < 0) {
++                LOG_AGENT(FTL, agent, "Error opening \"%s\"", cmd_options.uart_rx_file.c_str());
++            }
++            chip.uart_set_rx_fd(fd);
++        } else {
++            chip.uart_set_rx_fd(STDIN_FILENO);
++        }
+ 
+-    if (!cmd_options.uart_tx_file.empty()) {
+-        int fd = open(cmd_options.uart_tx_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+-        if (fd < 0) {
+-            LOG_AGENT(FTL, agent, "Error creating \"%s\"", cmd_options.uart_tx_file.c_str());
++        if (!cmd_options.uart_tx_file.empty()) {
++            int fd = open(cmd_options.uart_tx_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
++            if (fd < 0) {
++                LOG_AGENT(FTL, agent, "Error creating \"%s\"", cmd_options.uart_tx_file.c_str());
++            }
++            chip.uart_set_tx_fd(fd);
++        } else {
++            chip.uart_set_tx_fd(STDOUT_FILENO);
+         }
+-        chip.uart_set_tx_fd(fd);
+-    } else {
+-        chip.uart_set_tx_fd(STDOUT_FILENO);
+     }
+ #endif // EMU_HAS_SHAKTI_UART
+ 
+@@ -479,6 +507,8 @@ sys_emu::sys_emu(const sys_emu_cmd_options &cmd_options, api_communicate *api_co
+     }
+ }
+ 
++sys_emu::~sys_emu() = default;
++
+ 
+ #if EMU_ERBIUM
+ void sys_emu::por_reset()
+@@ -487,7 +517,7 @@ void sys_emu::por_reset()
+     // Awaking harts are still linked in a list; fold them back first so the
+     // reset below sees consistent hart lists.
+     chip.active.splice(chip.active.cend(), chip.awaking);
+-    chip.memory.por_reset();
++    chip.memory.por_reset(agent);
+     reset_chip();
+ }
+ 
+@@ -585,7 +615,11 @@ int sys_emu::main_internal() {
+ 
+     // With an API listener that wants to keep serving (e.g. the QEMU socket
+     // backend) the emulator runs until told to stop, even with no harts.
+-    const bool keep_alive = (api_listener != nullptr) && api_listener->keep_alive();
++    const bool keep_alive = ((api_listener != nullptr) && api_listener->keep_alive())
++#if EMU_HAS_SHAKTI_UART
++        || (uart_socket_ != nullptr)
++#endif
++        ;
+ 
+     // While there are active threads or the network emulator is still not done
+     while (!chip.get_emu_done()
+@@ -632,11 +666,25 @@ int sys_emu::main_internal() {
+         // listener may block for a short while instead of busy looping.
+         if (api_listener) {
+             api_listener->process();
+-            // (Not while a timer is counting: sleeping harts waiting on the
+-            // rvtimer would otherwise wake up at 1 cycle/ms.)
+-            if (keep_alive && !chip.has_active_harts() && !chip.timers_active()) {
++        }
++#if EMU_HAS_SHAKTI_UART
++        if (uart_socket_) {
++            uart_socket_->process();
++            if (uart_socket_->stop_requested()) chip.set_emu_done(true);
++        }
++#endif
++        // Not while a timer is counting: sleeping harts waiting on the
++        // rvtimer would otherwise wake up at 1 cycle/ms. One bounded wait,
++        // not one wait per endpoint; UART is serviced even while CPU held.
++        if (keep_alive && !chip.has_active_harts() && !chip.timers_active()) {
++            if (api_listener && api_listener->keep_alive()) {
+                 api_listener->idle_wait();
+             }
++#if EMU_HAS_SHAKTI_UART
++            else if (uart_socket_) {
++                uart_socket_->idle_wait();
++            }
++#endif
+         }
+ 
+         // Safe boundary for resets requested by host MMIO or by an
+diff --git a/sw-sysemu/sys_emu/sys_emu.h b/sw-sysemu/sys_emu/sys_emu.h
+index 40fb28f..835616f 100644
+--- a/sw-sysemu/sys_emu/sys_emu.h
++++ b/sw-sysemu/sys_emu/sys_emu.h
+@@ -169,6 +169,8 @@ struct sys_emu_cmd_options {
+ #if EMU_HAS_SHAKTI_UART
+     std::string uart_rx_file;
+     std::string uart_tx_file;
++    // Independent raw full-duplex serial peer, never a framed host API.
++    std::string uart_socket_path;
+ #endif
+ 
+     std::string otp_load_file;
+@@ -184,13 +186,16 @@ struct sys_emu_cmd_options {
+ };
+ 
+ class api_communicate;
++#if EMU_HAS_SHAKTI_UART
++class UartSocket;
++#endif
+ 
+ // Driver for a bemu::System instance
+ class sys_emu
+ {
+ public:
+     SW_SYSEMU_EXPORT sys_emu(const sys_emu_cmd_options& cmd_options, api_communicate* api_comm = nullptr);
+-    virtual ~sys_emu() = default;
++    virtual ~sys_emu();
+ 
+     /// Function used for parsing the command line arguments
+     static std::tuple<bool, struct sys_emu_cmd_options>
+@@ -338,6 +343,10 @@ private:
+ 
+     api_communicate* api_listener = nullptr;
+     sys_emu_cmd_options cmd_options;
++#if EMU_HAS_SHAKTI_UART
++    // Destroy before chip: the endpoint detaches the UART's borrowed fds.
++    std::unique_ptr<UartSocket> uart_socket_;
++#endif
+ };
+ 
+ 
+diff --git a/sw-sysemu/sys_emu/sys_emu_main.cpp b/sw-sysemu/sys_emu/sys_emu_main.cpp
+index 5c3651a..93d6b7a 100644
+--- a/sw-sysemu/sys_emu/sys_emu_main.cpp
++++ b/sw-sysemu/sys_emu/sys_emu_main.cpp
+@@ -26,6 +26,11 @@ int main(int argc, char * argv[])
+         return EXIT_FAILURE;
+     }
+ 
+-    std::unique_ptr<sys_emu> emu(new sys_emu(cmd_options));
+-    return emu.get()->main_internal();
++    try {
++        std::unique_ptr<sys_emu> emu(new sys_emu(cmd_options));
++        return emu.get()->main_internal();
++    } catch (const std::exception& e) {
++        std::cerr << argv[0] << ": " << e.what() << std::endl;
++        return EXIT_FAILURE;
++    }
+ }
+diff --git a/sw-sysemu/sys_emu/sys_emu_parse_args.cpp b/sw-sysemu/sys_emu/sys_emu_parse_args.cpp
+index b13490f..3b24b5c 100644
+--- a/sw-sysemu/sys_emu/sys_emu_parse_args.cpp
++++ b/sw-sysemu/sys_emu/sys_emu_parse_args.cpp
+@@ -7,6 +7,9 @@
+ #include <getopt.h>
+ #include "emu_gio.h"
+ #include "sys_emu.h"
++#if EMU_HAS_SHAKTI_UART
++#include "uart_socket.h"
++#endif
+ 
+ static const char * help_msg =
+ #if EMU_ERBIUM
+@@ -84,6 +87,8 @@ static const char * help_msg =
+ #if EMU_HAS_SHAKTI_UART
+ "     -uart_rx_file <path>     Path to the file from which to read UART RX input (default is stdin)\n"
+ "     -uart_tx_file <path>     Path to the file to which to write UART TX output (default is stdout)\n"
++"     --uart-socket <path>     Owned raw UNIX stream serial peer (no xSPI framing); one client, reconnectable\n"
++"                             Replaces stdin/stdout; incompatible with UART RX/TX files; path must not exist\n"
+ #endif // EMU_HAS_SHAKTI_UART
+ "     -otp_load <path>         Path to a raw binary file to load into the OTP region\n"
+ #endif // SDK_RELEASE
+@@ -166,6 +171,10 @@ sys_emu::parse_command_line_arguments(int argc, char* argv[])
+     int index = 0;
+     uint64_t dump_at_end_addr = 0, dump_at_end_size = 0;
+     uint64_t dump_at_pc_pc, dump_at_pc_addr, dump_at_pc_size;
++#if EMU_HAS_SHAKTI_UART
++    bool uart_socket_given = false;
++    bool uart_file_given = false;
++#endif
+ 
+     static const struct option long_options[] = {
+ #ifndef SDK_RELEASE
+@@ -230,6 +239,8 @@ sys_emu::parse_command_line_arguments(int argc, char* argv[])
+ #if EMU_HAS_SHAKTI_UART
+         {"uart_rx_file",           required_argument, nullptr, 0},
+         {"uart_tx_file",           required_argument, nullptr, 0},
++        {"uart-socket",            required_argument, nullptr, 0},
++        {"uart_socket",            required_argument, nullptr, 0},
+ #endif // EMU_HAS_SHAKTI_UART
+         {"otp_load",               required_argument, nullptr, 0},
+ #endif // !SDK_RELEASE
+@@ -521,12 +532,21 @@ sys_emu::parse_command_line_arguments(int argc, char* argv[])
+ #if EMU_HAS_SHAKTI_UART
+         else if (!strcmp(name, "uart_rx_file"))
+         {
++            uart_file_given = true;
+             cmd_options.uart_rx_file = optarg;
+         }
+         else if (!strcmp(name, "uart_tx_file"))
+         {
++            uart_file_given = true;
+             cmd_options.uart_tx_file = optarg;
+         }
++        else if (!strcmp(name, "uart-socket") || !strcmp(name, "uart_socket"))
++        {
++            if (uart_socket_given) SE_ERROR("Specify --uart-socket only once");
++            uart_socket_given = true;
++            if (!*optarg) SE_ERROR("--uart-socket requires a nonempty pathname");
++            cmd_options.uart_socket_path = optarg;
++        }
+ #endif // EMU_HAS_SHAKTI_UART
+         else if (!strcmp(name, "otp_load"))
+         {
+@@ -682,10 +702,20 @@ sys_emu::parse_command_line_arguments(int argc, char* argv[])
+     // Enable logging for all threads if no filter has been specified
+     if (cmd_options.log_thread.none()) cmd_options.log_thread.set();
+ 
++#if EMU_HAS_SHAKTI_UART
++    if (uart_socket_given && uart_file_given)
++        SE_ERROR("--uart-socket cannot be combined with --uart_rx_file or --uart_tx_file");
++#if EMU_ERBIUM
++    if (uart_socket_given && UartSocket::same_path(cmd_options.uart_socket_path,
++                                                  cmd_options.api_socket_path))
++        SE_ERROR("--uart-socket and --api-socket require distinct pathnames");
++#endif
++#endif
+ #if EMU_ERBIUM
+     // Serving a host over the API socket: keep running until killed unless
+     // the user explicitly bounded the run.
+-    if (!cmd_options.api_socket_path.empty() && !max_cycles_given) {
++    if ((!cmd_options.api_socket_path.empty() || !cmd_options.uart_socket_path.empty()) &&
++        !max_cycles_given) {
+         cmd_options.max_cycles = ~0ull;
+     }
+ #else
+diff --git a/sw-sysemu/sys_emu/uart_socket.cpp b/sw-sysemu/sys_emu/uart_socket.cpp
+new file mode 100644
+index 0000000..bb074fc
+--- /dev/null
++++ b/sw-sysemu/sys_emu/uart_socket.cpp
+@@ -0,0 +1,184 @@
++/*-------------------------------------------------------------------------
++* Copyright (c) 2026 Ainekko, Co.
++* SPDX-License-Identifier: Apache-2.0
++*-------------------------------------------------------------------------*/
++
++#include "uart_socket.h"
++
++#include <cerrno>
++#include <cstring>
++#include <stdexcept>
++#include <system_error>
++#include <utility>
++
++#include <poll.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++namespace {
++volatile sig_atomic_t uart_stop_requested = 0;
++void stop_uart(int) { uart_stop_requested = 1; }
++
++void fail(const char* operation)
++{
++    throw std::system_error(errno, std::generic_category(), operation);
++}
++} // namespace
++
++UartSocket::UartSocket(const std::string& path, Attach attach)
++    : path_(path), attach_(std::move(attach))
++{
++    struct sockaddr_un addr{};
++    if (path.empty() || path.size() >= sizeof(addr.sun_path) ||
++        path.find('\0') != std::string::npos) {
++        throw std::invalid_argument("UART socket: invalid or overlong pathname");
++    }
++    addr.sun_family = AF_UNIX;
++    std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
++
++    try {
++        listen_fd_ = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++        if (listen_fd_ < 0) fail("UART socket");
++        // Never remove an existing path, even a stale socket. In particular,
++        // binding another emulator must not displace a live listener.
++        if (::bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0)
++            fail("UART socket bind (path must not already exist)");
++        struct stat st{};
++        if (::lstat(path_.c_str(), &st) < 0) fail("UART socket lstat");
++        if (!S_ISSOCK(st.st_mode))
++            throw std::runtime_error("UART socket pathname changed during bind");
++        path_dev_ = st.st_dev;
++        path_ino_ = st.st_ino;
++        owns_path_ = true;
++        if (::listen(listen_fd_, 1) < 0) fail("UART socket listen");
++
++        // Keep cleanup effective for UART-only runs as well as API runs.
++        // Restore prior handlers on destruction; do not globally ignore
++        // SIGPIPE (the UART FD writer suppresses its own write's signal).
++        struct sigaction sa{};
++        sa.sa_handler = stop_uart;
++        ::sigemptyset(&sa.sa_mask);
++        uart_stop_requested = 0;
++        if (::sigaction(SIGINT, &sa, &old_int_) < 0) fail("UART SIGINT");
++        installed_int_ = true;
++        if (::sigaction(SIGTERM, &sa, &old_term_) < 0) fail("UART SIGTERM");
++        installed_term_ = true;
++        attach_(-1);
++    } catch (...) {
++        cleanup();
++        throw;
++    }
++}
++
++UartSocket::~UartSocket()
++{
++    cleanup();
++}
++
++void UartSocket::drop_client()
++{
++    if (client_fd_ < 0) return;
++    // Invalidate the borrowed fd and its UART cache BEFORE closing it. The
++    // next accepted connection can have exactly the same descriptor number.
++    attach_(-1);
++    ::close(client_fd_);
++    client_fd_ = -1;
++}
++
++void UartSocket::cleanup()
++{
++    drop_client();
++    if (listen_fd_ >= 0) {
++        ::close(listen_fd_);
++        listen_fd_ = -1;
++    }
++    // Do not unlink a replacement file/socket installed at our old pathname.
++    struct stat st{};
++    if (owns_path_ && ::lstat(path_.c_str(), &st) == 0 &&
++        S_ISSOCK(st.st_mode) && st.st_dev == path_dev_ && st.st_ino == path_ino_) {
++        ::unlink(path_.c_str());
++    }
++    owns_path_ = false;
++    if (installed_term_) ::sigaction(SIGTERM, &old_term_, nullptr);
++    if (installed_int_) ::sigaction(SIGINT, &old_int_, nullptr);
++    installed_term_ = installed_int_ = false;
++}
++
++bool UartSocket::stop_requested() const
++{
++    return uart_stop_requested != 0;
++}
++
++bool UartSocket::same_path(const std::string& a, const std::string& b)
++{
++    if (a.empty() || b.empty()) return false;
++    if (a == b) return true;
++    const auto split = [](const std::string& path) {
++        const auto slash = path.find_last_of('/');
++        if (slash == std::string::npos) return std::make_pair(std::string("."), path);
++        return std::make_pair(slash == 0 ? std::string("/") : path.substr(0, slash),
++                              path.substr(slash + 1));
++    };
++    const auto first = split(a);
++    const auto second = split(b);
++    if (first.second != second.second) return false;
++    struct stat left{}, right{};
++    return ::stat(first.first.c_str(), &left) == 0 &&
++           ::stat(second.first.c_str(), &right) == 0 &&
++           left.st_dev == right.st_dev && left.st_ino == right.st_ino;
++}
++
++void UartSocket::process()
++{
++    struct pollfd fds[] = {
++        {listen_fd_, POLLIN, 0},
++        {client_fd_, POLLRDHUP, 0},
++    };
++    int rv = ::poll(fds, 2, 0);
++    if (rv < 0) {
++        if (errno == EINTR) return;
++        fail("UART socket poll");
++    }
++    if (client_fd_ >= 0) {
++        const auto events = fds[1].revents;
++        if (events & (POLLERR | POLLHUP | POLLRDHUP | POLLNVAL)) {
++            drop_client();
++        }
++    }
++    if (!(fds[0].revents & POLLIN)) return;
++    // Bounded work under connect storms. One live client is retained; extra
++    // clients are accepted and immediately closed, never queued for takeover.
++    for (unsigned i = 0; i < 16; ++i) {
++        const int fd = ::accept4(listen_fd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
++        if (fd < 0) {
++            // Interrupted/transient accepts will be retried next iteration;
++            // resource exhaustion must not stall CPU execution either.
++            return;
++        }
++        if (client_fd_ >= 0) {
++            ::close(fd);
++            continue;
++        }
++        try {
++            attach_(fd);
++        } catch (...) {
++            attach_(-1);
++            ::close(fd);
++            throw;
++        }
++        client_fd_ = fd;
++    }
++}
++
++void UartSocket::idle_wait()
++{
++    // Do not wait on POLLOUT (usually always ready) or client POLLIN: a full
++    // UART FIFO/pinmux-disabled receiver can leave readable bytes indefinitely.
++    // A bounded 1ms sleep still services incoming serial data while held/WFI,
++    // without spinning on host backpressure. Timers bypass this in sys_emu.
++    // A listener can also remain readable under accept resource exhaustion.
++    // Always yield here; the next process() is at most 1ms away.
++    if (::poll(nullptr, 0, 1) < 0 && errno != EINTR) fail("UART socket idle poll");
++}
+diff --git a/sw-sysemu/sys_emu/uart_socket.h b/sw-sysemu/sys_emu/uart_socket.h
+new file mode 100644
+index 0000000..37afc3e
+--- /dev/null
++++ b/sw-sysemu/sys_emu/uart_socket.h
+@@ -0,0 +1,52 @@
++/*-------------------------------------------------------------------------
++* Copyright (c) 2026 Ainekko, Co.
++* SPDX-License-Identifier: Apache-2.0
++*-------------------------------------------------------------------------*/
++
++#ifndef SYSEMU_UART_SOCKET_H
++#define SYSEMU_UART_SOCKET_H
++
++#include <csignal>
++#include <functional>
++#include <string>
++#include <sys/types.h>
++
++// Owned serial-peer transport, NOT a host MMIO/xSPI API. The UART borrows the
++// same nonblocking descriptor for RX and TX; this class never reads/writes bytes.
++class UartSocket {
++public:
++    // attach(-1) must detach BOTH directions and service the UART FD interface
++    // before returning, so its cached descriptor state is invalidated before
++    // close()/accept4() can reuse a descriptor number. Must not throw on detach.
++    using Attach = std::function<void(int)>;
++    UartSocket(const std::string& path, Attach attach);
++    ~UartSocket();
++    UartSocket(const UartSocket&) = delete;
++    UartSocket& operator=(const UartSocket&) = delete;
++
++    void process();
++    void idle_wait();
++    bool stop_requested() const;
++    bool has_client() const { return client_fd_ >= 0; }
++    // Include aliases of an existing parent directory (relative paths, ".",
++    // directory symlinks), even though the socket itself does not exist yet.
++    static bool same_path(const std::string& a, const std::string& b);
++
++private:
++    void drop_client();
++    void cleanup();
++
++    std::string path_;
++    Attach attach_;
++    int listen_fd_ = -1;
++    int client_fd_ = -1;
++    dev_t path_dev_ = 0;
++    ino_t path_ino_ = 0;
++    bool owns_path_ = false;
++    struct sigaction old_int_{};
++    struct sigaction old_term_{};
++    bool installed_int_ = false;
++    bool installed_term_ = false;
++};
++
++#endif
+diff --git a/sw-sysemu/sys_emu/uart_socket.md b/sw-sysemu/sys_emu/uart_socket.md
+new file mode 100644
+index 0000000..2701610
+--- /dev/null
++++ b/sw-sysemu/sys_emu/uart_socket.md
+@@ -0,0 +1,72 @@
++# Direct serial-peer endpoint
++
++`erbium_emu --uart-socket PATH` owns a filesystem AF_UNIX stream listener.
++Connect the Linux guest's UART1 (`ttyAMA1`) chardev to this path, separately
++from UART0's boot console and the framed `--api-socket` xSPI backend.
++Every byte received on this socket enters Shakti UART RX; every transmitted
++Shakti UART byte goes back to that same peer. No MMIO/console RPC, framing,
++terminal conversion, or emulator diagnostic text is inserted into this stream.
++
++This is the functional equivalent of host UART TX -> Erbium UART_RX (GPIO10)
++and host UART RX <- Erbium UART_TX (GPIO9), as described by the source RTL
++study in the enclosing project's `docs/uart-host-connectivity.md`.
++Firmware must still select `SystemConfig.uart_enable` (bit 6). This reliable,
++backpressured byte transport does not model baud timing, shift registers,
++electrical levels, framing errors, break, or physical RX overruns.
++
++## Ownership and reconnect policy
++
++* The pathname must not exist, including a stale socket. Nothing is removed
++  before bind. Inspect and manually remove a stale socket only after confirming
++  its previous owner is gone. A live listener, regular file, or symlink is never
++  displaced. Normal shutdown removes only the socket inode this instance bound.
++* One active full-duplex connection is retained. Additional connections are
++  accepted and immediately closed, not queued for later takeover. Admission
++  processing is bounded per emulator iteration.
++* EOF, half-close, hangup, or a socket error ends the session. The endpoint
++  detaches both borrowed UART fds and polls their FD interface **before** closing
++  the descriptor, then accepts a fresh connection. Bytes still in the closed
++  connection's kernel queues are discarded; bytes already in UART FIFOs remain
++  governed by the device. No unbounded reconnect spool/replay buffer is added.
++* CPU warm reset/POR does not recreate the listener or close a connected peer.
++  The normal device reset/pinmux rules still apply; a POR can disable the pads.
++  Whole-chip POR clears UART registers/FIFOs/interrupt state; CPU-only warm,
++  cold, and debug resets do not. Host bytes sent while pads are disabled are
++  discarded by the device's bounded RX service; reenable may also flush backlog.
++* No client means RX/TX attach to `-1`, not stdin/stdout. Device FIFO
++  backpressure governs queued TX; this is not a guarantee of lossless output
++  across unlimited disconnection or target FIFO-full writes.
++* SIGINT/SIGTERM allow normal cleanup even without an xSPI listener.
++  UART writes suppress their own SIGPIPE, without requiring the xSPI backend.
++* While CPU-held/WFI, the endpoint remains serviced. Idle waits are bounded
++  to 1ms when no simulation timer is running; a full RX FIFO does not cause a
++  readiness-driven busy loop.
++
++`--uart_rx_file PATH` and `--uart_tx_file PATH` (including existing single-dash
++spellings and PTY paths) remain available without `--uart-socket`. They cannot be
++combined with socket mode. UART and xSPI must use distinct socket pathnames.
++Attach the host/capture before releasing CPU reset to retain the boot banner.
++
++## Endpoint regressions
++
++From the enclosing repository root, build the isolated lifecycle test:
++
++```sh
++g++ -std=c++17 -Wall -Wextra -Werror -pedantic \
++  -Iet-platform/sw-sysemu/sys_emu \
++  et-platform/sw-sysemu/sys_emu/uart_socket.cpp \
++  et-platform/sw-sysemu/tests/erbium/host/test_uart_socket.cpp \
++  -o /tmp/test_uart_socket
++/tmp/test_uart_socket
++```
++
++After the shared emulator build (`cmake --build build/sw-sysemu --target
++erbium_emu -j2`), run the independent backend integration regression:
++
++```sh
++python3 et-platform/sw-sysemu/tests/erbium/host/test_uart_endpoint.py \
++  --emu build/sw-sysemu/erbium_emu
++```
++
++These tests are endpoint/FD-lifecycle tests, not the UART register-fidelity
++suite and not the guest `erbctl load --start`/Kotama console acceptance test.
+diff --git a/sw-sysemu/tests/erbium/host/test_uart_endpoint.py b/sw-sysemu/tests/erbium/host/test_uart_endpoint.py
+new file mode 100644
+index 0000000..1f3775d
+--- /dev/null
++++ b/sw-sysemu/tests/erbium/host/test_uart_endpoint.py
+@@ -0,0 +1,278 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 Ainekko, Co.
++# SPDX-License-Identifier: Apache-2.0
++"""Endpoint integration, separate from UART register-fidelity regressions.
++
++python3 test_uart_endpoint.py --emu /path/to/erbium_emu
++
++No guest image/cross compiler/pytest. MMIO is exercised through the existing
++xSPI backend test client solely to drive/assert the independent serial wiring.
++This is not the Linux UART1/Kotama end-to-end acceptance test.
++"""
++
++import argparse
++import contextlib
++from pathlib import Path
++import socket
++import struct
++import subprocess
++import sys
++import tempfile
++import time
++
++sys.dont_write_bytecode = True
++sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tools"))
++from erb_client import ErbClient  # noqa: E402
++
++DEADLINE = 5
++CONFIG = 0x02000008
++SOFT_RESET = 0x02000028
++MINION_BOOT = 0x80D00018
++TX = 0x02004008
++RX = 0x02004010
++STATUS = 0x02004018
++BAUD = 0x02004000
++CODE = 0x40001000
++SENTINEL = 0x40010000
++
++
++def check(condition, message):
++    if not condition:
++        raise AssertionError(message)
++
++
++def until(predicate, message):
++    deadline = time.monotonic() + DEADLINE
++    while time.monotonic() < deadline:
++        if predicate():
++            return
++        time.sleep(0.005)
++    raise AssertionError("timeout: " + message)
++
++
++def read(client, addr, size):
++    status, data = client.read(addr, size)
++    check(status == 0 and len(data) == size, f"MMIO read {addr:#x}: status {status}")
++    return data
++
++
++def w32(client, addr, value):
++    check(client.write(addr, struct.pack("<I", value)) == 0, f"MMIO write {addr:#x}")
++
++
++def u32(client, addr):
++    return struct.unpack("<I", read(client, addr, 4))[0]
++
++
++def enable_pads(client):
++    w32(client, CONFIG, u32(client, CONFIG) | 64)
++    # Device-side disconnected-pad backlog discard/reenable is serviced on a
++    # peripheral tick; do not race incoming test data with that pinmux edge.
++    time.sleep(0.1)
++
++
++def connect(path):
++    peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++    peer.settimeout(DEADLINE)
++    peer.connect(str(path))
++    return peer
++
++
++def receive(peer, size):
++    data = b""
++    while len(data) < size:
++        chunk = peer.recv(size - len(data))
++        check(bool(chunk), "serial peer unexpectedly closed")
++        data += chunk
++    return data
++
++
++def serial_rx(client, payload):
++    data = bytearray()
++    for _ in payload:
++        until(lambda: u32(client, STATUS) & 4, "UART RX byte")
++        data.append(u32(client, RX) & 255)
++    check(bytes(data) == payload, "UART input is not byte-transparent")
++
++
++def serial_tx(client, peer, payload):
++    for byte in payload:
++        until(lambda: not (u32(client, STATUS) & 2), "UART TX space")
++        w32(client, TX, byte)
++    check(receive(peer, len(payload)) == payload, "UART output is not byte-transparent")
++
++
++@contextlib.contextmanager
++def backend(emu, directory, api=True):
++    path = Path(directory)
++    uart = path / "uart.sock"
++    bus = path / "api.sock"
++    args = [str(emu), "--uart-socket", str(uart), "--start-held",
++            "-minions", "1", "-single_thread", "-reset_pc", hex(CODE)]
++    if api:
++        args += ["--api-socket", str(bus)]
++    log_path = path / "emu.log"
++    with log_path.open("wb") as log:
++        proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
++        client = None
++        try:
++            until(lambda: proc.poll() is not None or uart.exists(), "UART listener")
++            check(proc.poll() is None, "backend exited before listener startup")
++            if api:
++                client = ErbClient(str(bus))
++                client.sock.settimeout(DEADLINE)
++            yield client, uart, proc
++            check(proc.poll() is None, "backend exited during serial service")
++        except BaseException:
++            log.flush()
++            print(log_path.read_text(errors="replace")[-12000:], file=sys.stderr)
++            raise
++        finally:
++            if client:
++                client.close()
++            if proc.poll() is None:
++                proc.terminate()
++            try:
++                proc.wait(timeout=DEADLINE)
++            except subprocess.TimeoutExpired:
++                proc.kill()
++                proc.wait()
++                raise AssertionError("backend failed to terminate/clean up")
++            check(proc.returncode == 0, f"backend return code {proc.returncode}")
++            check(not uart.exists(), "owned UART socket not removed at shutdown")
++            if api:
++                check(not bus.exists(), "API socket not removed at shutdown")
++            log.flush()
++            text = log_path.read_bytes()
++            check(b"FATAL" not in text and b"fatal error in chip model" not in text,
++                  "backend reported a fatal model error")
++            check(b"UART-no-stdout!" not in text, "disconnected serial output leaked into emulator logs")
++
++
++def exercise(emu):
++    with tempfile.TemporaryDirectory(prefix="erbium-uart-endpoint-") as tmp:
++        with backend(emu, tmp) as (client, path, _):
++            enable_pads(client)
++            peer = connect(path)
++            try:
++                # Full duplex, burst >16, all values including NUL, LF, CR,
++                # high-bit bytes, escape, and the xSPI framing magic.
++                payload = bytes(range(256)) + b"UERB\r\n\x1b\x00"
++                peer.sendall(payload)
++                serial_tx(client, peer, payload[::-1])
++                serial_rx(client, payload)
++                check(client.ping()[0] == 0, "UART traffic damaged xSPI protocol")
++
++                extra = connect(path)
++                try:
++                    check(extra.recv(1) == b"", "second serial client was not rejected")
++                finally:
++                    extra.close()
++                serial_tx(client, peer, b"retained-first-client")
++
++                # Target-only resets never close/recreate the serial connection.
++                w32(client, BAUD, 0x1234)
++                peer.sendall(b"warm-state")
++                until(lambda: u32(client, STATUS) & 4, "RX queued before warm reset")
++                w32(client, SOFT_RESET, 6)
++                check(u32(client, BAUD) & 0xFFFF == 0x1234, "CPU warm reset reset UART registers")
++                serial_rx(client, b"warm-state")
++                serial_tx(client, peer, b"held-warm-reset")
++                peer.sendall(b"POR-state")
++                until(lambda: u32(client, STATUS) & 4, "RX queued before POR")
++                check(client.reset(0) == 0, "POR failed")
++                check(u32(client, BAUD) & 0xFFFF == 5, "POR did not reset UART registers")
++                check(not (u32(client, STATUS) & 4), "POR did not reset internal UART RX FIFO")
++                enable_pads(client)  # POR disables the pinmux
++                serial_tx(client, peer, b"same-peer-after-POR")
++
++                # A real hart reaches WFI; peripheral serial service remains
++                # live without any UART/timer interrupt enabled.
++                code = struct.pack("<6I", 0x400102B7, 0x06500313, 0x0062B023,
++                                   0x30405073, 0x10500073, 0xFFDFF06F)
++                check(client.write(CODE, code) == 0, "upload WFI program")
++                check(client.write(MINION_BOOT, struct.pack("<Q", CODE)) == 0, "set boot PC")
++                w32(client, SOFT_RESET, 4)
++                until(lambda: read(client, SENTINEL, 8) == struct.pack("<Q", 101),
++                      "hart executes uploaded WFI program")
++                time.sleep(0.05)
++                peer.sendall(b"WFI-input")
++                serial_rx(client, b"WFI-input")
++                serial_tx(client, peer, b"WFI-output")
++                w32(client, SOFT_RESET, 6)
++            finally:
++                peer.close()
++
++            # No client must NOT fall back to stdout. Fill exactly the bounded
++            # UART FIFO while detached and deliver its retained bytes on reattach.
++            time.sleep(0.1)
++            deferred = b"UART-no-stdout!\x00"
++            check(len(deferred) == 16, "test requires exactly one UART FIFO")
++            for byte in deferred:
++                w32(client, TX, byte)
++            check(u32(client, STATUS) & 2, "disconnected TX did not retain bounded FIFO")
++            peer = connect(path)
++            try:
++                check(receive(peer, 16) == deferred, "reconnect lost queued UART TX")
++                peer.sendall(b"\x00\xffreconnected")
++                serial_rx(client, b"\x00\xffreconnected")
++                # Half-close ends this full-duplex session and allows replacement.
++                peer.shutdown(socket.SHUT_WR)
++                check(peer.recv(1) == b"", "half-close did not end serial session")
++            finally:
++                peer.close()
++            peer = connect(path)
++            try:
++                serial_tx(client, peer, b"reconnect-after-half-close")
++            finally:
++                peer.close()
++
++    # UART-only CPU-held operation also keeps serving/cleans up gracefully.
++    with tempfile.TemporaryDirectory(prefix="erbium-uart-only-") as tmp:
++        with backend(emu, tmp, api=False) as (_, path, _):
++            peer = connect(path)
++            try:
++                peer.sendall(b"held-without-xspi")
++                time.sleep(0.05)
++            finally:
++                peer.close()
++
++
++def cli_conflicts(emu):
++    with tempfile.TemporaryDirectory(prefix="erbium-uart-cli-") as tmp:
++        path = str(Path(tmp) / "uart.sock")
++        cases = [
++            ["--uart-socket", path, "--uart_rx_file", "/dev/null"],
++            ["--uart_tx_file", "/dev/null", "--uart-socket", path],
++            ["--uart-socket", path, "--api-socket", path],
++            ["--uart-socket", path, "--api-socket", f"{tmp}/./uart.sock"],
++            ["--uart-socket", path, "--uart_socket", path],
++            ["--uart-socket", ""],
++        ]
++        for args in cases:
++            proc = subprocess.run([str(emu), *args], stdin=subprocess.DEVNULL,
++                                  capture_output=True, timeout=DEADLINE)
++            check(proc.returncode != 0, f"conflicting CLI accepted: {args}")
++            check(b"--uart-socket" in proc.stdout, "UART option missing from help")
++            check(not Path(path).exists(), "CLI failure left a socket behind")
++
++        Path(path).write_bytes(b"preserve-this-unrelated-file")
++        proc = subprocess.run([str(emu), "--uart-socket", path, "--start-held"],
++                              stdin=subprocess.DEVNULL, capture_output=True, timeout=DEADLINE)
++        check(proc.returncode != 0, "existing unrelated path accepted")
++        check(Path(path).read_bytes() == b"preserve-this-unrelated-file",
++              "unrelated file was removed/modified")
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--emu", required=True, type=Path)
++    args = parser.parse_args()
++    emu = args.emu.resolve()
++    cli_conflicts(emu)
++    exercise(emu)
++    print("UART endpoint integration: PASS")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/sw-sysemu/tests/erbium/host/test_uart_socket.cpp b/sw-sysemu/tests/erbium/host/test_uart_socket.cpp
+new file mode 100644
+index 0000000..17379c6
+--- /dev/null
++++ b/sw-sysemu/tests/erbium/host/test_uart_socket.cpp
+@@ -0,0 +1,219 @@
++/*-------------------------------------------------------------------------
++* Copyright (c) 2026 Ainekko, Co.
++* SPDX-License-Identifier: Apache-2.0
++*-------------------------------------------------------------------------*/
++// Isolated transport/lifecycle test. Compile with uart_socket.cpp; no emulator
++// library, cross compiler, or guest image is needed (see uart_socket.md).
++#include "uart_socket.h"
++
++#include <array>
++#include <cassert>
++#include <chrono>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <stdexcept>
++#include <vector>
++
++#include <fcntl.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++namespace {
++struct Borrower {
++    int fd = -1;
++    int cached_fd = -1;
++    std::vector<int> attachments;
++    void attach(int new_fd) {
++        if (new_fd < 0) {
++            // Model the UART fdinterface poll: cached state must be cleared
++            // while the old borrowed fd is still open.
++            if (fd >= 0) assert(::fcntl(fd, F_GETFD) >= 0);
++            fd = cached_fd = -1;
++        } else {
++            assert(fd == -1 && cached_fd == -1);
++            assert(::fcntl(new_fd, F_GETFL) & O_NONBLOCK);
++            assert(::fcntl(new_fd, F_GETFD) & FD_CLOEXEC);
++            fd = cached_fd = new_fd;
++        }
++        attachments.push_back(new_fd);
++    }
++};
++
++int connect_peer(const std::string& path) {
++    int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
++    assert(fd >= 0);
++    struct sockaddr_un addr{};
++    addr.sun_family = AF_UNIX;
++    std::strcpy(addr.sun_path, path.c_str());
++    assert(::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
++    return fd;
++}
++
++void reject_path(const std::string& path) {
++    bool rejected = false;
++    try { UartSocket endpoint(path, [](int) {}); }
++    catch (const std::exception&) { rejected = true; }
++    assert(rejected);
++}
++
++size_t fd_count() {
++    size_t count = 0;
++    for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) {
++        (void)entry;
++        ++count;
++    }
++    return count;
++}
++} // namespace
++
++int main() {
++    char dir[] = "/tmp/uart-socket-test-XXXXXX";
++    assert(::mkdtemp(dir));
++    const std::string path = std::string(dir) + "/uart.sock";
++    assert(UartSocket::same_path(path, std::string(dir) + "/./uart.sock"));
++    assert(!UartSocket::same_path(path, std::string(dir) + "/api.sock"));
++    const auto initial_fd_count = fd_count();
++    struct sigaction before_pipe{}, before_term{};
++    assert(::sigaction(SIGPIPE, nullptr, &before_pipe) == 0);
++    assert(::sigaction(SIGTERM, nullptr, &before_term) == 0);
++    Borrower uart;
++    {
++        UartSocket endpoint(path, [&](int fd) { uart.attach(fd); });
++        assert(uart.fd == -1);
++        struct stat original{}, after{};
++        assert(::lstat(path.c_str(), &original) == 0);
++        reject_path(path); // live listener cannot be displaced
++        assert(::lstat(path.c_str(), &after) == 0);
++        assert(original.st_ino == after.st_ino);
++        struct sigaction current_pipe{};
++        assert(::sigaction(SIGPIPE, nullptr, &current_pipe) == 0);
++        assert(current_pipe.sa_handler == before_pipe.sa_handler);
++
++        int peer = connect_peer(path);
++        endpoint.process();
++        assert(endpoint.has_client());
++        const int original_fd = uart.fd;
++
++        std::array<unsigned char, 256> bytes{}, received{};
++        for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<unsigned char>(i);
++        assert(::send(peer, bytes.data(), bytes.size(), MSG_NOSIGNAL) == 256);
++        endpoint.process(); // lifecycle service must not consume any raw byte
++        assert(::read(uart.fd, received.data(), received.size()) == 256);
++        assert(bytes == received);
++        assert(::send(uart.fd, bytes.data(), bytes.size(), MSG_NOSIGNAL) == 256);
++        assert(::read(peer, received.data(), received.size()) == 256);
++        assert(bytes == received);
++
++        int extra = connect_peer(path);
++        endpoint.process();
++        assert(uart.fd == original_fd);
++        unsigned char byte;
++        assert(::read(extra, &byte, 1) == 0);
++        ::close(extra);
++
++        // Readable host bytes with no UART consumer must not make idle_wait
++        // spin. RX full/pinmux disabled are common causes in the real model.
++        assert(::send(peer, bytes.data(), bytes.size(), MSG_NOSIGNAL) == 256);
++        const auto start = std::chrono::steady_clock::now();
++        for (unsigned i = 0; i < 10; ++i) endpoint.idle_wait();
++        assert(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(5));
++        assert(::read(uart.fd, received.data(), received.size()) == 256);
++
++        // A slow reader cannot block the emulator's borrowed TX descriptor.
++        std::array<unsigned char, 16384> block{};
++        size_t sent = 0;
++        while (true) {
++            const auto n = ::send(uart.fd, block.data(), block.size(), MSG_NOSIGNAL);
++            if (n < 0) {
++                assert(errno == EAGAIN || errno == EWOULDBLOCK);
++                break;
++            }
++            sent += static_cast<size_t>(n);
++            assert(sent < 16 * 1024 * 1024);
++        }
++        ::close(peer);
++        endpoint.process();
++        assert(!endpoint.has_client() && uart.fd == -1 && uart.cached_fd == -1);
++        assert(::fcntl(original_fd, F_GETFD) < 0 && errno == EBADF);
++
++        peer = connect_peer(path);
++        endpoint.process();
++        assert(endpoint.has_client());
++        // Usually the number is reused; correctness cannot depend on that.
++        assert(::send(peer, bytes.data(), bytes.size(), MSG_NOSIGNAL) == 256);
++        assert(::read(uart.fd, received.data(), received.size()) == 256);
++        assert(received == bytes);
++        assert(::shutdown(peer, SHUT_WR) == 0);
++        endpoint.process();
++        assert(!endpoint.has_client());
++        ::close(peer);
++
++        // Shutdown is graceful for UART-only runs; destructor owns cleanup.
++        assert(!endpoint.stop_requested());
++        assert(::raise(SIGTERM) == 0);
++        assert(endpoint.stop_requested());
++    }
++    assert(!std::filesystem::exists(path));
++    struct sigaction after_term{};
++    assert(::sigaction(SIGTERM, nullptr, &after_term) == 0);
++    assert(after_term.sa_handler == before_term.sa_handler);
++
++    // Refuse unrelated files, symlinks, and stale sockets; never unlink them.
++    std::ofstream(path) << "keep";
++    for (unsigned i = 0; i < 20; ++i) reject_path(path);
++    assert(std::filesystem::file_size(path) == 4);
++    ::unlink(path.c_str());
++    assert(::symlink("missing-target", path.c_str()) == 0);
++    reject_path(path);
++    assert(std::filesystem::is_symlink(path));
++    ::unlink(path.c_str());
++    {
++        int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
++        assert(fd >= 0);
++        struct sockaddr_un addr{};
++        addr.sun_family = AF_UNIX;
++        std::strcpy(addr.sun_path, path.c_str());
++        assert(::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
++        ::close(fd);
++        reject_path(path);
++        assert(std::filesystem::exists(path));
++        ::unlink(path.c_str());
++    }
++    reject_path("");
++    reject_path(std::string(108, 'x'));
++
++    // A replacement at the old pathname is not ours to unlink on shutdown.
++    {
++        UartSocket endpoint(path, [](int) {});
++        ::unlink(path.c_str());
++        std::ofstream(path) << "replacement";
++    }
++    assert(std::filesystem::file_size(path) == 11);
++    ::unlink(path.c_str());
++
++    // Likewise preserve a different live listener replacing our pathname.
++    int replacement = -1;
++    {
++        UartSocket endpoint(path, [](int) {});
++        assert(::unlink(path.c_str()) == 0);
++        replacement = ::socket(AF_UNIX, SOCK_STREAM, 0);
++        assert(replacement >= 0);
++        struct sockaddr_un addr{};
++        addr.sun_family = AF_UNIX;
++        std::strcpy(addr.sun_path, path.c_str());
++        assert(::bind(replacement, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
++        assert(::listen(replacement, 1) == 0);
++    }
++    assert(std::filesystem::exists(path));
++    const int peer = connect_peer(path);
++    ::close(peer);
++    ::close(replacement);
++    ::unlink(path.c_str());
++    ::rmdir(dir);
++    assert(fd_count() == initial_fd_count);
++    std::cout << "UART socket lifecycle: PASS\n";
++}
+-- 
+2.43.0
+

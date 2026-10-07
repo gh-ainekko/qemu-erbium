@@ -1,0 +1,886 @@
+From 3300a4c1a13272040444ceb6b38891a0edd8cbd1 Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Wed, 7 Oct 2026 05:24:27 +0000
+Subject: [PATCH 09/17] erbium: align Shakti UART registers and IRQs with
+ compiled RTL
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ sw-sysemu/devices/shakti_uart.h               | 295 +++++++++--------
+ .../tests/erbium/uart-registers/README.md     |  88 +++++
+ .../tests/erbium/uart-registers/registers.cpp | 313 ++++++++++++++++++
+ sw-sysemu/tests/erbium/uart-registers/run.sh  |  14 +
+ .../tests/erbium/uart-registers/system_mock.h |  28 ++
+ 5 files changed, 602 insertions(+), 136 deletions(-)
+ create mode 100644 sw-sysemu/tests/erbium/uart-registers/README.md
+ create mode 100644 sw-sysemu/tests/erbium/uart-registers/registers.cpp
+ create mode 100755 sw-sysemu/tests/erbium/uart-registers/run.sh
+ create mode 100644 sw-sysemu/tests/erbium/uart-registers/system_mock.h
+
+diff --git a/sw-sysemu/devices/shakti_uart.h b/sw-sysemu/devices/shakti_uart.h
+index 516b7c2..790c895 100644
+--- a/sw-sysemu/devices/shakti_uart.h
++++ b/sw-sysemu/devices/shakti_uart.h
+@@ -21,7 +21,6 @@
+ #include "memory/memory_error.h"
+ #include "memory/memory_region.h"
+ 
+-#include <hwinc/uart.h>
+ namespace bemu {
+ 
+ template <unsigned long long Base, size_t N, uint32_t PlicSource>
+@@ -32,112 +31,129 @@ struct ShaktiUart : public MemoryRegion {
+     using pointer       = typename MemoryRegion::pointer;
+     using const_pointer = typename MemoryRegion::const_pointer;
+ 
++    // Built ip/uart/verilog/uart.v is authoritative, not the stale HAL IEN
++    // definition at 0x30 (actually IQC). Top-level halves the AXI address.
+     enum : size_type {
+-        SHAKTI_UART_BAUD         = UART_BAUDREG_OFFSET,
+-        SHAKTI_UART_TX_REG       = UART_TXREG_OFFSET,
+-        SHAKTI_UART_RCV_REG      = UART_RXREG_OFFSET,
+-        SHAKTI_UART_STATUS       = UART_STATUSREG_OFFSET,
+-        SHAKTI_UART_DELAY        = UART_DELAYREG_OFFSET,
+-        SHAKTI_UART_CONTROL      = UART_CONTROLREG_OFFSET,
+-        SHAKTI_UART_IEN          = UART_INTERRUPTEN_OFFSET,
+-        SHAKTI_UART_RX_THRESHOLD = UART_RX_THRESHOLD_OFFSET,
++        SHAKTI_UART_BAUD         = 0x00,
++        SHAKTI_UART_TX_REG       = 0x08,
++        SHAKTI_UART_RCV_REG      = 0x10,
++        SHAKTI_UART_STATUS       = 0x18,
++        SHAKTI_UART_DELAY        = 0x20,
++        SHAKTI_UART_CONTROL      = 0x28,
++        SHAKTI_UART_IQC          = 0x30,
++        SHAKTI_UART_RX_THRESHOLD = 0x38,
++        SHAKTI_UART_RAW          = 0x48,
++        SHAKTI_UART_IEN          = 0x50,
++        SHAKTI_UART_IRQ_STATUS   = 0x58,
+     };
+ 
+     enum : uint32_t {
+-        STATUS_TX_EMPTY     = UART_STATUSREG_TX_EMPTY_FIELD_MASK,
+-        STATUS_TX_FULL      = UART_STATUSREG_TX_FULL_FIELD_MASK,
+-        STATUS_RX_NOT_EMPTY = UART_STATUSREG_RX_NOTEMPTY_FIELD_MASK,
+-        STATUS_RX_FULL      = UART_STATUSREG_RX_FULL_FIELD_MASK,
+-        STATUS_PARITY_ERROR = UART_STATUSREG_PARITY_ERROR_FIELD_MASK,
+-        STATUS_OVERRUN      = UART_STATUSREG_OVERRUN_ERROR_FIELD_MASK,
+-        STATUS_FRAME_ERROR  = UART_STATUSREG_FRAME_ERROR_FIELD_MASK,
+-        STATUS_BREAK_ERROR  = UART_STATUSREG_BREAK_ERROR_FIELD_MASK,
+-        STATUS_RXFIFOTHRE   = UART_STATUSREG_RX_FIFO_THRESHOLD_FIELD_MASK,
++        STATUS_TX_EMPTY     = 1u << 0,
++        STATUS_TX_FULL      = 1u << 1,
++        STATUS_RX_NOT_EMPTY = 1u << 2,
++        STATUS_RX_FULL      = 1u << 3,
++        STATUS_PARITY_ERROR = 1u << 4,
++        STATUS_OVERRUN      = 1u << 5,
++        STATUS_FRAME_ERROR  = 1u << 6,
++        STATUS_BREAK_ERROR  = 1u << 7,
++        STATUS_RXFIFOTHRE   = 1u << 8,
++        IRQ_TX_NOT_FULL     = 1u << 1,
+     };
+ 
+     static constexpr size_t FIFO_DEPTH = 16;
+ 
+     void read(const Agent& agent, size_type pos, size_type n, pointer result) override {
+-        (void) n;
+-
+-        switch (pos) {
+-        case SHAKTI_UART_TX_REG:
+-            *reinterpret_cast<uint32_t*>(result) = 0;
+-            break;
++        check_size(pos, n);
++        uint64_t value = 0;
++        // RTL selects addr[5:0] after the top-level shift: a 0x80-byte
++        // alias period, bit 0 ignored, other non-register offsets invalid.
++        switch (pos & 0x7e) {
+         case SHAKTI_UART_RCV_REG: {
++            poll_rx_fifo(agent.chip->is_uart_enabled());
+             uint8_t data = 0;
+-            if (agent.chip->is_uart_enabled()) {
+-                poll_rx_fifo();
+-                (void)rx_fifo_pop(data);
+-            }
+-            *reinterpret_cast<uint32_t*>(result) = data;
+-            sync_interrupt_line(agent, false);
+-            break;
+-        }
+-        case SHAKTI_UART_STATUS: {
+-            if (agent.chip->is_uart_enabled()) {
+-                *reinterpret_cast<uint32_t*>(result) = status_value(true);
+-            } else {
+-                *reinterpret_cast<uint32_t*>(result) = STATUS_TX_EMPTY;
+-            }
+-            sync_interrupt_line(agent, false);
++            (void)rx_fifo_pop(data); // pinmux never gates MMIO or buffered RX
++            value = repeat(data, 32);
+             break;
+         }
+-        case SHAKTI_UART_BAUD:
+-            *reinterpret_cast<uint32_t*>(result) = reg_baud;
+-            break;
+-        case SHAKTI_UART_DELAY:
+-            *reinterpret_cast<uint32_t*>(result) = reg_delay;
+-            break;
+-        case SHAKTI_UART_CONTROL:
+-            *reinterpret_cast<uint32_t*>(result) = reg_control;
+-            break;
+-        case SHAKTI_UART_IEN:
+-            *reinterpret_cast<uint32_t*>(result) = reg_ien;
+-            break;
+-        case SHAKTI_UART_RX_THRESHOLD:
+-            *reinterpret_cast<uint32_t*>(result) = reg_rx_threshold;
+-            break;
+-        default:
+-            *reinterpret_cast<uint32_t*>(result) = 0;
++        case SHAKTI_UART_STATUS:
++            poll_rx_fifo(agent.chip->is_uart_enabled());
++            value = repeat(status_value(), 16);
+             break;
++        case SHAKTI_UART_BAUD: value = repeat(reg_baud, 16); break;
++        case SHAKTI_UART_DELAY: value = repeat(reg_delay, 16); break;
++        case SHAKTI_UART_CONTROL: value = repeat(reg_control, 16); break;
++        case SHAKTI_UART_IQC: value = repeat(reg_iqc, 8); break;
++        case SHAKTI_UART_RX_THRESHOLD: value = repeat(reg_rx_threshold, 8); break;
++        case SHAKTI_UART_RAW: value = reg_raw; break;
++        case SHAKTI_UART_IEN: value = repeat(reg_ien, 16); break;
++        case SHAKTI_UART_IRQ_STATUS: value = reg_raw & reg_ien; break;
++        default: throw memory_error(Base + pos); // TX is write-only
+         }
++        // BSV duplicate() repeats each register's native width across 64 bits;
++        // RAW/IRQ_STATUS instead zero-extend. Initialize *all* requested bytes,
++        // including xSPI's eight-byte read, without alignment/aliasing UB.
++        for (size_type i = 0; i < n; ++i)
++            result[i] = static_cast<uint8_t>(value >> (8 * i));
++        sync_interrupt_line(agent);
+     }
+ 
+     void write(const Agent& agent, size_type pos, size_type n, const_pointer source) override {
+-        (void) n;
+-
+-        uint32_t value = *reinterpret_cast<const uint32_t*>(source);
++        check_size(pos, n);
++        uint32_t value = 0;
++        for (size_type i = 0; i < std::min(n, size_type(4)); ++i)
++            value |= uint32_t(source[i]) << (8 * i);
+ 
+-        switch (pos) {
++        switch (pos & 0x7e) {
+         case SHAKTI_UART_TX_REG:
+-            if (agent.chip->is_uart_enabled()) {
+-                tx_fifo_push(value & 0xFFu);
+-            }
+-            sync_interrupt_line(agent, false);
+-            break;
+-        case SHAKTI_UART_BAUD:
+-            reg_baud = value & UART_BAUDREG_WRITE_MASK;
+-            break;
+-        case SHAKTI_UART_DELAY:
+-            reg_delay = value & UART_DELAYREG_WRITE_MASK;
++            tx_fifo_push(value & 0xffu); // MMIO engine independent of pad routing
+             break;
++        case SHAKTI_UART_BAUD: reg_baud = value & 0xffffu; break;
++        case SHAKTI_UART_DELAY: reg_delay = value & 0xffffu; break;
+         case SHAKTI_UART_CONTROL:
+-            reg_control = value & UART_CONTROLREG_WRITE_MASK;
+-            break;
+-        case SHAKTI_UART_IEN:
+-            reg_ien = value & UART_INTERRUPTEN_WRITE_MASK;
+-            sync_interrupt_line(agent, true);
++            // No modem in the compiled instance: charsize[10:5], parity[4:3],
++            // stopbits[2:1]. Bit 0/stick parity and modem bits are absent.
++            reg_control = value & 0x7feu;
+             break;
++        case SHAKTI_UART_IQC: reg_iqc = value & 0xffu; break;
+         case SHAKTI_UART_RX_THRESHOLD:
+-            reg_rx_threshold = value & UART_RX_THRESHOLD_WRITE_MASK;
+-            sync_interrupt_line(agent, true);
++            reg_rx_threshold = value & 0x1fu;
++            // No modem FIFO-clear controls in this instance.
+             break;
+-        case SHAKTI_UART_STATUS:
++        case SHAKTI_UART_RAW:
++            // The built RTL uses XOR of low ten bits, including software-set
++            // of previously zero bits, NOT W1C. Capture resumes on clock_tick.
++            reg_raw ^= value & 0x3ffu;
+             break;
+-        default:
++        case SHAKTI_UART_IEN: reg_ien = value & 0x3ffu; break;
++        case SHAKTI_UART_STATUS:
++            // AND-to-clear (zero clears). Threshold set wins a simultaneous
++            // clear in built RTL, and remains sticky after occupancy falls.
++            threshold_latched = (threshold_latched && (value & STATUS_RXFIFOTHRE))
++                                || rx_threshold_reached();
+             break;
++        default: throw memory_error(Base + pos); // RX/IRQ_STATUS read-only
+         }
++        sync_interrupt_line(agent); // including clearing PLIC when mask is zero
++    }
++
++    // UART chip/peripheral reset, NOT CPU warm hold or CPU-only cold reset.
++    // The fd owner keeps its attachments; internal queued bytes are reset.
++    // MainMemory's whole-chip reset path must call this explicitly.
++    void reset(const Agent& agent) {
++        reg_baud = 5;
++        reg_delay = 0;
++        reg_control = 8u << 5;
++        reg_iqc = 0;
++        reg_rx_threshold = 5; // compiled RTL, not BSV expression/prose guess
++        reg_raw = reg_ien = 0;
++        threshold_latched = false;
++        tx_fifo_head = tx_fifo_count = rx_fifo_head = rx_fifo_count = 0;
++        tx_fifo.fill(0);
++        rx_fifo.fill(0);
++        configured_tx_fd = configured_rx_fd = -1;
++        tx_can_sigpipe = false;
++        agent.chip->er_plic_interrupt_pending_clear(PlicSource);
++        interrupt_asserted = false;
+     }
+ 
+     void init(const Agent&, size_type, size_type, const_pointer) override {
+@@ -154,18 +170,14 @@ struct ShaktiUart : public MemoryRegion {
+ 
+     void clock_tick(const Agent& agent, uint64_t cycle) {
+         if ((cycle % UART_CLK_DIV) != 0) return;
+-        drain_tx_fifo();
+-        poll_rx_fifo();
+-
+-        if (reg_ien == 0) return;
+-        uint32_t pending = status_value(false) & reg_ien;
+-        if (pending != 0) {
+-            agent.chip->er_plic_interrupt_pending_set(PlicSource);
+-            interrupt_asserted = true;
+-        } else if (interrupt_asserted) {
+-            agent.chip->er_plic_interrupt_pending_clear(PlicSource);
+-            interrupt_asserted = false;
+-        }
++        const bool pads_enabled = agent.chip->is_uart_enabled();
++        drain_tx_fifo(pads_enabled);
++        poll_rx_fifo(pads_enabled);
++        update_threshold();
++        // Sticky capture runs even with the interrupt mask/pads disabled.
++        // Only interrupt bit 1 is inverted relative to live STATUS.
++        reg_raw |= status_value() ^ STATUS_TX_FULL;
++        sync_interrupt_line(agent);
+     }
+ 
+     // Borrowed byte-stream attachments, not physical baud-clocked inputs.
+@@ -177,15 +189,25 @@ struct ShaktiUart : public MemoryRegion {
+     // pair requires the owner to attach new fds. Assigning -1 pauses that
+     // direction; attaching another fd resumes bytes, it does not reset FIFOs.
+     // Detach and poll before closing/reusing an fd number.
++    // uart_enable selects pads, not MMIO: disabled TX advances internally and
++    // is discarded on a peripheral tick (never replayed on reenable). Already
++    // buffered RX remains readable. Host RX is paused while pads are disabled;
++    // bytes in the reliable host queue can arrive after reenable. That deliberate
++    // lossless-stream policy is not a simulation of bytes lost on a real wire.
++    // Baud/framing/IQC registers are storage only; no bit/shift-register timing,
++    // active TX character, parity/frame/break errors or physical overrun model.
+     int tx_fd = -1;
+     int rx_fd = -1;
+ 
+ private:
+-    uint32_t reg_baud = 0;
++    uint32_t reg_baud = 5;
+     uint32_t reg_delay = 0;
+-    uint32_t reg_control = 0;
++    uint32_t reg_control = 8u << 5;
++    uint32_t reg_iqc = 0;
++    uint32_t reg_raw = 0;
++    bool threshold_latched = false;
+     uint32_t reg_ien = 0;
+-    uint32_t reg_rx_threshold = 0;
++    uint32_t reg_rx_threshold = 5;
+     std::array<uint8_t, FIFO_DEPTH> tx_fifo{};
+     size_t   tx_fifo_head = 0;
+     size_t   tx_fifo_count = 0;
+@@ -200,54 +222,46 @@ private:
+     int configured_rx_fd = -1;
+     bool tx_can_sigpipe = false;
+ 
+-    void sync_interrupt_line(const Agent& agent, bool poll_rx) {
+-        if (poll_rx) poll_rx_fifo();
+-        uint32_t pending = status_value(false) & reg_ien;
+-        bool should_assert = (pending != 0);
+-        if (should_assert != interrupt_asserted) {
+-            interrupt_asserted = should_assert;
+-            if (should_assert)
+-                agent.chip->er_plic_interrupt_pending_set(PlicSource);
+-            else
+-                agent.chip->er_plic_interrupt_pending_clear(PlicSource);
+-        }
++    static void check_size(size_type pos, size_type n) {
++        if (n != 1 && n != 2 && n != 4 && n != 8)
++            throw memory_error(Base + pos);
+     }
+ 
+-    uint32_t status_value(bool poll_rx) {
+-        if (poll_rx) {
+-            poll_rx_fifo();
+-        }
+-
+-        uint32_t status = 0;
++    static uint64_t repeat(uint32_t value, unsigned width) {
++        uint64_t result = 0;
++        for (unsigned bit = 0; bit < 64; bit += width)
++            result |= uint64_t(value) << bit;
++        return result;
++    }
+ 
+-        // TX status
+-        if (tx_fifo_count == 0) {
+-            status |= STATUS_TX_EMPTY;
+-        }
+-        if (tx_fifo_count >= FIFO_DEPTH) {
+-            status |= STATUS_TX_FULL;
+-        }
++    void sync_interrupt_line(const Agent& agent) {
++        // Non-modem instance exposes only bits [8:0] on the IRQ output.
++        // Bit 9 is writable/readable but must never assert PLIC source 3.
++        const bool should_assert = (reg_raw & reg_ien & 0x1ffu) != 0;
++        if (should_assert)
++            agent.chip->er_plic_interrupt_pending_set(PlicSource);
++        else if (interrupt_asserted)
++            agent.chip->er_plic_interrupt_pending_clear(PlicSource);
++        interrupt_asserted = should_assert;
++    }
+ 
+-        // RX status
+-        if (rx_fifo_count > 0) {
+-            status |= STATUS_RX_NOT_EMPTY;
+-        }
+-        if (rx_fifo_count >= FIFO_DEPTH) {
+-            status |= STATUS_RX_FULL;
+-        }
+-        // Stream backpressure is intentionally distinct from a physical UART
+-        // overrun. This attachment does not simulate parity/framing/overruns.
+-        if (rx_threshold_reached()) {
+-            status |= STATUS_RXFIFOTHRE;
+-        }
++    uint32_t status_value() const {
++        uint32_t status = 0;
++        if (tx_fifo_count == 0) status |= STATUS_TX_EMPTY;
++        if (tx_fifo_count >= FIFO_DEPTH) status |= STATUS_TX_FULL;
++        if (rx_fifo_count > 0) status |= STATUS_RX_NOT_EMPTY;
++        if (rx_fifo_count >= FIFO_DEPTH) status |= STATUS_RX_FULL;
++        if (threshold_latched) status |= STATUS_RXFIFOTHRE;
++        // Stream backpressure never fabricates physical receiver errors.
+         return status;
+     }
+ 
+     bool rx_threshold_reached() const {
+-        if (reg_rx_threshold == 0) {
+-            return rx_fifo_count > 0;
+-        }
+-        return rx_fifo_count > reg_rx_threshold;
++        return rx_fifo_count >= reg_rx_threshold; // including empty >= zero
++    }
++
++    void update_threshold() {
++        threshold_latched = threshold_latched || rx_threshold_reached();
+     }
+ 
+     void tx_fifo_push(uint8_t value) {
+@@ -258,7 +272,11 @@ private:
+         ++tx_fifo_count;
+     }
+ 
+-    void drain_tx_fifo() {
++    void drain_tx_fifo(bool pads_enabled) {
++        if (!pads_enabled) {
++            // The real serializer still runs; no bytes cross disconnected pads.
++            tx_fifo_head = tx_fifo_count = 0;
++        }
+         if (tx_fd == -1) {
+             configured_tx_fd = -1;
+             return;
+@@ -341,7 +359,11 @@ private:
+         return true;
+     }
+ 
+-    void poll_rx_fifo() {
++    void poll_rx_fifo(bool pads_enabled) {
++        if (!pads_enabled) {
++            if (rx_fd == -1) configured_rx_fd = -1;
++            return;
++        }
+         if (rx_fd == -1) {
+             configured_rx_fd = -1;
+             return;
+@@ -357,6 +379,7 @@ private:
+             ssize_t rv = ::read(rx_fd, &rx_fifo[tail], count);
+             if (rv > 0) {
+                 rx_fifo_count += static_cast<size_t>(rv);
++                update_threshold();
+             } else if (rv == 0 || (rv < 0 && stream_unavailable(errno))) {
+                 return;
+             } else if (errno != EINTR) {
+diff --git a/sw-sysemu/tests/erbium/uart-registers/README.md b/sw-sysemu/tests/erbium/uart-registers/README.md
+new file mode 100644
+index 0000000..5fe8f9c
+--- /dev/null
++++ b/sw-sysemu/tests/erbium/uart-registers/README.md
+@@ -0,0 +1,88 @@
++# Standalone Shakti UART register regression
++
++```sh
++bash sw-sysemu/tests/erbium/uart-registers/run.sh
++```
++
++Run from `et-platform`, or give the script's full path. Requires a native C++17
++compiler. It compiles the **production** `devices/shakti_uart.h`, with only the
++System/pinmux/PLIC boundary mocked, under ASan/UBSan and `-Wall -Wextra -Werror`.
++No backend build, cross compiler, simulator, service, or regenerated HAL is
++needed. `UART_REGISTER_BUILD` selects the artifact directory (default: `mktemp`
++in `/tmp`); `CXX` selects the compiler.
++
++## Primary evidence
++
++Reference RTL: `core-et-erbium` commit
++`afa22ae4d30ef5efe52ddf7a8ec7ddb55c3da21f`, at the outer repository's
++`ext/core-et-erbium/`. Paths below are relative to that checkout:
++
++- `ip/uart/verilog/uart.v:2923–2935`: actual compiled reset values. Baud 5,
++  charsize 8, parity/stopbits/delay/IQC/raw/mask zero, **RX threshold 5**.
++- `uart.v:1532–1617,2466–2473,2764–2801`: compiled register widths and bus
++  access decode. CPU offsets RAW/MASK/IRQ_STATUS are **0x48/0x50/0x58**;
++  **0x30 is IQC**, not interrupt enable. TX reads/RX writes are invalid accesses.
++- `uart.v:1396–1422,1635–1643,2536–2577,2681–2685`: error flags occupy status
++  bits 4–7, RX threshold is bit 8, IRQ bit 1 means **TX not full** (opposite
++  live status TX_FULL), RAW is sticky OR capture, its write is low-ten-bit
++  **XOR**, and only masked bits 0–8 drive the non-modem instance's IRQ output.
++- `uart.v:2536–2538,1635–1643`: threshold comparison is inclusive `>=`, remains
++  latched below threshold, clears by writing **zero** to status bit 8, and a
++  simultaneous threshold set wins a clear. Zero threshold includes empty RX.
++- `uart.v:2545–2620`: reads duplicate native-width values across the 64-bit bus:
++  baud/delay/control/status/mask 16-bit, IQC/threshold 8-bit, RX 32-bit. RAW and
++  IRQ_STATUS instead zero-extend. Tests poison all eight output bytes and use
++  unaligned/narrow source and destination buffers to catch incomplete fills
++  and alias/alignment/out-of-bounds accesses.
++- `erbium_digital/verilog/erbium_digital_et.v:656–667,1376–1407`: `uart_enable`
++  selects physical pads only; disabled RX sees idle high. It does not gate MMIO
++  or the independent UART engine. Top-level address division plus compiled
++  decode makes a 0x80-byte register alias period (address bit 0 ignored).
++- `prcm/verilog/prcm_et.v:230–252`: UART reset follows chip/peripheral reset;
++  CPU cold/warm reset extenders are separate.
++
++BSV companion evidence: `ip/uart/bsv/uart_cfg_regs.bsv` and
++`RS232_modified.bsv`. Where BSV expressions/prose or generated register metadata
++conflict with the compiled design, expectations above use **compiled RTL**.
++The tests use literal expected offsets/values rather than importing the device's
++constants or stale UART HAL metadata.
++
++## Coverage and limits
++
++Positive/negative checks cover reset/widths, decode/access permissions, mask-zero
++PLIC clearing, IQC versus mask, software-set XOR raw bits, raw read persistence,
++TX IRQ polarity, non-modem bit 9, inclusive/sticky threshold, independent
++status/raw acknowledgment, RX-full IRQ persistence, FIFO clear controls absent
++without modem support, pad-disabled MMIO, retained internal RX, suppression of
++pad-disabled TX, and an explicit device chip reset preserving borrowed fds.
++
++Real pipes additionally check 16-byte RX backpressure without fabricated physical
++overrun, byte ordering, and TX EAGAIN/resume. The root repository's
++`smallvm/tests/uart_transport.*` remain the more extensive EINTR, partial-write,
++SIGPIPE, named-FIFO, PTY and fd-lifecycle transport regression. Its old
++`assert(!chip.irq)` after draining RX needs explicit STATUS/RAW acknowledgment:
++compiled RTL keeps threshold STATUS and RAW sticky. Retaining that old automatic
++IRQ-clear assertion would contradict the fidelity checks here.
++
++This is an explicitly **functional byte-stream model**, not line-level RTL
++co-simulation. Baud/framing/qualification controls retain their compiled register
++values but do not change byte timing or character width. Parity, break, framing,
++physical overrun, active TX shift-register timing, FIFO-full AXI stalling and
++BSV rule/bus-cycle arbitration are not simulated. Raw capture is on peripheral
++ticks; MMIO has synchronous effects. Pad-disabled TX advances/discards internally
++on a tick instead of freezing/replaying. Pad-disabled host RX is paused and can
++arrive after reenable, deliberately preserving reliable host backpressure rather
++than simulating lost wire arrivals. Reset clears internal FIFOs, not bytes still
++queued in external host descriptors.
++
++## Reset integration boundary
++
++`ShaktiUart::reset(const Agent&)` restores compiled registers/FIFOs/sticky state
++and immediately clears the PLIC line without closing or detaching borrowed fds.
++Invoke it on **whole-chip/peripheral reset only**, not CPU warm hold, CPU-only
++cold reset, or debug reset. The mocked hold check confirms the UART itself never
++consults CPU hold; end-to-end reset routing needs a System/MainMemory callback
++outside this device-only change. The existing `MainMemory::por_reset()` resets
++Sysregs/SCCR, but not UART. Both the `sys_emu::por_reset()` path and the non-SYS_EMU
++whole-reset fallback need that integration. Startup reconstructs the device
++already; neither socket reattachment nor CPU-only hold should reconstruct it.
+diff --git a/sw-sysemu/tests/erbium/uart-registers/registers.cpp b/sw-sysemu/tests/erbium/uart-registers/registers.cpp
+new file mode 100644
+index 0000000..716937c
+--- /dev/null
++++ b/sw-sysemu/tests/erbium/uart-registers/registers.cpp
+@@ -0,0 +1,313 @@
++// SPDX-License-Identifier: Apache-2.0
++// Expected offsets, bits, reset values and duplication come from the compiled
++// ext/core-et-erbium/ip/uart/verilog/uart.v, not UART header constants.
++#include <array>
++#include <cassert>
++#include <iostream>
++#include <vector>
++#include <sys/ioctl.h>
++#include "system_mock.h"
++#include "devices/shakti_uart.h"
++
++using Uart = bemu::ShaktiUart<0x02004000, 0x1000, 3>;
++struct Fixture {
++    bemu::System chip;
++    bemu::Noagent agent{&chip};
++    Uart uart;
++    uint64_t rd(uint64_t offset, unsigned n = 8) {
++        // Deliberately unaligned, poisoned output with surrounding canaries.
++        std::array<uint8_t, 10> out;
++        out.fill(0xa5);
++        uart.read(agent, offset, n, out.data() + 1);
++        uint64_t value = 0;
++        for (unsigned i = 0; i < n; ++i) value |= uint64_t(out[i + 1]) << (8 * i);
++        assert(out[0] == 0xa5);
++        for (unsigned i = n + 1; i < out.size(); ++i) assert(out[i] == 0xa5);
++        return value;
++    }
++    void wr(uint64_t offset, uint64_t value, unsigned n = 4) {
++        std::array<uint8_t, 9> in{};
++        for (unsigned i = 0; i < n; ++i) in[i + 1] = value >> (8 * i);
++        uart.write(agent, offset, n, in.data() + 1);
++    }
++    void tick() { uart.clock_tick(agent, 30); }
++    uint16_t status() { return rd(0x18); }
++    void expect_error(uint64_t offset, bool writing, unsigned n = 4) {
++        bool caught = false;
++        try {
++            if (writing) wr(offset, 0xff, n);
++            else (void)rd(offset, n);
++        } catch (const bemu::memory_error& error) {
++            assert(error.addr == 0x02004000 + offset);
++            caught = true;
++        }
++        assert(caught);
++    }
++};
++struct Pipe {
++    int fds[2];
++    Pipe() {
++        assert(pipe(fds) == 0);
++        for (int fd : fds) {
++            int flags = fcntl(fd, F_GETFL);
++            assert(flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
++        }
++    }
++    ~Pipe() { close(fds[0]); close(fds[1]); }
++    void send(std::initializer_list<uint8_t> bytes) {
++        std::vector<uint8_t> data(bytes);
++        assert(::write(fds[1], data.data(), data.size()) == ssize_t(data.size()));
++    }
++    int waiting() {
++        int bytes = -1;
++        assert(ioctl(fds[0], FIONREAD, &bytes) == 0);
++        return bytes;
++    }
++    std::vector<uint8_t> drain() {
++        std::vector<uint8_t> bytes;
++        uint8_t data[4096];
++        for (;;) {
++            const ssize_t n = ::read(fds[0], data, sizeof(data));
++            if (n < 0) { assert(errno == EAGAIN); return bytes; }
++            assert(n > 0);
++            bytes.insert(bytes.end(), data, data + n);
++        }
++    }
++};
++
++static void reset_widths_and_access() {
++    Fixture f;
++    assert(f.rd(0x00) == 0x0005000500050005ULL);
++    assert(f.rd(0x20) == 0);
++    assert(f.rd(0x28) == 0x0100010001000100ULL); // 8-bit chars, no parity/stop bits
++    assert(f.rd(0x30) == 0);
++    assert(f.rd(0x38) == 0x0505050505050505ULL); // compiled reset is 5, not 24
++    assert(f.rd(0x18) == 0x0001000100010001ULL);
++    assert(f.rd(0x10) == 0 && f.rd(0x48) == 0 && f.rd(0x50) == 0 && f.rd(0x58) == 0);
++    assert(!f.chip.irq);
++    f.wr(0x00, 0x1234abcd);
++    assert(f.rd(0x00) == 0xabcdabcdabcdabcdULL);
++    assert(f.rd(0x00, 4) == 0xabcdabcd && f.rd(0x00, 2) == 0xabcd);
++    assert(f.rd(0x00, 1) == 0xcd);
++    f.wr(0x20, ~0ULL);
++    assert(f.rd(0x20) == ~0ULL);
++    f.wr(0x28, ~0ULL);
++    assert(f.rd(0x28) == 0x07fe07fe07fe07feULL); // no modem/stick parity
++    f.wr(0x30, 0x12345678);
++    assert(f.rd(0x30) == 0x7878787878787878ULL);
++    f.wr(0x38, ~0ULL);
++    assert(f.rd(0x38) == 0x1f1f1f1f1f1f1f1fULL); // five-bit field, no FIFO-clear
++    f.wr(0x50, ~0ULL, 8);
++    assert(f.rd(0x50) == 0x03ff03ff03ff03ffULL);
++    f.wr(0x48, ~0ULL, 8);
++    assert(f.rd(0x48) == 0x3ff && f.rd(0x58) == 0x3ff); // zero-extended, not duplicated
++    assert(f.rd(0x48) == 0x3ff); // no read-clear
++    assert(f.chip.irq);
++    f.wr(0x50, 0);
++    assert(!f.chip.irq && f.rd(0x48) == 0x3ff && f.rd(0x58) == 0);
++    // RTL address aliasing after top-level address >> 1.
++    assert(f.rd(0x80) == f.rd(0x00) && f.rd(0x81) == f.rd(0x00));
++    f.expect_error(0x08, false); // TX is not a peer extraction register
++    f.expect_error(0x10, true);  // RX is not a peer injection register
++    f.expect_error(0x58, true);
++    f.expect_error(0x40, false);
++    f.expect_error(0x40, true);
++    f.expect_error(0x02, false);
++    f.expect_error(0x00, false, 0);
++    f.expect_error(0x00, true, 3);
++    // Narrow source buffer: do not read four bytes for a one-byte access.
++    const uint8_t byte = 0x34;
++    f.uart.write(f.agent, 0, 1, &byte);
++    assert(f.rd(0, 2) == 0x34);
++    std::cout << "PASS compiled reset, field widths, register replication, unaligned/narrow MMIO, decode/access\n";
++}
++
++static void raw_mask_status_and_tx_polarity() {
++    Fixture f;
++    f.chip.enabled = false;
++    f.wr(0x30, 0xff); // IQC must not enable IRQ
++    f.tick();
++    assert(f.rd(0x48) == 3); // empty TX and TX *not* full, captured even with mask/pads off
++    assert(f.rd(0x50) == 0 && f.rd(0x58) == 0 && !f.chip.irq);
++    f.wr(0x50, 2);
++    assert(f.rd(0x58) == 2 && f.chip.irq);
++    const unsigned clears = f.chip.clears;
++    f.wr(0x50, 0);
++    assert(!f.chip.irq && f.chip.clears == clears + 1);
++    f.tick();
++    assert(!f.chip.irq && f.rd(0x48) == 3);
++    f.wr(0x50, 2);
++    assert(f.chip.irq); // old raw survives mask toggling
++    f.wr(0x48, 2);
++    assert(f.rd(0x48) == 1 && !f.chip.irq);
++    f.wr(0x48, 2);
++    assert(f.rd(0x48) == 3 && f.chip.irq); // XOR sets a zero bit, unlike W1C
++    f.wr(0x48, 2);
++    f.uart.clock_tick(f.agent, 29);
++    assert(!f.chip.irq); // no capture until peripheral clock tick
++    f.tick();
++    assert(f.chip.irq); // still-active condition relatches
++
++    f.uart.reset(f.agent);
++    f.wr(0x48, 0x200);
++    f.wr(0x50, 0x200);
++    assert(f.rd(0x58) == 0x200 && !f.chip.irq); // no modem IRQ bit 9 output
++    f.wr(0x48, 0x400);
++    assert(f.rd(0x48) == 0x200); // bit 10 ignored
++    f.tick();
++    assert(!f.chip.irq);
++
++    f.uart.reset(f.agent);
++    f.chip.enabled = true;
++    f.wr(0x50, 2);
++    for (unsigned i = 0; i < 16; ++i) f.wr(0x08, i);
++    assert(f.status() == 2); // live full is not the IRQ condition
++    f.tick(); // no TX peer => lossless retention under backpressure
++    assert(f.rd(0x48) == 0 && !f.chip.irq);
++    f.wr(0x48, 2); // software can set raw even while condition inactive
++    assert(f.chip.irq);
++    f.wr(0x48, 2);
++    f.tick();
++    assert(!f.chip.irq && f.rd(0x48) == 0);
++    std::cout << "PASS IQC versus mask, sticky RAW/XOR, mask-zero PLIC clear, TX-not-full IRQ, no modem IRQ\n";
++}
++
++static void rx_threshold_sticky_and_ack() {
++    Fixture f;
++    Pipe p;
++    f.uart.rx_fd = p.fds[0];
++    p.send({1, 2, 3, 4});
++    assert(f.status() == 5); // occupancy four, reset threshold five
++    f.tick();
++    assert(f.rd(0x48) == 7);
++    p.send({5});
++    assert(f.status() == 0x105); // inclusive count >= threshold
++    f.tick();
++    f.wr(0x50, 0x100);
++    assert(f.chip.irq && f.rd(0x58) == 0x100);
++    for (unsigned i = 1; i <= 5; ++i) assert(f.rd(0x10) == (uint64_t(i) << 32 | i));
++    assert(f.status() == 0x101); // threshold stays after empty
++    assert(f.chip.irq && f.rd(0x48) == 0x107); // RX-not-empty raw also stays
++    f.wr(0x18, 0x100); // ones retain, zero clears
++    assert(f.status() == 0x101);
++    f.wr(0x18, 0);
++    assert(f.status() == 1 && f.chip.irq); // clearing STATUS doesn't acknowledge RAW
++    f.wr(0x48, 0x100);
++    assert(!f.chip.irq && f.rd(0x58) == 0);
++    f.tick();
++    assert(!f.chip.irq); // no threshold source remains
++    f.wr(0x50, 4);
++    assert(f.chip.irq); // drained RX's sticky raw must be acknowledged separately
++    f.wr(0x48, 4);
++    assert(!f.chip.irq);
++    f.tick();
++    assert(!f.chip.irq);
++
++    f.wr(0x38, 0); // zero threshold includes an *empty* FIFO
++    f.tick();
++    assert(f.status() == 0x101);
++    f.wr(0x18, 0);
++    assert(f.status() == 0x101); // concurrent occupancy set wins a clear
++    f.wr(0x38, 31);
++    f.wr(0x18, 0);
++    assert(f.status() == 1);
++    p.send({0, 0xff, 0x11, 0x13});
++    assert(f.status() == 5);
++    f.wr(0x38, 0xe0 | 5); // conditional modem FIFO-clear controls are absent
++    assert(f.rd(0x38, 1) == 5 && (f.status() & 4));
++    assert(f.rd(0x10, 4) == 0 && f.rd(0x10, 4) == 0xff);
++    assert(f.rd(0x10, 4) == 0x11 && f.rd(0x10, 4) == 0x13);
++    std::cout << "PASS inclusive/sticky RX threshold, AND-to-clear STATUS, RAW independence, no modem FIFO clears\n";
++}
++
++static void pad_routing_and_reset_independence() {
++    Fixture f;
++    Pipe rx, tx;
++    f.uart.rx_fd = rx.fds[0];
++    f.uart.tx_fd = tx.fds[1];
++    f.chip.enabled = false;
++    rx.send({0x41, 0x42});
++    f.wr(0x08, 0x99);
++    assert(f.status() == 0 && rx.waiting() == 2); // write accepted with pads disabled
++    f.tick();
++    assert(tx.waiting() == 0 && f.status() == 1 && rx.waiting() == 2);
++    assert(f.rd(0x10) == 0); // no RX crosses disabled pads
++    f.chip.enabled = true;
++    f.chip.cpu_warm_held = true;
++    f.wr(0x00, 0x123);
++    f.wr(0x50, 4);
++    f.wr(0x08, 0xa5);
++    f.tick(); // CPU hold must not prevent independent peripheral operation
++    assert(tx.drain() == std::vector<uint8_t>{0xa5}); // disabled-pad 0x99 NOT replayed
++    assert(f.chip.irq && f.rd(0x00, 2) == 0x123);
++    f.chip.enabled = false;
++    assert(f.rd(0x10, 4) == 0x41); // prior internal RX still CPU/host readable
++    assert(f.rd(0x10, 4) == 0x42);
++    assert(f.chip.irq); // pinmux/CPU hold does not clear raw
++    f.chip.cpu_warm_held = false;
++    assert(f.rd(0x00, 2) == 0x123 && f.chip.irq);
++
++    f.chip.enabled = true;
++    rx.send({1, 2, 3, 4, 5});
++    assert(f.status() == 0x105); // internal RX and sticky threshold to reset
++    f.wr(0x20, 0x1234);
++    f.wr(0x28, 0x7fe);
++    f.wr(0x30, 0x23);
++    f.wr(0x08, 0xee); // queued TX reset should not leak onto peer
++    f.uart.reset(f.agent);
++    assert(!f.chip.irq);
++    assert(f.uart.tx_fd == tx.fds[1] && f.uart.rx_fd == rx.fds[0]);
++    assert(f.rd(0x00, 2) == 5 && f.rd(0x28, 2) == 0x100 && f.rd(0x38, 1) == 5);
++    assert(f.rd(0x48) == 0 && f.rd(0x50) == 0 && f.rd(0x10) == 0 && f.status() == 1);
++    assert(f.rd(0x20) == 0 && f.rd(0x30) == 0 && f.rd(0x58) == 0);
++    f.chip.enabled = true;
++    f.tick();
++    assert(tx.waiting() == 0);
++    rx.send({0x5a});
++    f.wr(0x08, 0x7e);
++    f.tick();
++    assert(f.rd(0x10, 4) == 0x5a && tx.drain() == std::vector<uint8_t>{0x7e});
++    std::cout << "PASS pad-only routing, independent CPU hold, chip-reset defaults/FIFOs/PLIC, fd preservation\n";
++}
++
++static void bounded_lossless_stream() {
++    Fixture f;
++    Pipe rx, tx;
++    f.uart.rx_fd = rx.fds[0];
++    f.uart.tx_fd = tx.fds[1];
++    std::vector<uint8_t> bytes(32);
++    for (unsigned i = 0; i < bytes.size(); ++i) bytes[i] = i * 7;
++    assert(::write(rx.fds[1], bytes.data(), bytes.size()) == ssize_t(bytes.size()));
++    assert(f.status() == 0x10d);
++    assert(rx.waiting() == 16);
++    f.tick();
++    f.wr(0x50, 8); // RX full positive source, sticky through draining
++    assert(f.rd(0x58) == 8 && f.chip.irq);
++    for (unsigned i = 0; i < 100; ++i) f.tick();
++    assert(rx.waiting() == 16 && !(f.status() & 0xf0)); // no fabricated overrun/errors
++    for (uint8_t byte : bytes) assert(f.rd(0x10, 4) == byte);
++    assert(rx.waiting() == 0 && !(f.status() & 0x0c));
++    assert(f.chip.irq && f.rd(0x58) == 8);
++    f.wr(0x48, 8);
++    assert(!f.chip.irq);
++    std::array<uint8_t, 4096> filler{};
++    while (::write(tx.fds[1], filler.data(), filler.size()) > 0) {}
++    assert(errno == EAGAIN);
++    for (unsigned i = 0; i < 16; ++i) f.wr(0x08, bytes[i]);
++    f.tick();
++    assert(f.status() & 2); // actual EAGAIN retains FIFO and TX_FULL
++    tx.drain();
++    f.tick();
++    assert((f.status() & 3) == 1);
++    bytes.resize(16);
++    assert(tx.drain() == bytes);
++    std::cout << "PASS bounded RX host backpressure, binary byte order, no fake overrun, TX EAGAIN/resume\n";
++}
++
++int main() {
++    reset_widths_and_access();
++    raw_mask_status_and_tx_polarity();
++    rx_threshold_sticky_and_ack();
++    pad_routing_and_reset_independence();
++    bounded_lossless_stream();
++}
+diff --git a/sw-sysemu/tests/erbium/uart-registers/run.sh b/sw-sysemu/tests/erbium/uart-registers/run.sh
+new file mode 100755
+index 0000000..6f299ef
+--- /dev/null
++++ b/sw-sysemu/tests/erbium/uart-registers/run.sh
+@@ -0,0 +1,14 @@
++#!/usr/bin/env bash
++# SPDX-License-Identifier: Apache-2.0
++# Standalone native test; no backend build or cross compiler required.
++set -euo pipefail
++HERE=$(cd "$(dirname "$0")" && pwd)
++SYSEMU=$(cd "$HERE/../../.." && pwd)
++OUT=${UART_REGISTER_BUILD:-"$(mktemp -d /tmp/shakti-uart-registers.XXXXXX)"}
++mkdir -p "$OUT"
++"${CXX:-c++}" -std=c++17 -O1 -g -Wall -Wextra -Werror -DERBIUM \
++  -fsanitize=address,undefined -fno-omit-frame-pointer -pthread \
++  -I"$SYSEMU" -I"$SYSEMU/../erbium-hal/include" "$HERE/registers.cpp" -o "$OUT/registers"
++ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
++  timeout 10 "$OUT/registers" | tee "$OUT/registers.log"
++printf 'Test artifacts: %s\n' "$OUT"
+diff --git a/sw-sysemu/tests/erbium/uart-registers/system_mock.h b/sw-sysemu/tests/erbium/uart-registers/system_mock.h
+new file mode 100644
+index 0000000..772754a
+--- /dev/null
++++ b/sw-sysemu/tests/erbium/uart-registers/system_mock.h
+@@ -0,0 +1,28 @@
++// SPDX-License-Identifier: Apache-2.0
++// Only stub the System/PLIC boundary; compile the production UART and Agent.
++#ifndef UART_REGISTER_SYSTEM_MOCK_H
++#define UART_REGISTER_SYSTEM_MOCK_H
++#include <cassert>
++#include <cstdint>
++#define BEMU_SYSTEM_H
++namespace bemu {
++class System {
++public:
++    bool enabled = true;
++    bool cpu_warm_held = false;
++    bool irq = false;
++    unsigned sets = 0, clears = 0;
++    bool is_uart_enabled() const { return enabled; }
++    void er_plic_interrupt_pending_set(uint32_t source) {
++        assert(source == 3);
++        irq = true;
++        ++sets;
++    }
++    void er_plic_interrupt_pending_clear(uint32_t source) {
++        assert(source == 3);
++        irq = false;
++        ++clears;
++    }
++};
++}
++#endif
+-- 
+2.43.0
+

@@ -64,7 +64,8 @@ MRAM with no emulator preload. To place a user-supplied ELF in the guest, build
 with `ERBIUM_ELF=/absolute/path/image.elf J=2 scripts/build-all.sh linux`; it appears
 at `/firmware/host-payload.elf` and is **not** automatically loaded into Erbium.
 The Linux build now also needs the stock RISC-V cross compiler to build the small
-loader fixture. UART transport remains unchanged.
+loader fixture. Direct UART wiring and console use are documented in
+`docs/uart-console.md`.
 
 ## Run
 
@@ -105,3 +106,15 @@ mtdblock, SRAM via ioctl, minion mailbox job, 99h reset) takes ~4 s with the stu
   (per-flash "no write completion") for real hardware.
 * The Versal OSPI DMA read path needs TF-A/PM firmware; patch 0001 falls back to PIO.
 * No interrupt line from Erbium to the host; `erbctl job` polls Mailbox1.
+
+## Direct Erbium UART
+
+`scripts/run-linux.sh --backend CONTROL --mram MRAM --uart-socket UART` connects
+Linux UART1 (`/dev/ttyAMA1`) to the independent Erbium serial-peer socket. UART0
+remains the host console. `scripts/run-uart.sh` manages a fresh complete session.
+
+Inside Linux: `erbctl console /dev/ttyAMA1 --load /firmware/host-payload.elf`
+attaches raw UART first, then runs the verified ELF loader while relaying output.
+Without `--load`, it only opens the tty. Ctrl-] exits an interactive session.
+`--uart-test` and `--kotama-test` runner modes automate binary IRQ/WFI echo/reload
+and real Kotama `info` acceptance respectively, using the actual guest UART1.

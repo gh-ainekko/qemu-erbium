@@ -1,0 +1,33 @@
+From 99a87f92aa3fdd6537e0c1f7b560349c156ea46e Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Wed, 7 Oct 2026 05:54:20 +0000
+Subject: [PATCH 17/17] erbium: permit CPU access to the complete mapped UART
+ register aperture
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ sw-sysemu/pma_er.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/sw-sysemu/pma_er.cpp b/sw-sysemu/pma_er.cpp
+index b8bf90a..bcde939 100644
+--- a/sw-sysemu/pma_er.cpp
++++ b/sw-sysemu/pma_er.cpp
+@@ -46,7 +46,13 @@ static inline bool paddr_is_xspi(uint64_t addr)
+ { return (addr >= ERBIUM_TOP_XSPI_REGISTERS_BASE) && (addr < ERBIUM_TOP_XSPI_REGISTERS_END); }
+ 
+ static inline bool paddr_is_uart(uint64_t addr)
+-{ return (addr >= ERBIUM_TOP_UART_REGISTERS_BASE) && (addr < ERBIUM_TOP_UART_REGISTERS_END); }
++{
++    // The integrated NoC UART window is 4 KiB, matching MainMemory. The old
++    // generated HAL ends at +0x44 and incorrectly faults compiled-RTL UART
++    // RAW/MASK/IRQ_STATUS accesses at +0x48/+0x50/+0x58 from actual firmware.
++    return (addr >= ERBIUM_TOP_UART_REGISTERS_BASE) &&
++           (addr < ERBIUM_TOP_UART_REGISTERS_BASE + 0x1000);
++}
+ 
+ // BootROM is 8KB inside the ROMRAM region.
+ static inline bool paddr_is_bootrom(uint64_t addr)
+-- 
+2.43.0
+

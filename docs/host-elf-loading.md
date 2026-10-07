@@ -2,7 +2,9 @@
 
 Implemented: CPU warm-reset hold/release in sysemu, a strict userspace ELF
 loader in `erbctl`, and a Linux → xSPI → MRAM → RISC-V execution test.
-No new UART transport or Kotama console bridge is included.
+The loader milestone itself did not add a UART bridge. The subsequent direct
+UART console is documented in `uart-console.md`; use its combined console/load
+workflow when startup output must be captured before release.
 
 ## Update and test
 

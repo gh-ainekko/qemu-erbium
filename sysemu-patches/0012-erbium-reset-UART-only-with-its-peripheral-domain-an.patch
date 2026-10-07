@@ -1,0 +1,80 @@
+From c1d72c1d50ec914c46ac419fc57591713e4a4919 Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Wed, 7 Oct 2026 05:37:29 +0000
+Subject: [PATCH 12/17] erbium: reset UART only with its peripheral domain and
+ preserve wide MMIO
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ sw-sysemu/memory/erbium/main_memory.cpp | 7 +++++--
+ sw-sysemu/memory/erbium/main_memory.h   | 4 ++--
+ sw-sysemu/system.cpp                    | 2 +-
+ 3 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/sw-sysemu/memory/erbium/main_memory.cpp b/sw-sysemu/memory/erbium/main_memory.cpp
+index b1b5ba0..2ce65b1 100644
+--- a/sw-sysemu/memory/erbium/main_memory.cpp
++++ b/sw-sysemu/memory/erbium/main_memory.cpp
+@@ -48,7 +48,8 @@ unsigned MainMemory::access_sizes(addr_type addr, addr_type* last) const
+     case erbreg_idx:    // SysregsEr: 32-bit registers, 4 or 8 byte access
+     case sccr_idx:      // SCCR stub: 4 or 8 byte access
+         return (1u << 4) | (1u << 8);
+-    case uart_idx:      // ShaktiUart: 32-bit registers
++    case uart_idx:      // UART: native fields replicated on the 64-bit bus
++        return (1u << 4) | (1u << 8);
+     case plic_idx:      // PLIC: 32-bit registers, 4 byte access only
+         return (1u << 4);
+     case sysreg_idx:    // ESRs: 64-bit access only
+@@ -58,10 +59,11 @@ unsigned MainMemory::access_sizes(addr_type addr, addr_type* last) const
+     }
+ }
+ 
+-void MainMemory::por_reset()
++void MainMemory::por_reset(const Agent& agent)
+ {
+     dynamic_cast<SysregsEr<region_bases[erbreg_idx]>*>(regions[erbreg_idx].get())->reset(ResetCause::POR);
+     dynamic_cast<SccrEr<region_bases[sccr_idx]>*>(regions[sccr_idx].get())->reset();
++    dynamic_cast<ShaktiUart<region_bases[uart_idx], region_sizes[uart_idx], ER_PLIC_UART0_INTR_ID>*>(regions[uart_idx].get())->reset(agent);
+ }
+ 
+ void MainMemory::set_cpu_warm_reset(bool held)
+@@ -149,6 +151,7 @@ void MainMemory::uart_clock_tick(const Agent& agent, uint64_t cycle) {
+     ptr->clock_tick(agent, cycle);
+ }
+ 
++
+ void MainMemory::plic_interrupt_pending_set(const Agent& agent, uint32_t source)
+ {
+     auto ptr = dynamic_cast<ER_PLIC<region_bases[plic_idx], region_sizes[plic_idx]>*>(regions[plic_idx].get());
+diff --git a/sw-sysemu/memory/erbium/main_memory.h b/sw-sysemu/memory/erbium/main_memory.h
+index 08077e3..e27e9f4 100644
+--- a/sw-sysemu/memory/erbium/main_memory.h
++++ b/sw-sysemu/memory/erbium/main_memory.h
+@@ -107,9 +107,9 @@ public:
+     // If @last is not null it receives the last valid address of the region.
+     unsigned access_sizes(addr_type addr, addr_type* last = nullptr) const;
+ 
+-    // Power-on reset of the register blocks (system registers, SCCR stub)
++    // Power-on reset of the register blocks (system registers, SCCR, UART)
+     // without touching memory contents (ROM, SRAM, MRAM survive).
+-    void por_reset();
++    void por_reset(const Agent& agent);
+     void set_cpu_warm_reset(bool held);
+ 
+     void read(const Agent& agent, addr_type addr, size_type n, void* result) {
+diff --git a/sw-sysemu/system.cpp b/sw-sysemu/system.cpp
+index c8a55ff..3b114ec 100644
+--- a/sw-sysemu/system.cpp
++++ b/sw-sysemu/system.cpp
+@@ -206,7 +206,7 @@ void System::process_erbium_reset()
+             return;
+         }
+ #endif
+-        memory.por_reset();
++        memory.por_reset(Noagent(this));
+         m_cpu_warm_reset_pin = false;
+     }
+     if (cold || whole) {
+-- 
+2.43.0
+

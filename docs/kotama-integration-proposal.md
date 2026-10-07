@@ -2,9 +2,10 @@
 
 Implementation update (2026-10-07): CPU hold/start and `erbctl` ELF loading /
 verification are now implemented and tested, including a host-loaded Kotama boot.
-See [host ELF loading](host-elf-loading.md). UART transport/console changes remain
-future work. The text below preserves the original proposal and study results;
-its proposed `erbctl console` and `--uart-socket` options are not implemented.
+See [host ELF loading](host-elf-loading.md). Direct host UART1 ↔ Erbium UART and
+`erbctl console` are now implemented too; see [UART console](uart-console.md).
+The text below preserves the original proposal and study results; statements
+about missing features describe that earlier baseline, not the current code.
 Study date: 2026-10-06.
 
 ## Recommendation

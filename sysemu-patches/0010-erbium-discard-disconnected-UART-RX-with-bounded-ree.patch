@@ -1,0 +1,351 @@
+From c977681d9897887ebe5b45731ec33826e953ef40 Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Wed, 7 Oct 2026 05:30:03 +0000
+Subject: [PATCH 10/17] erbium: discard disconnected UART RX with bounded
+ reenable flush
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ sw-sysemu/devices/shakti_uart.h               |  46 +++++--
+ .../tests/erbium/uart-registers/README.md     |  28 ++--
+ .../tests/erbium/uart-registers/registers.cpp | 123 +++++++++++++++++-
+ sw-sysemu/tests/erbium/uart-registers/run.sh  |   3 +-
+ 4 files changed, 176 insertions(+), 24 deletions(-)
+
+diff --git a/sw-sysemu/devices/shakti_uart.h b/sw-sysemu/devices/shakti_uart.h
+index 790c895..f84116e 100644
+--- a/sw-sysemu/devices/shakti_uart.h
++++ b/sw-sysemu/devices/shakti_uart.h
+@@ -152,6 +152,7 @@ struct ShaktiUart : public MemoryRegion {
+         rx_fifo.fill(0);
+         configured_tx_fd = configured_rx_fd = -1;
+         tx_can_sigpipe = false;
++        rx_drop_until_idle = false;
+         agent.chip->er_plic_interrupt_pending_clear(PlicSource);
+         interrupt_asserted = false;
+     }
+@@ -184,16 +185,21 @@ struct ShaktiUart : public MemoryRegion {
+     // FIFO fullness backpressures the host; it is not a physical RX overrun.
+     // On first use we add O_NONBLOCK (also affects dup'd descriptors). The owner
+     // must not clear it while attached. No descriptor is closed by this device.
+-    // EOF/EIO/EPIPE keep the attachment and queued bytes: a named FIFO writer
+-    // or a PTY slave peer can reconnect while its master stays open. A new PTY
++    // With pads connected, EOF/EIO/EPIPE/socket-disconnect errors keep the
++    // attachment and queued bytes: a FIFO writer or PTY slave can reconnect
++    // while its master stays open. A new PTY
+     // pair requires the owner to attach new fds. Assigning -1 pauses that
+     // direction; attaching another fd resumes bytes, it does not reset FIFOs.
+     // Detach and poll before closing/reusing an fd number.
+     // uart_enable selects pads, not MMIO: disabled TX advances internally and
+     // is discarded on a peripheral tick (never replayed on reenable). Already
+-    // buffered RX remains readable. Host RX is paused while pads are disabled;
+-    // bytes in the reliable host queue can arrive after reenable. That deliberate
+-    // lossless-stream policy is not a simulation of bytes lost on a real wire.
++    // buffered RX remains readable. Host arrivals on disconnected RX pads are
++    // discarded in bounded batches, independently of internal FIFO fullness.
++    // On reenable we finish discarding any backlog up to an observed idle/EOF
++    // boundary before receiving again, never replaying disconnected arrivals.
++    // New arrivals during that conservative transition flush may also be lost:
++    // an fd carries bytes, not pinmux-transition timestamps. Connected-pad FIFO
++    // fullness still uses lossless host backpressure, not physical overrun.
+     // Baud/framing/IQC registers are storage only; no bit/shift-register timing,
+     // active TX character, parity/frame/break errors or physical overrun model.
+     int tx_fd = -1;
+@@ -221,6 +227,7 @@ private:
+     int configured_tx_fd = -1;
+     int configured_rx_fd = -1;
+     bool tx_can_sigpipe = false;
++    bool rx_drop_until_idle = false;
+ 
+     static void check_size(size_type pos, size_type n) {
+         if (n != 1 && n != 2 && n != 4 && n != 8)
+@@ -322,7 +329,8 @@ private:
+ 
+     static bool stream_unavailable(int error) {
+         return error == EAGAIN || error == EWOULDBLOCK ||
+-               error == EIO || error == EPIPE || error == ENXIO;
++               error == EIO || error == EPIPE || error == ENXIO ||
++               error == ECONNRESET || error == ENOTCONN;
+     }
+ 
+     ssize_t write_tx_stream(const uint8_t* data, size_t count) {
+@@ -359,20 +367,36 @@ private:
+         return true;
+     }
+ 
+-    void poll_rx_fifo(bool pads_enabled) {
+-        if (!pads_enabled) {
+-            if (rx_fd == -1) configured_rx_fd = -1;
+-            return;
++    // Bound bytes AND syscalls, including EINTR retries, so a flooding peer
++    // cannot monopolize the emulator while disconnected. Returning false keeps
++    // the flush pending, even across reenable, until idle can be observed.
++    bool discard_rx_stream() {
++        std::array<uint8_t, 256> discarded{};
++        for (unsigned attempt = 0; attempt < 16; ++attempt) {
++            const ssize_t rv = ::read(rx_fd, discarded.data(), discarded.size());
++            if (rv > 0) continue;
++            if (rv == 0 || stream_unavailable(errno)) return true;
++            if (errno != EINTR)
++                throw std::system_error(errno, std::generic_category(), "UART disconnected RX read");
+         }
++        return false;
++    }
++
++    void poll_rx_fifo(bool pads_enabled) {
++        if (!pads_enabled) rx_drop_until_idle = true;
+         if (rx_fd == -1) {
+             configured_rx_fd = -1;
+             return;
+         }
+-        if (rx_fifo_count == FIFO_DEPTH) return;
++        if (!rx_drop_until_idle && rx_fifo_count == FIFO_DEPTH) return;
+         if (configured_rx_fd != rx_fd) {
+             make_nonblocking(rx_fd);
+             configured_rx_fd = rx_fd;
+         }
++        if (rx_drop_until_idle) {
++            if (discard_rx_stream() && pads_enabled) rx_drop_until_idle = false;
++            return;
++        }
+         while (rx_fifo_count < FIFO_DEPTH) {
+             const size_t tail = rx_fifo_tail();
+             const size_t count = std::min(FIFO_DEPTH - rx_fifo_count, FIFO_DEPTH - tail);
+diff --git a/sw-sysemu/tests/erbium/uart-registers/README.md b/sw-sysemu/tests/erbium/uart-registers/README.md
+index 5fe8f9c..5cc3d86 100644
+--- a/sw-sysemu/tests/erbium/uart-registers/README.md
++++ b/sw-sysemu/tests/erbium/uart-registers/README.md
+@@ -55,6 +55,12 @@ TX IRQ polarity, non-modem bit 9, inclusive/sticky threshold, independent
+ status/raw acknowledgment, RX-full IRQ persistence, FIFO clear controls absent
+ without modem support, pad-disabled MMIO, retained internal RX, suppression of
+ pad-disabled TX, and an explicit device chip reset preserving borrowed fds.
++Disconnected RX tests prove disable/send/tick/reenable produces no phantom input,
++discard works even with an already-full internal FIFO, and an unread backlog
++larger than one batch cannot reappear on reenable. Each drain is limited to
++16 read attempts of at most 256 bytes (4 KiB), including EINTR retries. Link-time
++read wrappers exercise continuous flood and EINTR storms; read/write wrappers
++check recoverable ECONNRESET/ENOTCONN endpoint-polling races.
+ 
+ Real pipes additionally check 16-byte RX backpressure without fabricated physical
+ overrun, byte ordering, and TX EAGAIN/resume. The root repository's
+@@ -70,10 +76,14 @@ values but do not change byte timing or character width. Parity, break, framing,
+ physical overrun, active TX shift-register timing, FIFO-full AXI stalling and
+ BSV rule/bus-cycle arbitration are not simulated. Raw capture is on peripheral
+ ticks; MMIO has synchronous effects. Pad-disabled TX advances/discards internally
+-on a tick instead of freezing/replaying. Pad-disabled host RX is paused and can
+-arrive after reenable, deliberately preserving reliable host backpressure rather
+-than simulating lost wire arrivals. Reset clears internal FIFOs, not bytes still
+-queued in external host descriptors.
++on a tick instead of freezing/replaying. Pad-disabled host RX is discarded in
++bounded batches without touching internal RX contents. Reenable continues a
++pending discard until an idle/EAGAIN/EOF boundary is observed, preventing an old
++backlog from becoming phantom input. The fd has no arrival/pinmux timestamps, so
++new bytes arriving during this conservative reenable flush may also be discarded;
++continuous flood can delay receiver reconnection without blocking the emulator.
++Connected-pad full-FIFO backpressure remains lossless. Reset clears internal
++FIFOs, not bytes still queued in external host descriptors.
+ 
+ ## Reset integration boundary
+ 
+@@ -81,8 +91,8 @@ queued in external host descriptors.
+ and immediately clears the PLIC line without closing or detaching borrowed fds.
+ Invoke it on **whole-chip/peripheral reset only**, not CPU warm hold, CPU-only
+ cold reset, or debug reset. The mocked hold check confirms the UART itself never
+-consults CPU hold; end-to-end reset routing needs a System/MainMemory callback
+-outside this device-only change. The existing `MainMemory::por_reset()` resets
+-Sysregs/SCCR, but not UART. Both the `sys_emu::por_reset()` path and the non-SYS_EMU
+-whole-reset fallback need that integration. Startup reconstructs the device
+-already; neither socket reattachment nor CPU-only hold should reconstruct it.
++consults CPU hold; end-to-end reset routing uses a System/MainMemory callback
++owned outside this device-only change. Both the `sys_emu::por_reset()` path and
++the non-SYS_EMU whole-reset fallback must invoke the Agent-aware UART reset.
++Startup reconstructs the device already; neither socket reattachment nor
++CPU-only hold should reconstruct it.
+diff --git a/sw-sysemu/tests/erbium/uart-registers/registers.cpp b/sw-sysemu/tests/erbium/uart-registers/registers.cpp
+index 716937c..cdb7a01 100644
+--- a/sw-sysemu/tests/erbium/uart-registers/registers.cpp
++++ b/sw-sysemu/tests/erbium/uart-registers/registers.cpp
+@@ -3,12 +3,39 @@
+ // ext/core-et-erbium/ip/uart/verilog/uart.v, not UART header constants.
+ #include <array>
+ #include <cassert>
++#include <cstring>
+ #include <iostream>
+ #include <vector>
+ #include <sys/ioctl.h>
+ #include "system_mock.h"
+ #include "devices/shakti_uart.h"
+ 
++extern "C" ssize_t __real_read(int, void*, size_t);
++extern "C" ssize_t __real___read_chk(int, void*, size_t, size_t);
++extern "C" ssize_t __real_write(int, const void*, size_t);
++static int flood_fd = -1;
++static int flood_errno = 0;
++static size_t flood_reads = 0, flood_bytes = 0;
++static int error_tx_fd = -1, error_tx_errno = 0;
++extern "C" ssize_t __wrap_read(int fd, void* data, size_t count) {
++    if (fd != flood_fd) return __real_read(fd, data, count);
++    ++flood_reads;
++    if (flood_errno) { errno = flood_errno; return -1; }
++    std::memset(data, 0xcc, count);
++    flood_bytes += count;
++    return count;
++}
++// glibc fortification can route fixed-size-buffer reads through __read_chk.
++extern "C" ssize_t __wrap___read_chk(int fd, void* data, size_t count, size_t buffer_size) {
++    if (fd != flood_fd) return __real___read_chk(fd, data, count, buffer_size);
++    assert(count <= buffer_size);
++    return __wrap_read(fd, data, count);
++}
++extern "C" ssize_t __wrap_write(int fd, const void* data, size_t count) {
++    if (fd == error_tx_fd && error_tx_errno) { errno = error_tx_errno; return -1; }
++    return __real_write(fd, data, count);
++}
++
+ using Uart = bemu::ShaktiUart<0x02004000, 0x1000, 3>;
+ struct Fixture {
+     bemu::System chip;
+@@ -226,13 +253,16 @@ static void pad_routing_and_reset_independence() {
+     f.uart.rx_fd = rx.fds[0];
+     f.uart.tx_fd = tx.fds[1];
+     f.chip.enabled = false;
+-    rx.send({0x41, 0x42});
+     f.wr(0x08, 0x99);
+-    assert(f.status() == 0 && rx.waiting() == 2); // write accepted with pads disabled
++    assert(f.status() == 0); // write accepted with pads disabled
++    rx.send({0x41, 0x42});
+     f.tick();
+-    assert(tx.waiting() == 0 && f.status() == 1 && rx.waiting() == 2);
++    assert(tx.waiting() == 0 && f.status() == 1 && rx.waiting() == 0);
+     assert(f.rd(0x10) == 0); // no RX crosses disabled pads
+     f.chip.enabled = true;
++    f.tick();
++    assert(f.rd(0x10) == 0); // disabled send is NOT replayed on reenable
++    rx.send({0x41, 0x42}); // new traffic on connected pads
+     f.chip.cpu_warm_held = true;
+     f.wr(0x00, 0x123);
+     f.wr(0x50, 4);
+@@ -248,6 +278,7 @@ static void pad_routing_and_reset_independence() {
+     assert(f.rd(0x00, 2) == 0x123 && f.chip.irq);
+ 
+     f.chip.enabled = true;
++    f.tick(); // finish the disconnected-pad flush before sending new traffic
+     rx.send({1, 2, 3, 4, 5});
+     assert(f.status() == 0x105); // internal RX and sticky threshold to reset
+     f.wr(0x20, 0x1234);
+@@ -270,6 +301,90 @@ static void pad_routing_and_reset_independence() {
+     std::cout << "PASS pad-only routing, independent CPU hold, chip-reset defaults/FIFOs/PLIC, fd preservation\n";
+ }
+ 
++static void disconnected_rx_discard_is_bounded() {
++    Fixture f;
++    Pipe rx;
++    f.uart.rx_fd = rx.fds[0];
++    std::vector<uint8_t> received(16, 0x42);
++    assert(::write(rx.fds[1], received.data(), received.size()) == ssize_t(received.size()));
++    assert(f.status() == 0x10d); // internal RX full before disconnect
++    f.chip.enabled = false;
++    rx.send({0xfa, 0xfb, 0xfc});
++    f.tick(); // must discard external arrivals even though internal FIFO is full
++    assert(rx.waiting() == 0);
++    f.chip.enabled = true;
++    f.tick();
++    for (uint8_t byte : received) assert(f.rd(0x10, 4) == byte);
++    assert(f.rd(0x10) == 0); // old internal bytes survived, disconnected bytes did not
++
++    // A real queued burst larger than one discard batch must never turn into
++    // phantom input when pads reconnect before the remaining backlog is drained.
++    std::array<uint8_t, 4096> old{};
++    size_t queued = 0;
++    for (;;) {
++        const ssize_t n = ::write(rx.fds[1], old.data(), old.size());
++        if (n < 0) { assert(errno == EAGAIN); break; }
++        queued += n;
++    }
++    assert(queued >= 4096);
++    f.chip.enabled = false;
++    f.tick();
++    assert(rx.waiting() == int(queued - 4096));
++    f.chip.enabled = true;
++    while (rx.waiting()) {
++        const int before = rx.waiting();
++        f.tick();
++        assert(rx.waiting() == std::max(0, before - 4096));
++    }
++    f.tick(); // observe idle after a full final batch
++    assert(f.rd(0x10) == 0);
++
++    // Deterministic continuous flood and EINTR storm: both attempts and bytes
++    // are bounded. Reenable cannot accept data until a real idle boundary.
++    f.chip.enabled = false;
++    flood_fd = rx.fds[0];
++    flood_reads = flood_bytes = 0;
++    f.tick();
++    assert(flood_reads == 16 && flood_bytes == 4096);
++    f.chip.enabled = true;
++    f.tick();
++    assert(flood_reads == 32 && flood_bytes == 8192);
++    flood_errno = EINTR;
++    f.tick();
++    assert(flood_reads == 48 && flood_bytes == 8192);
++    flood_errno = 0;
++    flood_fd = -1;
++    f.tick();
++    assert(f.rd(0x10) == 0);
++    rx.send({0x5a});
++    f.tick();
++    assert(f.rd(0x10, 4) == 0x5a && f.rd(0x10) == 0);
++    std::cout << "PASS disconnected RX discard, full internal FIFO preservation, bounded backlog/flood/EINTR flush\n";
++}
++
++static void socket_disconnect_race_errors() {
++    Fixture f;
++    Pipe rx, tx;
++    f.uart.rx_fd = rx.fds[0];
++    f.uart.tx_fd = tx.fds[1];
++    rx.send({0x5a});
++    f.wr(0x08, 0xff);
++    flood_fd = rx.fds[0];
++    error_tx_fd = tx.fds[1];
++    for (int error : {ECONNRESET, ENOTCONN}) {
++        flood_errno = error_tx_errno = error;
++        f.tick(); // disconnect may race endpoint polling; neither direction throws
++        assert((f.status() & 5) == 0 && tx.waiting() == 0);
++        assert(rx.waiting() == 1);
++        assert(f.uart.rx_fd == rx.fds[0] && f.uart.tx_fd == tx.fds[1]);
++    }
++    flood_fd = error_tx_fd = -1;
++    flood_errno = error_tx_errno = 0;
++    f.tick();
++    assert(f.rd(0x10, 4) == 0x5a && tx.drain() == std::vector<uint8_t>{0xff});
++    std::cout << "PASS socket disconnect-race errors preserve fds and connected-pad queues\n";
++}
++
+ static void bounded_lossless_stream() {
+     Fixture f;
+     Pipe rx, tx;
+@@ -309,5 +424,7 @@ int main() {
+     raw_mask_status_and_tx_polarity();
+     rx_threshold_sticky_and_ack();
+     pad_routing_and_reset_independence();
++    disconnected_rx_discard_is_bounded();
++    socket_disconnect_race_errors();
+     bounded_lossless_stream();
+ }
+diff --git a/sw-sysemu/tests/erbium/uart-registers/run.sh b/sw-sysemu/tests/erbium/uart-registers/run.sh
+index 6f299ef..aae8048 100755
+--- a/sw-sysemu/tests/erbium/uart-registers/run.sh
++++ b/sw-sysemu/tests/erbium/uart-registers/run.sh
+@@ -8,7 +8,8 @@ OUT=${UART_REGISTER_BUILD:-"$(mktemp -d /tmp/shakti-uart-registers.XXXXXX)"}
+ mkdir -p "$OUT"
+ "${CXX:-c++}" -std=c++17 -O1 -g -Wall -Wextra -Werror -DERBIUM \
+   -fsanitize=address,undefined -fno-omit-frame-pointer -pthread \
+-  -I"$SYSEMU" -I"$SYSEMU/../erbium-hal/include" "$HERE/registers.cpp" -o "$OUT/registers"
++  -I"$SYSEMU" -I"$SYSEMU/../erbium-hal/include" "$HERE/registers.cpp" \
++  -Wl,--wrap=read -Wl,--wrap=__read_chk -Wl,--wrap=write -o "$OUT/registers"
+ ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+   timeout 10 "$OUT/registers" | tee "$OUT/registers.log"
+ printf 'Test artifacts: %s\n' "$OUT"
+-- 
+2.43.0
+

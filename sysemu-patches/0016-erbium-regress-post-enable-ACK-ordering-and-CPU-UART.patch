@@ -1,0 +1,86 @@
+From 894a44007ee866be981adfc0360db73bb45b7a62 Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Wed, 7 Oct 2026 05:49:15 +0000
+Subject: [PATCH 16/17] erbium: regress post-enable ACK ordering and CPU UART
+ PMA access
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ sw-sysemu/sys_emu/uart_socket.md              |  7 ++++-
+ .../tests/erbium/host/test_uart_endpoint.py   | 29 +++++++++++++++++--
+ 2 files changed, 32 insertions(+), 4 deletions(-)
+
+diff --git a/sw-sysemu/sys_emu/uart_socket.md b/sw-sysemu/sys_emu/uart_socket.md
+index 5d94cda..95612e7 100644
+--- a/sw-sysemu/sys_emu/uart_socket.md
++++ b/sw-sysemu/sys_emu/uart_socket.md
+@@ -75,6 +75,11 @@ python3 et-platform/sw-sysemu/tests/erbium/host/test_uart_endpoint.py \
+ The integration test also checks whole-POR FIFO/register/PLIC clearing,
+ CPU-only hold/release/cold and xSPI-only state preservation, same-connection
+ resets, and native-width replication in 32/64-bit backend transactions (a wide
+-RX transaction must pop once). These are endpoint/reset-integration tests,
++RX transaction must pop once). It explicitly samples disabled pads, waits for
++the enable-write ACK, then sends serial payload immediately without an
++intervening MMIO operation or sleep, over several UART clock phases.
++The WFI stub also checks CPU-side PMA access to RAW/IEN/IRQ_STATUS, preserving
++the mask while writing it back.
++These are endpoint/reset-integration tests,
+ not the standalone UART register-fidelity suite and not the guest
+ `erbctl load --start`/Kotama console acceptance test.
+diff --git a/sw-sysemu/tests/erbium/host/test_uart_endpoint.py b/sw-sysemu/tests/erbium/host/test_uart_endpoint.py
+index e7dccb1..7bdf1f8 100644
+--- a/sw-sysemu/tests/erbium/host/test_uart_endpoint.py
++++ b/sw-sysemu/tests/erbium/host/test_uart_endpoint.py
+@@ -82,8 +82,18 @@ def duplicate(value, width, bits):
+ 
+ 
+ def install_wfi(client):
+-    code = struct.pack("<6I", 0x400102B7, 0x06500313, 0x0062B023,
+-                       0x30405073, 0x10500073, 0xFFDFF06F)
++    # Probe corrected UART registers through the actual CPU PMA path, not just
++    # host MMIO. Read/write the same IEN value so reset-domain state is intact.
++    insns = (
++        0x020043B7,  # lui t2,UART_BASE>>12
++        0x0503AE03,  # lw t3,IEN(t2)
++        0x05C3A823,  # sw t3,IEN(t2)
++        0x0483AE03,  # lw t3,RAW(t2)
++        0x0583AE03,  # lw t3,IRQ_STATUS(t2)
++        0x400102B7, 0x06500313, 0x0062B023,  # sentinel = 101
++        0x30405073, 0x10500073, 0xFFDFF06F,  # mie=0; WFI; j WFI
++    )
++    code = struct.pack("<11I", *insns)
+     check(client.write(CODE, code) == 0, "upload WFI program")
+     check(client.write(MINION_BOOT, struct.pack("<Q", CODE)) == 0, "set boot PC")
+     check(client.write(SENTINEL, bytes(8)) == 0, "clear WFI sentinel")
+@@ -150,6 +160,19 @@ def enable_pads(client):
+     w32(client, CONFIG, u32(client, CONFIG) | 64)
+ 
+ 
++def immediate_post_enable(client, peer):
++    config = u32(client, CONFIG)
++    # Repeat to cover different phases of the periodic UART clock. No disabled
++    # sample may schedule a future flush of valid post-ACK input.
++    for phase in range(8):
++        w32(client, CONFIG, config & ~64)
++        u32(client, STATUS)  # explicitly sample disabled pads before transition
++        w32(client, CONFIG, config | 64)  # returns after the enable write ACK
++        payload = bytes([phase]) + b"post-enable-ACK"
++        peer.sendall(payload)  # no MMIO, polling, or sleep before payload
++        serial_rx(client, payload)
++
++
+ def connect(path):
+     peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+     peer.settimeout(DEADLINE)
+@@ -235,7 +258,7 @@ def exercise(emu):
+             try:
+                 # Attach capture before enabling pads. Fresh input immediately
+                 # after enable must not be lost to deferred disabled-pad work.
+-                enable_pads(client)
++                immediate_post_enable(client, peer)
+                 wide_access(client, peer)
+                 # Full duplex, burst >16, all values including NUL, LF, CR,
+                 # high-bit bytes, escape, and the xSPI framing magic.
+-- 
+2.43.0
+

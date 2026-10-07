@@ -1,6 +1,8 @@
 # Real-chip host console connectivity: UART versus bus/mailbox transport
 
-Design study: 2026-10-07. Recommendation, not an implemented feature.
+Design study: 2026-10-07. The discussion below records the pre-implementation
+baseline. **Follow-up:** direct UART option 1 is now implemented; see
+`uart-console.md` for the actual interface, corrected model behavior and limits.
 
 ## Recommendation
 

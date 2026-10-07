@@ -22,7 +22,8 @@ UNIX socket that models the xSPI IP's AXI port into the NoC (`docs/protocol.md`)
 | `docs/qemu-ospi-notes.md` | how the Versal OSPI model frames transactions; build notes |
 | `docs/sysemu-notes.md` | building/running `erbium_emu`, test ELFs, socket backend |
 | `docs/protocol.md` | QEMU <-> erbium_emu socket protocol v1 |
-| `docs/kotama-integration-proposal.md` | original Kotama integration proposal; UART transport remains future work |
+| `docs/kotama-integration-proposal.md` | original Kotama integration proposal and standalone study |
+| `docs/uart-console.md` | direct Linux UART1 ↔ Erbium UART wiring, interactive console and IRQ/WFI tests |
 | `docs/host-elf-loading.md` | implemented ELF upload/readback verification and CPU hold/start; usage and tests |
 | `docs/erbium-qemu-TODO.md` | open questions |
 | `docs/sfdp-rtl.hex`, `tools/gen_sfdp_from_trm.py` | SFDP image from RTL / generator from TRM |
@@ -62,6 +63,14 @@ preload). To use your own ELF, rebuild with
 `ERBIUM_ELF=/path/image.elf J=2 scripts/build-all.sh linux`, start the backend with
 `--start-held`, and run `erbctl load /firmware/host-payload.elf --verify --start`
 inside Linux. See `docs/host-elf-loading.md` for the complete sequence and limits.
+
+**Direct UART console:** `scripts/run-uart.sh` starts a fresh held backend and
+Linux, with `/dev/ttyAMA1` wired to Erbium's UART independently of xSPI. Inside
+Linux, use `erbctl console /dev/ttyAMA1 --load /firmware/host-payload.elf` to attach
+before uploading/starting your embedded ELF (Ctrl-] exits). Run
+`scripts/run-uart-test.sh` for the hermetic interrupt-driven echo/reload test or
+`--kotama` for a supplied Kotama payload. See `docs/uart-console.md`, including
+the distinction between functional byte-stream and electrical/baud timing.
 
 **Pieces** (all driven by `scripts/`):
 

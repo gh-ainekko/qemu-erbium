@@ -1,0 +1,211 @@
+From 4692b122d92acee1021b0e07ea053af25eb6d75f Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Wed, 7 Oct 2026 05:40:38 +0000
+Subject: [PATCH 13/17] erbium: accept UART RX immediately after pinmux enable
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ sw-sysemu/devices/shakti_uart.h               | 30 +++++++++----------
+ .../tests/erbium/uart-registers/README.md     | 21 ++++++++-----
+ .../tests/erbium/uart-registers/registers.cpp | 23 +++++++-------
+ 3 files changed, 39 insertions(+), 35 deletions(-)
+
+diff --git a/sw-sysemu/devices/shakti_uart.h b/sw-sysemu/devices/shakti_uart.h
+index f84116e..0ae4052 100644
+--- a/sw-sysemu/devices/shakti_uart.h
++++ b/sw-sysemu/devices/shakti_uart.h
+@@ -152,7 +152,6 @@ struct ShaktiUart : public MemoryRegion {
+         rx_fifo.fill(0);
+         configured_tx_fd = configured_rx_fd = -1;
+         tx_can_sigpipe = false;
+-        rx_drop_until_idle = false;
+         agent.chip->er_plic_interrupt_pending_clear(PlicSource);
+         interrupt_asserted = false;
+     }
+@@ -195,11 +194,13 @@ struct ShaktiUart : public MemoryRegion {
+     // is discarded on a peripheral tick (never replayed on reenable). Already
+     // buffered RX remains readable. Host arrivals on disconnected RX pads are
+     // discarded in bounded batches, independently of internal FIFO fullness.
+-    // On reenable we finish discarding any backlog up to an observed idle/EOF
+-    // boundary before receiving again, never replaying disconnected arrivals.
+-    // New arrivals during that conservative transition flush may also be lost:
+-    // an fd carries bytes, not pinmux-transition timestamps. Connected-pad FIFO
+-    // fullness still uses lossless host backpressure, not physical overrun.
++    // Discard occurs ONLY when polling samples pads disabled; there is no
++    // deferred reenable flush that could drop valid post-enable traffic.
++    // The fd carries no arrival/pinmux-transition timestamps: unread bytes
++    // beyond a disabled batch, or arriving between the last disabled poll and
++    // reenable, can be received later. This is an event-sampling timing limit,
++    // not an exact line-level gate. Connected-pad FIFO fullness still uses
++    // lossless host backpressure, not physical overrun.
+     // Baud/framing/IQC registers are storage only; no bit/shift-register timing,
+     // active TX character, parity/frame/break errors or physical overrun model.
+     int tx_fd = -1;
+@@ -227,7 +228,6 @@ private:
+     int configured_tx_fd = -1;
+     int configured_rx_fd = -1;
+     bool tx_can_sigpipe = false;
+-    bool rx_drop_until_idle = false;
+ 
+     static void check_size(size_type pos, size_type n) {
+         if (n != 1 && n != 2 && n != 4 && n != 8)
+@@ -368,33 +368,31 @@ private:
+     }
+ 
+     // Bound bytes AND syscalls, including EINTR retries, so a flooding peer
+-    // cannot monopolize the emulator while disconnected. Returning false keeps
+-    // the flush pending, even across reenable, until idle can be observed.
+-    bool discard_rx_stream() {
++    // cannot monopolize the emulator while disconnected. No discard is carried
++    // into a later enabled poll: that poll must accept post-enable peer bytes.
++    void discard_rx_stream() {
+         std::array<uint8_t, 256> discarded{};
+         for (unsigned attempt = 0; attempt < 16; ++attempt) {
+             const ssize_t rv = ::read(rx_fd, discarded.data(), discarded.size());
+             if (rv > 0) continue;
+-            if (rv == 0 || stream_unavailable(errno)) return true;
++            if (rv == 0 || stream_unavailable(errno)) return;
+             if (errno != EINTR)
+                 throw std::system_error(errno, std::generic_category(), "UART disconnected RX read");
+         }
+-        return false;
+     }
+ 
+     void poll_rx_fifo(bool pads_enabled) {
+-        if (!pads_enabled) rx_drop_until_idle = true;
+         if (rx_fd == -1) {
+             configured_rx_fd = -1;
+             return;
+         }
+-        if (!rx_drop_until_idle && rx_fifo_count == FIFO_DEPTH) return;
++        if (pads_enabled && rx_fifo_count == FIFO_DEPTH) return;
+         if (configured_rx_fd != rx_fd) {
+             make_nonblocking(rx_fd);
+             configured_rx_fd = rx_fd;
+         }
+-        if (rx_drop_until_idle) {
+-            if (discard_rx_stream() && pads_enabled) rx_drop_until_idle = false;
++        if (!pads_enabled) {
++            discard_rx_stream();
+             return;
+         }
+         while (rx_fifo_count < FIFO_DEPTH) {
+diff --git a/sw-sysemu/tests/erbium/uart-registers/README.md b/sw-sysemu/tests/erbium/uart-registers/README.md
+index 5cc3d86..0f0917d 100644
+--- a/sw-sysemu/tests/erbium/uart-registers/README.md
++++ b/sw-sysemu/tests/erbium/uart-registers/README.md
+@@ -55,9 +55,11 @@ TX IRQ polarity, non-modem bit 9, inclusive/sticky threshold, independent
+ status/raw acknowledgment, RX-full IRQ persistence, FIFO clear controls absent
+ without modem support, pad-disabled MMIO, retained internal RX, suppression of
+ pad-disabled TX, and an explicit device chip reset preserving borrowed fds.
+-Disconnected RX tests prove disable/send/tick/reenable produces no phantom input,
+-discard works even with an already-full internal FIFO, and an unread backlog
+-larger than one batch cannot reappear on reenable. Each drain is limited to
++Disconnected RX tests prove disable/send/tick/reenable discards the sampled bytes,
++discard works even with an already-full internal FIFO, and a burst larger than
++one batch drains across bounded **disabled** samples. Post-enable bytes are
++accepted on the first enabled poll, without an intervening empty poll or tick.
++There is no deferred reenable flush or idle prerequisite. Each drain is limited to
+ 16 read attempts of at most 256 bytes (4 KiB), including EINTR retries. Link-time
+ read wrappers exercise continuous flood and EINTR storms; read/write wrappers
+ check recoverable ECONNRESET/ENOTCONN endpoint-polling races.
+@@ -77,11 +79,14 @@ physical overrun, active TX shift-register timing, FIFO-full AXI stalling and
+ BSV rule/bus-cycle arbitration are not simulated. Raw capture is on peripheral
+ ticks; MMIO has synchronous effects. Pad-disabled TX advances/discards internally
+ on a tick instead of freezing/replaying. Pad-disabled host RX is discarded in
+-bounded batches without touching internal RX contents. Reenable continues a
+-pending discard until an idle/EAGAIN/EOF boundary is observed, preventing an old
+-backlog from becoming phantom input. The fd has no arrival/pinmux timestamps, so
+-new bytes arriving during this conservative reenable flush may also be discarded;
+-continuous flood can delay receiver reconnection without blocking the emulator.
++bounded batches without touching internal RX contents, **only while a poll
++samples pads disabled**. Enabling resumes ordinary intake immediately; bytes
++sent after an enable acknowledgment must not be dropped by a later flush.
++The fd has no arrival/pinmux-transition timestamps. Unread bytes beyond a
++disabled batch, or arrivals between the last disabled sample and reenable,
++may consequently be received later. This is an event-sampling timing limit,
++not exact physical arrival-time gating. No synchronous pinmux-transition
++callback or line-level time model is implied.
+ Connected-pad full-FIFO backpressure remains lossless. Reset clears internal
+ FIFOs, not bytes still queued in external host descriptors.
+ 
+diff --git a/sw-sysemu/tests/erbium/uart-registers/registers.cpp b/sw-sysemu/tests/erbium/uart-registers/registers.cpp
+index cdb7a01..072f011 100644
+--- a/sw-sysemu/tests/erbium/uart-registers/registers.cpp
++++ b/sw-sysemu/tests/erbium/uart-registers/registers.cpp
+@@ -262,6 +262,9 @@ static void pad_routing_and_reset_independence() {
+     f.chip.enabled = true;
+     f.tick();
+     assert(f.rd(0x10) == 0); // disabled send is NOT replayed on reenable
++    f.chip.enabled = false;
++    f.tick();
++    f.chip.enabled = true; // configuration is now applied/acknowledged
+     rx.send({0x41, 0x42}); // new traffic on connected pads
+     f.chip.cpu_warm_held = true;
+     f.wr(0x00, 0x123);
+@@ -278,7 +281,6 @@ static void pad_routing_and_reset_independence() {
+     assert(f.rd(0x00, 2) == 0x123 && f.chip.irq);
+ 
+     f.chip.enabled = true;
+-    f.tick(); // finish the disconnected-pad flush before sending new traffic
+     rx.send({1, 2, 3, 4, 5});
+     assert(f.status() == 0x105); // internal RX and sticky threshold to reset
+     f.wr(0x20, 0x1234);
+@@ -317,8 +319,8 @@ static void disconnected_rx_discard_is_bounded() {
+     for (uint8_t byte : received) assert(f.rd(0x10, 4) == byte);
+     assert(f.rd(0x10) == 0); // old internal bytes survived, disconnected bytes did not
+ 
+-    // A real queued burst larger than one discard batch must never turn into
+-    // phantom input when pads reconnect before the remaining backlog is drained.
++    // A real queued burst larger than one discard batch drains in bounded
++    // disabled samples, not via a deferred flush after the pads are enabled.
+     std::array<uint8_t, 4096> old{};
+     size_t queued = 0;
+     for (;;) {
+@@ -330,23 +332,22 @@ static void disconnected_rx_discard_is_bounded() {
+     f.chip.enabled = false;
+     f.tick();
+     assert(rx.waiting() == int(queued - 4096));
+-    f.chip.enabled = true;
+     while (rx.waiting()) {
+         const int before = rx.waiting();
+         f.tick();
+         assert(rx.waiting() == std::max(0, before - 4096));
+     }
+-    f.tick(); // observe idle after a full final batch
++    f.chip.enabled = true;
+     assert(f.rd(0x10) == 0);
+ 
+     // Deterministic continuous flood and EINTR storm: both attempts and bytes
+-    // are bounded. Reenable cannot accept data until a real idle boundary.
++    // are bounded WHILE disabled, including EINTR retries. Reenable does not
++    // depend on observing idle and must accept new post-enable bytes immediately.
+     f.chip.enabled = false;
+     flood_fd = rx.fds[0];
+     flood_reads = flood_bytes = 0;
+     f.tick();
+     assert(flood_reads == 16 && flood_bytes == 4096);
+-    f.chip.enabled = true;
+     f.tick();
+     assert(flood_reads == 32 && flood_bytes == 8192);
+     flood_errno = EINTR;
+@@ -354,12 +355,12 @@ static void disconnected_rx_discard_is_bounded() {
+     assert(flood_reads == 48 && flood_bytes == 8192);
+     flood_errno = 0;
+     flood_fd = -1;
+-    f.tick();
+-    assert(f.rd(0x10) == 0);
++    f.chip.enabled = true;
+     rx.send({0x5a});
+-    f.tick();
++    // No intervening UART poll/tick after enable: this reproduces sending
++    // immediately after the SYSTEM_CONFIG enable ACK in the endpoint contract.
+     assert(f.rd(0x10, 4) == 0x5a && f.rd(0x10) == 0);
+-    std::cout << "PASS disconnected RX discard, full internal FIFO preservation, bounded backlog/flood/EINTR flush\n";
++    std::cout << "PASS disabled-sample RX discard, bounded backlog/flood/EINTR, immediate post-enable RX\n";
+ }
+ 
+ static void socket_disconnect_race_errors() {
+-- 
+2.43.0
+
