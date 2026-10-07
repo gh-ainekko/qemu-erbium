@@ -112,6 +112,7 @@ esac
 ''')
         self.executable('tools/ninja', '''#!/bin/bash
 set -eu
+printf '%s\\n' "$*" >> "$QEMU_TEST_ROOT/ninja-calls"
 mkdir -p "$QEMU_TEST_ROOT/dist/share/qemu" "$QEMU_TEST_ROOT/ext/qemu/build/tests/qtest"
 touch "$QEMU_TEST_ROOT/ext/qemu/build/tests/qtest/erbium-xspi-test"
 ''')
@@ -148,6 +149,11 @@ touch "$QEMU_TEST_ROOT/ext/qemu/build/tests/qtest/erbium-xspi-test"
         self.assertIn('--enable-virtfs', flags)
         self.assertIn('--enable-attr', flags)
         self.assertNotIn('--disable-attr', flags)
+        ninja_calls = (self.root / 'ninja-calls').read_text().splitlines()
+        self.assertEqual(len(ninja_calls), 2)
+        for call in ninja_calls:
+            self.assertIn('-j2', call.split())
+        self.assertEqual(ninja_calls[-1].split()[-1], 'install')
         self.build()
         self.assertEqual(len(self.calls()), 1)
         self.build('--enable-debug-info')
