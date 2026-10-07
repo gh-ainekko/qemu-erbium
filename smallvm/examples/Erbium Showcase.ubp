@@ -1,7 +1,7 @@
 module main
 author 'Erbium'
 version 1 0
-description 'No GPIO required: functions, lists, variables, and a paced timer-driven counter. Press start, inspect counter/status/answer/history, then stop.'
+description 'No GPIO required: functions, lists, variables, and a counter paced by 100 milliseconds of simulated board time (not wall time). Press start, inspect counter/status/answer/history, then stop.'
 variables counter status answer history elapsed
 
 spec 'r' 'doublePlusOne' 'double _ plus one' 'num' 20

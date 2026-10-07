@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import shutil
 import signal
@@ -63,6 +64,18 @@ def frames(data):
     return result, len(data) - pos
 
 
+def assert_clean_gp_log(text):
+    """A later PASS must never conceal parser/debugger or serial errors."""
+    patterns = (
+        r"(?m)^.*\.gp:\d+\b",
+        r"(?mi)^(?:undefined|syntax error|parse error|serial error|file not found:|stopped at|to debug, type:).*$",
+        r"(?m)^-{8,}\s*$",
+        r"(?m)^(?:Welcome to GP!|gp>).*$",
+    )
+    errors = [match.group(0) for pattern in patterns for match in re.finditer(pattern, text)]
+    assert not errors, f"GP parser/runtime error in log: {errors[:5]}"
+
+
 def run(args):
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -89,9 +102,7 @@ def run(args):
     gp_command = ["xvfb-run", "-a", "-s", "-screen 0 1280x900x24",
                   str(args.gp.resolve())]
     gp_command += [str(p.relative_to(gpdir)) for p in sorted((gpdir / "runtime/lib").glob("*.gp"))]
-    gp_command += ["loadIDE.gp"]
-    if args.native_glue:
-        gp_command.append(str(args.native_glue.resolve()))
+    gp_command += ["loadIDE.gp", str(args.native_compat.resolve())]
     gp_command += [str(driver), "-", "--ide-test-config",
                    str(output / "config.json")]
     processes = []
@@ -148,6 +159,7 @@ def run(args):
                                 pass
                         time.sleep(0.01)
                     assert gp.returncode == 0, f"GP exited {gp.returncode}"
+                    assert_clean_gp_log((output / "gp.log").read_text(errors="replace"))
                     gp_result = output / "gp-result.json"
                     assert gp_result.exists(), "GP exited without result; inspect gp.log"
                     result = json.loads(gp_result.read_text())
@@ -155,6 +167,9 @@ def run(args):
                     outgoing, tail = frames(captures["ide-to-board"])
                     incoming, incoming_tail = frames(captures["board-to-ide"])
                     assert not tail and not incoming_tail, "incomplete captured UART frames"
+                    delays = [body[0] for op, ident, body in outgoing if op == 30 and ident == 1 and body]
+                    assert len(delays) >= 2 and all(value == 1 for value in delays), (
+                        f"Erbium default serial profile did not select delay 1 on connect/reconnect: {delays}")
                     downloads = [body for op, _, body in outgoing if op == 32]
                     assert len(downloads) >= 24, "missing compiled chunk downloads"
                     expected_downloads = (result["chunk_count"]
@@ -174,6 +189,7 @@ def run(args):
                                   incoming_frames=len(incoming), outgoing_frames=len(outgoing))
                     result["redundant_chunk_downloads"] = 0
                     result["readback_chunk_frames"] = len(readbacks)
+                    result["gp_error_log_checks"] = "PASS"
                     success = True
                     break
             if not success:
@@ -194,6 +210,17 @@ def run(args):
             os.close(slave)
         for name, data in captures.items():
             (output / f"{name}.bin").write_bytes(data)
+        # Preserve wire diagnostics on failure too, especially default-profile
+        # regressions before the version identifies boardType.
+        try:
+            outgoing, _ = frames(captures["ide-to-board"])
+            incoming, _ = frames(captures["board-to-ide"])
+            result["observed_serial_delay_requests"] = [
+                body[0] for op, ident, body in outgoing if op == 30 and ident == 1 and body
+            ]
+            result["captured_readback_chunks"] = sum(op == 32 for op, _, _ in incoming)
+        except AssertionError as exc:
+            result["capture_decode_error"] = str(exc)
         result.update(status="PASS" if success else "FAIL", failure=failure,
                       elapsed_seconds=round(time.monotonic() - started, 3),
                       emulator_command=emulator_command, gp_command=gp_command,
@@ -202,8 +229,7 @@ def run(args):
                       gp_sha256=hashlib.sha256(args.gp.read_bytes()).hexdigest(),
                       relay_queue_peak=relay_peak, relay_write_size=args.relay_write_size,
                       uart_bytes={k: len(v) for k, v in captures.items()})
-        if args.native_glue:
-            result["native_glue_sha256"] = hashlib.sha256(args.native_glue.read_bytes()).hexdigest()
+        result["native_compat_sha256"] = hashlib.sha256(args.native_compat.read_bytes()).hexdigest()
         result["driver_sha256"] = hashlib.sha256(driver.read_bytes()).hexdigest()
         result["project_sha256"] = hashlib.sha256((output / "large.ubp").read_bytes()).hexdigest()
         result["ide_source_sha256"] = {
@@ -222,8 +248,8 @@ def main():
     parser.add_argument("elf", nargs="?", type=Path, default=ROOT / "build/smallvm/smallvm.elf")
     parser.add_argument("--emu", type=Path, default=ROOT / "dist/bin/erbium_emu")
     parser.add_argument("--gp", type=Path, default=ROOT / "ext/smallvm/gp/gp-linux64bit")
-    parser.add_argument("--native-glue", type=Path,
-                        help="optional native launch glue (normally test patched upstream methods directly)")
+    parser.add_argument("--native-compat", type=Path, default=ROOT / "smallvm/ide/native-compat.gp",
+                        help="same native UI compatibility layer used by the live IDE; no launch/port overrides")
     parser.add_argument("--output", type=Path, default=ROOT / "build/smallvm/ide-tests")
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--relay-write-size", type=int, default=4096)
@@ -232,14 +258,12 @@ def main():
         parser.error("xvfb-run is required (install xvfb); this test never uses the live display")
     if args.relay_write_size < 1:
         parser.error("--relay-write-size must be positive")
-    if args.native_glue and not args.native_glue.is_file():
-        parser.error(f"native glue does not exist: {args.native_glue}")
-    for path in (args.elf, args.emu, args.gp):
+    for path in (args.elf, args.emu, args.gp, args.native_compat):
         if not path.is_file():
             parser.error(f"required artifact does not exist: {path}")
     # Prevent stale success artifacts from satisfying a failed invocation.
     args.output.mkdir(parents=True, exist_ok=True)
-    for name in ("gp-result.json", "saved.ubp", "readback.json", "decompiled.ubp"):
+    for name in ("gp-result.json", "saved.ubp", "readback.json", "decompiled.ubp", "save-dialog.png"):
         (args.output / name).unlink(missing_ok=True)
     raise SystemExit(run(args))
 

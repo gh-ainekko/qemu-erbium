@@ -16,23 +16,24 @@ listener, or use of the live IDE display/serial port. Every run owns two raw
 PTYs, its emulator, and an automatically chosen X display. The Python wrapper
 terminates owned process groups on success, failure, or the overall timeout.
 Exit status is zero only after **both** GP assertions and independent UART
-transcript checks pass. `--emu`, `--gp`, `--native-glue`, `--timeout`, `--output`,
+transcript checks pass. `--emu`, `--gp`, `--native-compat`, `--timeout`, `--output`,
 and an optional firmware ELF positional argument select alternate artifacts.
 
 ## What is actually tested
 
 The native GP process runs from its `gp` directory, loads all
-`runtime/lib/*.gp`, `loadIDE.gp`, and finally `ide_integration.gp` to replace
-**startup only**. By default the runtime methods under test are the upstream
-methods with the repository's selected-port preservation patch applied.
-`--native-glue FILE` can additionally load shared native launch glue before
-the test driver; the default deliberately avoids overriding runtime methods.
-No compiler, runtime, decompiler, project loader, or project save method is
-mocked. The driver creates the real MicroBlocks editor/page without entering
-the infinite interactive event loop. Missing native browser-shell primitives
-(HTML property notifications, dropped browser files, WebSerial capability)
-are explicit no-ops; the browser download primitive writes the output file.
-Those are not serial, compiler, or board-response substitutes.
+`runtime/lib/*.gp`, `loadIDE.gp`, the same `smallvm/ide/native-compat.gp` UI
+compatibility layer used by the live IDE, and finally `ide_integration.gp` to
+replace **startup only**. The runtime methods under test are the upstream
+methods with the repository's selected-port preservation and Erbium default
+serial-pacing patches applied. The live `launch.gp` is deliberately **not**
+loaded: its serial-path selection is unnecessary and tests must not attach to
+the live UI's service alias.
+No compiler, serial runtime, decompiler, or project loader method is replaced
+or mocked by the harness. The driver creates the real MicroBlocks editor/page
+without entering the infinite interactive event loop. Browser-shell
+compatibility and the native project save implementation come from the
+shared application compatibility layer, not test-only replacements.
 
 * `MicroBlocksEditor.openProject` loads a generated `.ubp` source project.
 * `SmallRuntime.compiledBytesFor` proves there is a near-1KB chunk and more
@@ -42,8 +43,11 @@ Those are not serial, compiler, or board-response substitutes.
 * `startAll`, real `getVar` replies, and the normal runtime message parser
   verify function result 41, string status, indexed list, a timer-paced
   counter that advances, and a counter that freezes after stopping.
-* The unmodified IDE `saveProject` writes current project source through
-  the file-download boundary; the IDE's own `saveLoadTest` checks it.
+* The live application's native `saveProject` opens the actual modal
+  `MicroBlocksFilePicker`; a scheduled GP helper navigates its real folder
+  method and invokes its acceptance callback. No picker/write primitive is
+  mocked. The native save method writes the file and the IDE's own
+  `saveLoadTest` checks it. `save-dialog.png` captures the real native dialog.
 * Close/reopen of the same PTY takes the IDE reconnect path and preserves
   all board CRCs.
 * An edit to the project's real Function AST is marked for recompilation
@@ -61,6 +65,14 @@ Those are not serial, compiler, or board-response substitutes.
   redundant uploads: exactly initial chunks + one edited chunk + recovered
   chunks may be downloaded, so reconnect and unchanged sync cannot quietly
   retransmit the project.
+* Parser/undefined-function errors, debugger stack traces, missing assets,
+  serial errors, and
+  fallback GP REPL messages in `gp.log` are hard failures even if a later
+  assertion/result reports PASS. Native icons and shell hooks are supplied
+  by the same compatibility file as the live IDE.
+* Captured connect/reconnect default serial-profile requests must all select
+  delay 1. This catches the initialization-order regression where default
+  pacing was selected before the incoming version identified Erbium.
 
 The showcase `smallvm/examples/Erbium Showcase.ubp` uses only variables,
 lists, arithmetic, a custom function, and timers: **no GPIO**. The generated
@@ -68,8 +80,10 @@ test project adds 24 unique long literals in separate source scripts.
 This is an aggregate >16KB multi-chunk upload through the IDE's real paced
 63-byte serial writes, **not** a single unpaced >16KB write. The showcase
 waits 100ms; the generated test waits 5ms because simulated time need not
-track wall time. Readback uses the IDE's supported minimum serial-delay
-setting, avoiding long physical-board per-word sleeps in slow simulation.
+track wall time. Counter progression is polled with a **20-second wall-time
+deadline**, not assumed from one fixed sleep; observed counter values and
+elapsed simulated milliseconds are recorded. Readback uses the real IDE's
+Erbium default serial-delay setting without a test-specific delay override.
 
 ## Artifacts and intentionally non-identical roundtrip
 
@@ -82,6 +96,7 @@ Default directory: `build/smallvm/ide-tests/`.
 * `ide-to-board.bin`, `board-to-ide.bin`: complete binary wire capture.
 * `large.ubp`, `edited.ubp`: deterministic source inputs.
 * `saved.ubp`: actual IDE save output.
+* `save-dialog.png`: actual native save dialog after folder navigation.
 * `readback.json`: exact chunks returned by the real firmware.
 * `decompiled.ubp`: real decompiler source output.
 
@@ -95,7 +110,11 @@ was dropped, records original/recovered author and description, and tests
 save/load plus runtime semantics of the recovered
 source. It does not assert that the recompiled CRCs equal the original CRCs:
 chunk IDs, variable indices, and metadata can legitimately change.
+The upstream native picker initially chooses `Downloads` even if given an
+absolute filename. The harness records `native_save_initial_directory` and
+navigates the real picker to the isolated output folder before acceptance.
 
 The helper unit tests only cover framing/generation. They do not count as
 IDE interoperability. No physical UART timing, real board peripherals,
-browser UI automation, or malformed-input firmware qualification is claimed.
+browser/mouse UI automation, or malformed-input firmware qualification is
+claimed. Native save-dialog behavior **is** exercised through real callbacks.

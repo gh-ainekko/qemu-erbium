@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ide_integration import frames, generate_project
+from ide_integration import assert_clean_gp_log, frames, generate_project
 
 
 class IDEHarnessTests(unittest.TestCase):
@@ -21,6 +21,21 @@ class IDEHarnessTests(unittest.TestCase):
     def test_unframed_uart_is_rejected(self):
         with self.assertRaisesRegex(AssertionError, "unframed UART"):
             frames(b"junk")
+
+    def test_gp_errors_reject_later_success(self):
+        assert_clean_gp_log("SDL2 headers: 2.0.12\nIDE_TEST_PASS test\nGoodbye!\n")
+        for error in (
+            "Undefined function: browserElectronOS",
+            "/test/driver.gp:56 Operator must be a string",
+            "Stopped at (<parse>:20)",
+            "-------------",
+            "Serial error, length: 1024",
+            "File not found: img/rounded-corner.svg",
+            "Welcome to GP!",
+            "gp> Goodbye!",
+        ):
+            with self.subTest(error=error), self.assertRaisesRegex(AssertionError, "error in log"):
+                assert_clean_gp_log(error + "\nIDE_TEST_PASS test\n")
 
     def test_generator_deterministic_and_unique(self):
         with tempfile.TemporaryDirectory() as directory:

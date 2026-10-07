@@ -1,24 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Last loaded after runtime/lib/*.gp and loadIDE.gp. No IDE methods replaced.
 
-// Browser-shell hooks are absent from the native GP executable. These are UI
-// notifications only, not compiler, runtime, project, or serial replacements.
-to browserLastAPIRequest { return nil }
-to browserStoreIDEProperty path value { nop }
-to browserNotify event value { nop }
-to browserHasWebSerial { return false }
-to browserGetDroppedFile { return nil }
-to browserLastSaveName { return nil }
-to browserElectronOS { return 3 }
-to browserWriteFile data suggestedFileName id {
-  // Implement only the browser file-download boundary. saveProject itself is
-  // the unmodified IDE method, including its filename handling/saveScripts.
-  writeFile (join (at (global 'ideTestConfig') 'output') '/' suggestedFileName) data
-}
 
 to ideAssert condition label {
   if (not condition) {
-    result = (dictionary)
+    result = (global 'ideTestResult')
+    if (isNil result) { result = (dictionary) }
     atPut result 'status' 'FAIL'
     atPut result 'failure' label
     writeFile (join (at (global 'ideTestConfig') 'output') '/gp-result.json') (jsonStringify result)
@@ -100,10 +87,6 @@ to ideCRCs rt {
 }
 
 to ideReadback rt {
-  // Supported IDE setting: the minimum stream delay avoids the firmware's
-  // physical-board per-word sleeps dominating slow simulated CPU time.
-  setSerialDelay rt 1
-  waitForPing rt
   dec = (newDecompiler)
   setField rt 'decompiler' dec
   sendMsgSync rt 'getVarNamesMsg'
@@ -116,7 +99,7 @@ to ideReadback rt {
   }
   setField rt 'decompiler' nil
   chunks = (getField dec 'chunks')
-  ideAssert ((count chunks) == expectedCount) 'actual UART readback contains every compiler chunk'
+  ideAssert ((count chunks) == expectedCount) (join 'actual UART readback chunks: ' (count chunks) ' expected: ' expectedCount)
   ideAssert ((count (getField dec 'vars')) == 5) 'readback includes all five variable names'
   for name (array 'counter' 'status' 'answer' 'history' 'elapsed') {
     id = (indexForVar (project (scripter rt)) name)
@@ -135,10 +118,39 @@ to ideReadback rt {
   return (decompileProject dec)
 }
 
+to ideAcceptSaveDialog path {
+  end = ((msecsSinceStart) + 5000)
+  pickerM = nil
+  while (and (isNil pickerM) ((msecsSinceStart) < end)) {
+    pickerM = (findMorph 'MicroBlocksFilePicker')
+    if (isNil pickerM) { waitMSecs 10 }
+  }
+  ideAssert (notNil pickerM) 'real native save dialog opens'
+  picker = (handler pickerM)
+  ideAssert (getField picker 'forSaving') 'native file picker is in save mode'
+  setGlobal 'ideSaveInitialDirectory' (getField picker 'currentDir')
+  ideAssert ((text (contents (getField picker 'nameField'))) == (filePart path)) 'native save dialog receives requested filename'
+  // The upstream picker currently starts in Downloads even when passed an
+  // absolute path. Navigate via its real folder method, as an interactive
+  // user does, rather than substituting a file picker or write primitive.
+  targetDir = (directoryPart path)
+  if (endsWith targetDir '/') { targetDir = (substring targetDir 1 ((count targetDir) - 1)) }
+  showFolder picker targetDir false
+  actualPath = (join (getField picker 'currentDir') '/' (text (contents (getField picker 'nameField'))))
+  ideAssert (actualPath == path) (join 'native save dialog path: ' actualPath)
+  writeFile (join (at (global 'ideTestConfig') 'output') '/save-dialog.png') (encodePNG (fullCostume pickerM))
+  // Invoke the real dialog's existing acceptance callback, not a file-boundary
+  // mock. The live native saveProject implementation does the actual write.
+  okay picker
+  setGlobal 'ideNativeSaveAccepted' true
+}
+
 to startup {
   i = (indexOf (commandLine) '--ide-test-config')
   config = (jsonParse (readFile (at (commandLine) (i + 1))))
   setGlobal 'ideTestConfig' config
+  result = (dictionary)
+  setGlobal 'ideTestResult' result
   setGlobal 'scale' 1
   setGlobal 'blockScale' 1
   // Same IDE initialization as openMicroBlocksEditor, without its infinite loop.
@@ -167,16 +179,21 @@ to startup {
   }
   ideAssert (largest >= 900) 'near-1KB real compiler chunk'
   ideAssert (total > 16384) 'multi-chunk compiled project exceeds 16KB'
+  atPut result 'compiled_bytes' total
+  atPut result 'largest_chunk_bytes' largest
   ideConnect rt (at config 'port')
   stopAndSyncScripts rt
   crcs = (ideCRCs rt)
+  atPut result 'chunk_count' (count crcs)
   startAll rt
   idePump rt 500
   ideAssert ((ideGetVar rt 'answer') == 41) 'function result is 41'
   ideAssert ((ideGetVar rt 'status') == 'running') 'string variable is running'
   history = (ideGetVar rt 'history')
+  atPut result 'observed_history' history
   ideAssert (notNil (findSubstring ', 20, 30]' history)) 'list initialized and indexed on board'
   counter1 = (ideGetVar rt 'counter')
+  atPut result 'observed_counter_start' counter1
   end = ((msecsSinceStart) + 20000)
   counter2 = counter1
   while (and (counter2 <= counter1) ((msecsSinceStart) < end)) {
@@ -184,16 +201,24 @@ to startup {
     waitForPing rt
     counter2 = (ideGetVar rt 'counter')
   }
-  ideAssert (counter2 > counter1) 'timer-paced counter advances'
+  atPut result 'observed_counter_end' counter2
+  ideAssert (counter2 > counter1) (join 'timer-paced counter advances: ' counter1 ' -> ' counter2)
   elapsed = (ideGetVar rt 'elapsed')
+  atPut result 'observed_elapsed_milliseconds' elapsed
   ideAssert (elapsed > 0) 'real timer reports positive elapsed milliseconds'
   sendStopAll rt
   idePump rt 100
   stopped1 = (ideGetVar rt 'counter')
   idePump rt 200
   stopped2 = (ideGetVar rt 'counter')
+  atPut result 'observed_counter_stopped' stopped2
   ideAssert (stopped1 == stopped2) 'stop freezes running script'
-  saveProject editor 'saved.ubp'
+  savePath = (join (at config 'output') '/saved.ubp')
+  launch page (newCommand 'ideAcceptSaveDialog' savePath)
+  saveProject editor savePath
+  ideAssert (true == (global 'ideNativeSaveAccepted')) 'native save dialog was accepted'
+  atPut result 'native_save_dialog_exercised' true
+  atPut result 'native_save_initial_directory' (global 'ideSaveInitialDirectory')
   saved = (readFile (join (at config 'output') '/saved.ubp'))
   ideAssert (saved == (codeString (project (scripter rt)))) 'real IDE saveProject writes current source'
   ideAssert (saveLoadTest (project (scripter rt))) 'IDE project save/load roundtrip'
@@ -219,6 +244,7 @@ to startup {
     if ((at crcs id) != (at editedCRCs id)) { changed += 1 }
   }
   ideAssert (changed == 1) 'incremental source edit changes exactly one compiled chunk'
+  atPut result 'incrementally_changed_chunks' changed
   startAll rt
   idePump rt 100
   ideAssert ((ideGetVar rt 'answer') == 42) 'incrementally compiled function result is 42'
@@ -249,7 +275,6 @@ to startup {
   ideAssert ((ideGetVar rt 'status') == 'running') 'roundtrip retains string variable'
   sendStopAll rt
 
-  result = (dictionary)
   atPut result 'status' 'PASS'
   atPut result 'compiled_bytes' total
   atPut result 'largest_chunk_bytes' largest
@@ -259,7 +284,9 @@ to startup {
   atPut result 'decompiled_source_exact' sourceExact
   atPut result 'original_script_count' originalScripts
   atPut result 'decompiled_script_count' recoveredScripts
-  atPut result 'native_browser_shell_shims' true
+  atPut result 'shared_native_compat' true
+  atPut result 'native_save_dialog_exercised' true
+  atPut result 'native_save_initial_directory' (global 'ideSaveInitialDirectory')
   atPut result 'readback_bytes_exact' true
   atPut result 'observed_counter_start' counter1
   atPut result 'observed_counter_end' counter2
