@@ -1,0 +1,221 @@
+From 665bf1ea40b8846a33f2c939f1d5c45525cdd34a Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Wed, 7 Oct 2026 03:09:29 +0000
+Subject: [PATCH] erbium: preserve Shakti UART streams under host backpressure
+
+Bound RX reads by the hardware FIFO capacity rather than consuming and dropping host bursts. Make borrowed stream fds nonblocking before I/O, replace select with bounded reads, and retain attachments across EOF and transient peer disconnects.
+
+Only retire TX bytes accepted by the host, preserving queued data and status across EINTR, EAGAIN, zero and partial writes. Suppress write-generated SIGPIPE per thread without altering socket backend signal policy. Report permanent descriptor errors explicitly; stream fullness is not a physical UART overrun.
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ sw-sysemu/devices/shakti_uart.h | 147 +++++++++++++++++++++++---------
+ 1 file changed, 105 insertions(+), 42 deletions(-)
+
+diff --git a/sw-sysemu/devices/shakti_uart.h b/sw-sysemu/devices/shakti_uart.h
+index 87deb2a..516b7c2 100644
+--- a/sw-sysemu/devices/shakti_uart.h
++++ b/sw-sysemu/devices/shakti_uart.h
+@@ -7,11 +7,15 @@
+ #define BEMU_SHAKTI_UART_H
+ 
+ #include <array>
++#include <algorithm>
+ #include <cerrno>
+ #include <cstdint>
++#include <fcntl.h>
++#include <pthread.h>
++#include <signal.h>
+ #include <system_error>
+ #include <unistd.h>
+-#include <sys/select.h>
++#include <sys/stat.h>
+ #include "agent.h"
+ #include "system.h"
+ #include "memory/memory_error.h"
+@@ -164,6 +168,15 @@ struct ShaktiUart : public MemoryRegion {
+         }
+     }
+ 
++    // Borrowed byte-stream attachments, not physical baud-clocked inputs.
++    // FIFO fullness backpressures the host; it is not a physical RX overrun.
++    // On first use we add O_NONBLOCK (also affects dup'd descriptors). The owner
++    // must not clear it while attached. No descriptor is closed by this device.
++    // EOF/EIO/EPIPE keep the attachment and queued bytes: a named FIFO writer
++    // or a PTY slave peer can reconnect while its master stays open. A new PTY
++    // pair requires the owner to attach new fds. Assigning -1 pauses that
++    // direction; attaching another fd resumes bytes, it does not reset FIFOs.
++    // Detach and poll before closing/reusing an fd number.
+     int tx_fd = -1;
+     int rx_fd = -1;
+ 
+@@ -182,8 +195,10 @@ private:
+ 
+     size_t tx_fifo_tail() const { return (tx_fifo_head + tx_fifo_count) % FIFO_DEPTH; }
+     size_t rx_fifo_tail() const { return (rx_fifo_head + rx_fifo_count) % FIFO_DEPTH; }
+-    bool     error_overrun = false;
+     bool     interrupt_asserted = false;
++    int configured_tx_fd = -1;
++    int configured_rx_fd = -1;
++    bool tx_can_sigpipe = false;
+ 
+     void sync_interrupt_line(const Agent& agent, bool poll_rx) {
+         if (poll_rx) poll_rx_fifo();
+@@ -220,9 +235,8 @@ private:
+         if (rx_fifo_count >= FIFO_DEPTH) {
+             status |= STATUS_RX_FULL;
+         }
+-        if (error_overrun) {
+-            status |= STATUS_OVERRUN;
+-        }
++        // Stream backpressure is intentionally distinct from a physical UART
++        // overrun. This attachment does not simulate parity/framing/overruns.
+         if (rx_threshold_reached()) {
+             status |= STATUS_RXFIFOTHRE;
+         }
+@@ -245,24 +259,76 @@ private:
+     }
+ 
+     void drain_tx_fifo() {
+-        if (tx_fifo_count == 0 || tx_fd == -1) return;
+-        uint8_t byte = tx_fifo[tx_fifo_head];
+-        tx_fifo_head = (tx_fifo_head + 1) % FIFO_DEPTH;
+-        --tx_fifo_count;
+-        // glibc marks write() warn_unused_result and a (void) cast does not
+-        // silence it under -Werror; a UART TX drop is not an error we care about.
+-        ssize_t rv = ::write(tx_fd, &byte, 1);
+-        (void) rv;
++        if (tx_fd == -1) {
++            configured_tx_fd = -1;
++            return;
++        }
++        if (tx_fifo_count == 0) return;
++        if (configured_tx_fd != tx_fd) {
++            make_nonblocking(tx_fd);
++            struct stat st;
++            int rv;
++            do { rv = ::fstat(tx_fd, &st); } while (rv < 0 && errno == EINTR);
++            if (rv < 0)
++                throw std::system_error(errno, std::generic_category(), "UART TX fstat");
++            tx_can_sigpipe = S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode);
++            configured_tx_fd = tx_fd;
++        }
++        // Only commit bytes the host accepted; a short write leaves the rest
++        // in the bounded guest FIFO, with TX_FULL/TX_EMPTY reflecting reality.
++        const size_t count = std::min(tx_fifo_count, FIFO_DEPTH - tx_fifo_head);
++        ssize_t rv;
++        do {
++            rv = write_tx_stream(&tx_fifo[tx_fifo_head], count);
++        } while (rv < 0 && errno == EINTR);
++        if (rv > 0) {
++            tx_fifo_head = (tx_fifo_head + static_cast<size_t>(rv)) % FIFO_DEPTH;
++            tx_fifo_count -= static_cast<size_t>(rv);
++        } else if (rv < 0 && !stream_unavailable(errno)) {
++            throw std::system_error(errno, std::generic_category(), "UART TX write");
++        }
+     }
+ 
+-    bool rx_fifo_push(uint8_t value) {
+-        if (rx_fifo_count >= FIFO_DEPTH) {
+-            error_overrun = true;
+-            return false;
++    static void make_nonblocking(int fd) {
++        int flags;
++        do { flags = ::fcntl(fd, F_GETFL); } while (flags < 0 && errno == EINTR);
++        if (flags >= 0 && (flags & O_NONBLOCK)) return;
++        int rv = -1;
++        if (flags >= 0) {
++            do { rv = ::fcntl(fd, F_SETFL, flags | O_NONBLOCK); }
++            while (rv < 0 && errno == EINTR);
+         }
+-        rx_fifo[rx_fifo_tail()] = value;
+-        ++rx_fifo_count;
+-        return true;
++        if (rv < 0)
++            throw std::system_error(errno, std::generic_category(), "UART O_NONBLOCK");
++    }
++
++    static bool stream_unavailable(int error) {
++        return error == EAGAIN || error == EWOULDBLOCK ||
++               error == EIO || error == EPIPE || error == ENXIO;
++    }
++
++    ssize_t write_tx_stream(const uint8_t* data, size_t count) {
++        if (!tx_can_sigpipe) return ::write(tx_fd, data, count);
++        // Standalone sysemu does not necessarily ignore SIGPIPE. Suppress only
++        // this write's signal, without changing process-wide signal handlers
++        // or consuming a SIGPIPE that was already pending on this thread.
++        sigset_t mask, old_mask, pending;
++        ::sigemptyset(&mask);
++        ::sigaddset(&mask, SIGPIPE);
++        const int error = ::pthread_sigmask(SIG_BLOCK, &mask, &old_mask);
++        if (error != 0)
++            throw std::system_error(error, std::generic_category(), "UART SIGPIPE mask");
++        ::sigpending(&pending);
++        const bool was_pending = ::sigismember(&pending, SIGPIPE) == 1;
++        const ssize_t rv = ::write(tx_fd, data, count);
++        const int saved_errno = errno;
++        if (rv < 0 && saved_errno == EPIPE && !was_pending) {
++            const struct timespec timeout = {0, 0};
++            while (::sigtimedwait(&mask, nullptr, &timeout) < 0 && errno == EINTR) {}
++        }
++        ::pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
++        errno = saved_errno;
++        return rv;
+     }
+ 
+     bool rx_fifo_pop(uint8_t& value) {
+@@ -276,31 +342,28 @@ private:
+     }
+ 
+     void poll_rx_fifo() {
+-        while (true) {
+-            uint8_t value = 0;
+-            const int result = read_rx_byte_nonblocking(value);
+-            if (result != 1) {
+-                break;
++        if (rx_fd == -1) {
++            configured_rx_fd = -1;
++            return;
++        }
++        if (rx_fifo_count == FIFO_DEPTH) return;
++        if (configured_rx_fd != rx_fd) {
++            make_nonblocking(rx_fd);
++            configured_rx_fd = rx_fd;
++        }
++        while (rx_fifo_count < FIFO_DEPTH) {
++            const size_t tail = rx_fifo_tail();
++            const size_t count = std::min(FIFO_DEPTH - rx_fifo_count, FIFO_DEPTH - tail);
++            ssize_t rv = ::read(rx_fd, &rx_fifo[tail], count);
++            if (rv > 0) {
++                rx_fifo_count += static_cast<size_t>(rv);
++            } else if (rv == 0 || (rv < 0 && stream_unavailable(errno))) {
++                return;
++            } else if (errno != EINTR) {
++                throw std::system_error(errno, std::generic_category(), "UART RX read");
+             }
+-            (void)rx_fifo_push(value);
+         }
+     }
+-
+-    int read_rx_byte_nonblocking(uint8_t& value) {
+-        if (rx_fd == -1) return 0;
+-
+-        fd_set rfds;
+-        struct timeval tv = {0, 0};
+-        FD_ZERO(&rfds);
+-        FD_SET(rx_fd, &rfds);
+-        if (select(rx_fd + 1, &rfds, nullptr, nullptr, &tv) <= 0)
+-            return 0;
+-
+-        ssize_t r = ::read(rx_fd, &value, 1);
+-        if (r == 1) { return 1; }
+-        if (r == 0) { rx_fd = -1; return 0; }
+-        return -1;
+-    }
+ };
+ 
+ 
+-- 
+2.43.0
+
