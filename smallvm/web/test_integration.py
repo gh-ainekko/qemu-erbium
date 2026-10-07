@@ -222,6 +222,17 @@ async def run(args):
                     assert r.status == 404, (path, r.status)
             for filename in ("uart-client-to-emulator.bin", "uart-emulator-to-client.bin"):
                 assert (server.output / filename).stat().st_size > 0
+            # Simulate systemd stopping both the server and its child while an
+            # idle UART remains open. No shutdown-time auto-restart is allowed.
+            ws = await client.ws_connect(base + "/uart")
+            os.kill(server.pid, signal.SIGTERM)
+            server.proc.send_signal(signal.SIGTERM)
+            message = await ws.receive(timeout=5)
+            assert message.type == aiohttp.WSMsgType.CLOSE and message.data == 1001, message
+            await asyncio.to_thread(server.proc.wait, 10)
+            assert not alive(server.pid)
+            events = [json.loads(line) for line in (server.output / "events.jsonl").read_text().splitlines()]
+            assert sum(event["kind"] == "spawn" for event in events) == 3
         if args.echo_elf:
             async with Server(args, args.echo_elf, "echo") as server:
                 # Startup READY is captured while unattached; drain before attaching.

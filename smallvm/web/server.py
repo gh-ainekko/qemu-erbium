@@ -329,8 +329,10 @@ class Session:
                 raise
 
     async def watch(self):
-        while True:
+        while not self.stopping:
             await asyncio.sleep(.25)
+            if self.stopping:
+                return
             if self.wire.error:
                 raise RuntimeError("UART I/O failed") from self.wire.error
             for task in self.log_tasks:
@@ -537,6 +539,18 @@ def make_app(repo, logs, web_root=None, assets=None, elf=None, emu=None, on_fata
             await session.close()
 
     app.cleanup_ctx.append(lifetime)
+    async def shutdown(app):
+        session = app.get(SESSION)
+        if session:
+            # systemd signals the whole cgroup, including the child. Do not
+            # auto-restart it while aiohttp is draining active HTTP handlers.
+            session.stopping = True
+            async with session.lock:
+                session.wire.enabled = False
+                session.wire.update()
+                await session.unplug(code=1001)
+
+    app.on_shutdown.append(shutdown)
     app.on_response_prepare.append(response_headers)
     app.router.add_get("/api/status", status)
     app.router.add_post("/api/reset", reset)
