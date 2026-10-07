@@ -6,14 +6,15 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from aiohttp import WSMessage, WSMsgType
 from aiohttp.test_utils import make_mocked_request
 from aiohttp import web
 from multidict import CIMultiDict
 
-from server import Capture, CHUNK, LIMIT, UART, close_websocket, same_origin
+from server import (Capture, CHUNK, LIMIT, Session, UART, boundary,
+                    close_websocket, response_headers, same_origin)
 
 
 class Origins(unittest.TestCase):
@@ -65,6 +66,67 @@ class BinaryClient:
     async def __aiter__(self):
         for offset in range(0, len(self.payload), CHUNK):
             yield WSMessage(WSMsgType.BINARY, self.payload[offset:offset + CHUNK], "")
+
+
+class Boundary(unittest.IsolatedAsyncioTestCase):
+    async def test_cross_site_top_level_static_navigation(self):
+        headers = {
+            "Host": "localhost:8001", "Sec-Fetch-Site": "cross-site",
+            "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document",
+        }
+        for method in ("GET", "HEAD"):
+            for path in ("/", "/index.html", "/erbium.js", "/assets/gp_wasm.js"):
+                with self.subTest(method=method, path=path):
+                    request = make_mocked_request(method, path, headers=headers)
+                    handler = AsyncMock(return_value=web.Response(text="static"))
+                    response = await boundary(request, handler)
+                    self.assertEqual(response.status, 200)
+                    handler.assert_awaited_once_with(request)
+                    await response_headers(request, response)
+                    self.assertEqual(response.headers["X-Frame-Options"], "SAMEORIGIN")
+                    self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+                    self.assertEqual(response.headers["Referrer-Policy"], "same-origin")
+
+    async def test_cross_site_controls_stay_protected(self):
+        for method, path in (("GET", "/uart"), ("GET", "/api/status"),
+                             ("HEAD", "/api/status"), ("POST", "/api/reset"),
+                             ("POST", "/")):
+            with self.subTest(method=method, path=path):
+                request = make_mocked_request(method, path, headers={
+                    "Host": "localhost:8001", "Sec-Fetch-Site": "cross-site",
+                })
+                handler = AsyncMock()
+                with self.assertRaises(web.HTTPForbidden):
+                    await boundary(request, handler)
+                handler.assert_not_awaited()
+
+
+class Supervisor(unittest.IsolatedAsyncioTestCase):
+    async def test_watch_exception_observed_and_fatal_callback_invoked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            # Exercise the real watchdog/callback without requiring a firmware
+            # build or starting a child process in this unit test.
+            session = Session.__new__(Session)
+            session.wire = UART(Path(temp))
+            session.stopping, session.failure = False, None
+            session.proc, session.log_tasks = None, []
+            session.on_fatal = Mock()
+            session.spawn = AsyncMock()
+            try:
+                await session.start()
+                session.wire.error = OSError("injected capture failure")
+                with self.assertLogs(level="ERROR"):
+                    await asyncio.wait_for(
+                        asyncio.gather(session.watch_task, return_exceptions=True), 2)
+                self.assertTrue(session.watch_task.done())
+                self.assertIsInstance(session.watch_task.exception(), RuntimeError)
+                self.assertEqual(session.failure, "UART I/O failed")
+                self.assertFalse(session.wire.enabled)
+                session.on_fatal.assert_called_once_with()
+            finally:
+                session.watch_task.cancel()
+                await asyncio.gather(session.watch_task, return_exceptions=True)
+                session.wire.close()
 
 
 class Wire(unittest.IsolatedAsyncioTestCase):

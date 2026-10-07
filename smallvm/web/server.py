@@ -353,7 +353,7 @@ class Session:
 
     def fail(self, exc):
         already_failed = self.failure is not None
-        self.failure = str(exc)
+        self.failure = str(exc) or type(exc).__name__
         self.wire.enabled = False
         self.wire.update()
         logging.error("UART supervisor failed: %s", exc)
@@ -432,8 +432,14 @@ def same_origin(request):
 
 @web.middleware
 async def boundary(request, handler):
-    # Check every route, not just WS; POST reset must not be CSRF-able.
-    same_origin(request)
+    # A user following an IDE link from another site legitimately sends
+    # Sec-Fetch-Site: cross-site. Static GET/HEAD requests are read-only and
+    # need no Origin check; the private proxy still authenticates the caller.
+    # Keep all APIs and UART strict (including GET/HEAD), and protect every
+    # non-read-only method against CSRF.
+    if (request.method not in ("GET", "HEAD") or request.path == "/uart"
+            or request.path.startswith("/api/")):
+        same_origin(request)
     return await handler(request)
 
 
@@ -576,11 +582,22 @@ def main():
         parser.error("port must be between 1024 and 65535")
     # CLI and service both use the distro interpreter/aiohttp, no network deps.
     os.umask(0o077)
+    failed = False
+
+    def fatal():
+        nonlocal failed
+        failed = True
+        # aiohttp's signal handler closes sockets, PTYs and owned children.
+        # After cleanup, return nonzero so systemd Restart=on-failure applies.
+        os.kill(os.getpid(), signal.SIGTERM)
+
     web.run_app(make_app(
         args.repo, args.logs or args.repo / "build/smallvm-web/current",
         args.web, args.assets, args.elf, args.emu,
-        on_fatal=lambda: os.kill(os.getpid(), signal.SIGTERM),
+        on_fatal=fatal,
     ), host="127.0.0.1", port=args.port, shutdown_timeout=5)
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

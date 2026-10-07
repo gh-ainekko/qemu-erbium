@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import resource
 import signal
 import socket
 import subprocess
@@ -95,6 +96,7 @@ class Server:
         self.output = args.output / name / str(time.time_ns())
         self.output.mkdir(parents=True, exist_ok=True)
         self.pid = None
+        self.expected_exit = 0
 
     async def __aenter__(self):
         # An occupied port is a hard error, not permission to reset its owner.
@@ -136,7 +138,7 @@ class Server:
             raise AssertionError("server failed graceful shutdown")
         finally:
             self.handle.close()
-        assert self.proc.returncode == 0, f"server exit {self.proc.returncode}"
+        assert self.proc.returncode == self.expected_exit, f"server exit {self.proc.returncode}"
         assert not self.pid or not alive(self.pid), "owned emulator leaked on shutdown"
 
 
@@ -151,6 +153,20 @@ async def run(args):
             result["initial"] = initial
             assert initial["emulator_running"] and not initial["connected"]
             assert initial["firmware_sha256"] == hashlib.sha256(args.elf.read_bytes()).hexdigest()
+            # A link clicked from chat is a legitimate cross-site document
+            # navigation. Static GET/HEAD must work, with framing policy intact.
+            navigation_headers = {
+                "Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Dest": "document",
+            }
+            for method in ("GET", "HEAD"):
+                async with client.request(method, base + "/", headers=navigation_headers) as r:
+                    assert r.status == 200
+                    assert r.headers["X-Frame-Options"] == "SAMEORIGIN"
+            for method, path in (("GET", "/api/status"), ("POST", "/api/reset")):
+                async with client.request(method, base + path, headers=navigation_headers) as r:
+                    assert r.status == 403
+            await denied_ws(client, base, 403, headers=navigation_headers)
             # Test native localhost tools, browser origin, and forwarded proxy origin.
             for origin in ("null", "https://evil.example", base + "/invalid"):
                 await denied_ws(client, base, 403, headers={"Origin": origin})
@@ -264,6 +280,20 @@ async def run(args):
                 assert (server.output / "uart-client-to-emulator.bin").read_bytes() == payload
                 assert (server.output / "uart-emulator-to-client.bin").read_bytes().endswith(payload)
                 result.update(echo_bytes=len(payload), echo_final=final)
+                # Force a real capture I/O failure in this isolated server,
+                # without filling the VM disk. The watchdog must be observed,
+                # close/reap the session, and exit nonzero for systemd restart.
+                ws = await server.client.ws_connect(server.base + "/uart")
+                resource.prlimit(server.proc.pid, resource.RLIMIT_FSIZE, (8192, 8192))
+                server.expected_exit = 1
+                await ws.send_bytes(b"capture-failure")
+                message = await ws.receive(timeout=10)
+                assert message.type == aiohttp.WSMsgType.CLOSE and message.data == 1001, message
+                await asyncio.to_thread(server.proc.wait, 10)
+                assert server.proc.returncode == 1
+                assert not alive(server.pid)
+                assert "UART supervisor failed" in (server.output / "server.log").read_text()
+                result["fatal_watch_exit"] = server.proc.returncode
         result["status"] = "PASS"
     finally:
         result["elapsed_seconds"] = round(time.monotonic() - started, 3)
