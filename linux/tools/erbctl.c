@@ -12,6 +12,7 @@
  *   erbctl reset                        99h chip reset
  *   erbctl hold                       CPU warm-reset hold (preserves MRAM)
  *   erbctl load ELF [--verify] [--start | --check] [--mtd /dev/mtd0]
+ *   erbctl console [TTY] [--baud N]     direct UART (default /dev/ttyAMA1)
  *   erbctl job <word> [timeout_ms]      write Mailbox0, wait for Mailbox1 != 0
  */
 #include <errno.h>
@@ -26,6 +27,7 @@
 #include <unistd.h>
 #include "erbium-xspi.h"
 #include "erbium-loader.h"
+#include "erbium-console.h"
 
 static int fd;
 
@@ -99,12 +101,16 @@ int main(int argc, char **argv)
 		i = 3;
 	}
 	if (i >= argc) {
-		fprintf(stderr, "usage: erbctl [-d dev] info|reg|mem|memw|mem32|sfdp|rates|reset|job|hold|load ...\n");
+		fprintf(stderr, "usage: erbctl [-d dev] info|reg|mem|memw|mem32|sfdp|rates|reset|job|hold|load|console ...\n"
+			"  console [TTY (default /dev/ttyAMA1)] [--baud N (default 115200)]\n"
+			"  Direct UART; Ctrl-] exits on terminal stdin (pipe input is binary).\n");
 		return 2;
 	}
 	const char *cmd = argv[i++];
 	int rem = argc - i;
 	char **a = argv + i;
+	if (!strcmp(cmd, "console"))
+		return erbctl_console(rem, a);
 	if (!strcmp(cmd, "load"))
 		return erbctl_load(dev, rem, a);
 	if (!strcmp(cmd, "hold") && rem == 0)

@@ -47,8 +47,10 @@ def setUpModule():
     try:
         for target, sources in (
             (NATIVE, [ROOT / "linux/tools/erbctl.c",
-                      ROOT / "linux/tools/erbium-loader.c"]),
-            (MOCK, [ROOT / "tests/erbctl_mock.c"]),
+                      ROOT / "linux/tools/erbium-loader.c",
+                      ROOT / "linux/tools/erbium-console.c"]),
+            (MOCK, [ROOT / "tests/erbctl_mock.c",
+                    ROOT / "linux/tools/erbium-console.c"]),
         ):
             result = subprocess.run(
                 common + [str(p) for p in sources] + ["-o", str(target)],
