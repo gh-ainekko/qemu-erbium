@@ -13,9 +13,9 @@ command -v ccache >/dev/null && export CC="ccache gcc" CXX="ccache g++" || true
 
 build_qemu() {
   mkdir -p "$R/ext/qemu/build"
-  if [ ! -f "$R/ext/qemu/build/config.status" ]; then
-    (cd "$R/ext/qemu/build" && ../configure --target-list=aarch64-softmmu --prefix="$R/dist" \
+  local -a configure=(../configure --target-list=aarch64-softmmu --prefix="$R/dist" \
       --enable-fdt --disable-docs --disable-werror --enable-slirp --enable-gcrypt \
+      --enable-attr --enable-virtfs \
       --disable-gtk --disable-sdl --disable-vnc --disable-spice --disable-opengl \
       --disable-virglrenderer --disable-gnutls --disable-nettle --disable-libssh --disable-curl \
       --disable-libnfs --disable-libiscsi --disable-rbd --disable-glusterfs --disable-smartcard \
@@ -25,11 +25,29 @@ build_qemu() {
       --disable-pa --disable-pipewire --disable-oss --disable-jack --disable-sndio \
       --disable-vhost-user --disable-vhost-net --disable-vhost-kernel --disable-vhost-vdpa \
       --disable-libvduse --disable-vduse-blk-export --disable-user --disable-linux-user \
-      --disable-bsd-user --disable-tpm --disable-seccomp --disable-cap-ng --disable-attr \
+      --disable-bsd-user --disable-tpm --disable-seccomp --disable-cap-ng \
       --disable-linux-aio --disable-linux-io-uring --disable-numa --disable-rdma --disable-vde \
       --disable-netmap --disable-libudev --disable-mpath --disable-l2tpv3 --disable-af-xdp \
-      --disable-debug-info ${QEMU_CONFIGURE_EXTRA:-} > "$R/build/qemu-configure.log" 2>&1) \
+      --disable-debug-info)
+  local -a extra=()
+  # QEMU_CONFIGURE_EXTRA is a whitespace-separated list of extra arguments.
+  read -r -a extra <<< "${QEMU_CONFIGURE_EXTRA:-}"
+  configure+=("${extra[@]}")
+  local fingerprint stamp="$R/ext/qemu/build/.erbium-configure.sha256"
+  fingerprint=$(printf '%s\0' "${configure[@]}" "${CC:-}" "${CXX:-}" | sha256sum)
+  fingerprint=${fingerprint%% *}
+  # config.status alone would retain flags from older builds (notably disabled
+  # virtfs). This QEMU generates CONFIG_VIRTFS in config-host.h, not .mak.
+  if [ ! -f "$R/ext/qemu/build/config.status" ] ||
+     [ "$(cat "$stamp" 2>/dev/null || true)" != "$fingerprint" ] ||
+     ! grep -Eq '^#define CONFIG_VIRTFS( 1)?$' "$R/ext/qemu/build/config-host.h" 2>/dev/null; then
+    (cd "$R/ext/qemu/build" && "${configure[@]}" > "$R/build/qemu-configure.log" 2>&1) \
       || { tail -30 "$R/build/qemu-configure.log"; exit 1; }
+    grep -Eq '^#define CONFIG_VIRTFS( 1)?$' "$R/ext/qemu/build/config-host.h" || {
+      echo "QEMU VirtFS support is required; do not disable virtfs in QEMU_CONFIGURE_EXTRA." >&2
+      exit 1
+    }
+    printf '%s\n' "$fingerprint" > "$stamp"
   fi
   ninja -C "$R/ext/qemu/build" -j"$J" qemu-system-aarch64 tests/qtest/erbium-xspi-test
   ninja -C "$R/ext/qemu/build" install >/dev/null
