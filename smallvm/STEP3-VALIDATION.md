@@ -17,6 +17,11 @@ The frozen-source browser run **PASS** is
 `build/smallvm/web-tests/final-pass/result.json` (Chromium, 50.432 seconds).
 It verifies source/asset immutability and matching build provenance, not just
 successful page loading.
+The final committed harness also passed a repeat run at
+`build/smallvm/web-tests/final-repeat/result.json` in **48.869 seconds**;
+all recorded source and served-asset hashes still match the checked-in code
+and deployed assets. That run explicitly records the board results
+**41 → 42 → 42** for original, edited and recovered programs.
 
 | Check | Result |
 | --- | --- |
