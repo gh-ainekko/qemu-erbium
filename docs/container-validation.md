@@ -66,3 +66,29 @@ copied committed source into a new container and invoked `./bootstrap.sh` with
 No additional code fixes were required. The complete build and serial-output
 logs are saved locally as `build/container-test/build.log` and
 `build/container-test/runtime.log`; the script regenerates these on each run.
+
+## Host ELF loading / CPU hold-start — 2026-10-07
+
+Ran `J=2 scripts/test-pristine-docker.sh` against immutable source snapshot
+`249f5b35e4a0a980b59676e1400879631048b0bf`, with the Ubuntu 24.04 digest above.
+The full build and binary-only runtime driver exited **0**.
+
+Both containers booted Linux and passed the mailbox-worker suite and the new
+host ELF upload/verify/start/reload suite. The latter starts with empty MRAM,
+`--start-held`, and **no backend ELF preload**, then requires a RISC-V mailbox
+response after Linux uploads the image via xSPI. The runtime container also
+booted/passed the stub guest suite.
+
+The build container additionally passed 154 native ELF/fault tests, 28 source
+update tests, eight preflight/runtime checks, real Kconfig refresh/optional-ELF
+checks, and the backend reset suite (including pipelined requests, debug hold
+exclusion and firmware-triggered debug reset with four harts).
+
+An earlier binary-only attempt exposed a pre-existing mailbox qtest race: it
+read the worker's startup marker immediately after asynchronous chip reset.
+QEMU patch 0008 now waits with a bounded timeout and checks the exact marker
+instead of accepting any nonzero value. The fresh rerun above includes that fix.
+
+Recorded outputs include `ERBIUM-TEST-RESULT 0`,
+`ERBIUM-LOAD-TEST-RESULT 0`, and `Binary-only container tests PASSED`.
+Logs/artifacts remain under `build/container-test/` until the next run.

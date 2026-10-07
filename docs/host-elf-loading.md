@@ -182,3 +182,13 @@ python3 et-platform/sw-sysemu/tests/erbium/host/test_cpu_reset.py \
   --emu build/sw-sysemu/erbium_emu
 scripts/run-e2e.sh
 ```
+
+### Pristine-container result
+
+`J=2 scripts/test-pristine-docker.sh` passed from committed snapshot
+`249f5b35e4a0a980b59676e1400879631048b0bf`, including the full build and a separate
+binary-only Ubuntu 24.04 container. Both executed the host-load/reload fixture
+through Linux/QEMU/xSPI with empty initial MRAM; all test markers were zero.
+See `container-validation.md` for details. The suite also found/fixed an older
+qtest startup race: it now waits for the mailbox worker's exact ready marker
+rather than assuming firmware has run immediately after chip reset.
