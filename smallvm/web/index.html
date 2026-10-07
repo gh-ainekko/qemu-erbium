@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en-us">
+	<head>
+		<title>MicroBlocks — Erbium</title>
+		<base href="/assets/">
+		<!-- Upstream MicroBlocks HTML, MPL-2.0; Erbium shell additions Apache-2.0. -->
+		<meta charset="utf-8">
+		<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+		<meta name="apple-mobile-web-app-capable" content="yes">
+		<meta name="mobile-web-app-capable" content="yes">
+
+		<link rel="manifest" href="manifest.json">
+		<link rel="icon" href="favicon.ico" type="image/x-icon" />
+		<link rel="apple-touch-icon" href="icons/Bunny512.png">
+
+		<meta name="theme-color" content="white"/>
+		<meta name="apple-mobile-web-app-capable" content="yes">
+		<meta name="apple-mobile-web-app-status-bar-style" content="black">
+		<meta name="apple-mobile-web-app-title" content="MicroBlocks">
+		<meta name="msapplication-TileImage" content="icons/Bunny192.png">
+		<meta name="msapplication-TileColor" content="#FFFFFF">
+
+		<!-- Styles -->
+		<link rel="stylesheet" href="styles/config/_config.css">
+		<link rel="stylesheet" href="styles/generic/minireset.css">
+		<link rel="stylesheet" href="styles/generic/_body.css">
+		<link rel="stylesheet" href="styles/generic/_button.css">
+		<link rel="stylesheet" href="styles/components/_app-preloader.css">
+		<link rel="stylesheet" href="styles/components/_buttons.css">
+		<link rel="stylesheet" href="styles/components/_categories-libraries.css">
+		<link rel="stylesheet" href="styles/components/_ide.css">
+		<link rel="stylesheet" href="styles/components/_menus.css">
+		<link rel="stylesheet" href="styles/components/_scripts-pane-controls.css">
+		<link rel="stylesheet" href="styles/components/_tips.css">
+		<link rel="stylesheet" href="styles/components/_top-bar.css">
+		<link rel="stylesheet" href="styles/components/_window.css">
+		<link rel="stylesheet" href="styles/components/_overlay.css">
+		<link rel="stylesheet" href="styles/components/_wysiwyg.css">
+		<link rel="stylesheet" href="styles/utilities/_drag.css">
+
+		<!-- Developer tools. Disable on live instances -->
+
+
+		<!-- Localization -->
+		<script type="text/javascript" src="gettext.js" defer></script>
+
+		<!-- Window Components -->
+		<script type="text/javascript" src="windows.js" defer></script>
+		<script type="text/javascript" src="graph.js" defer></script>
+
+		<!-- Firmware upload support -->
+		<script type="text/javascript" src="lib/usbDfuDevice.js" defer></script>
+		<script type="text/javascript" src="flasher.js" defer></script>
+
+	<style>
+            .erbium-top { flex-shrink: 0; height: 92px; }
+            #erbium-toolbar { height: 44px; display: flex; gap: 12px; align-items: center; padding: 0 12px; color: #ecedf1; background: #202536; font: 14px system-ui,sans-serif; }
+            #erbium-toolbar button { color: #202536; background: #ecedf1; padding: 5px 10px; border-radius: 4px; cursor: pointer; }
+            #erbium-toolbar button:disabled { opacity: .45; cursor: default; }
+            #erbium-status { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+            .workspace { height: calc(100vh - 92px - 32px); }
+        </style>
+    </head>
+
+	<body oncontextmenu="return false;">
+
+
+		<!-- FileUploader -->
+		<input type="file" id="FileUploader" multiple style="display:none">
+
+
+		<!-- Loader -->
+		<div class="app-preloader" data-ide="app-preloader">
+			<div class="app-preloader__contents">
+				<img class="app-preloader__logo" src="img/logo-preloader.svg" alt="MicroBlocks and Rosa logo">
+				<div class="app-preloader__spinner"></div>
+			</div>
+			<p class="app-preloader__text">Loading</p>
+		</div>
+
+
+		<!-- Emcripten -->
+		<div class="spinner" id="spinner"></div>
+		<div class="emscripten" id="status"></div>
+		<div class="emscripten">
+			<progress value="0" max="100" id="progress" hidden="1"></progress>
+		</div>
+
+
+		<!-- IDE -->
+		<div class="ide" data-ide="ide">
+
+			<div class="erbium-top" data-ide="top-bar">
+                <section id="erbium-toolbar" aria-label="Erbium virtual board">
+                    <strong>Erbium sysemu</strong>
+                    <button id="erbium-connect" disabled>Connect</button>
+                    <button id="erbium-disconnect" disabled>Disconnect</button>
+                    <button id="erbium-reset" disabled title="Restart firmware; board storage is volatile">Reset board</button>
+                    <button id="erbium-example" disabled title="Replace the editor project with the no-peripheral example">Load example</button>
+                    <span id="erbium-status" role="status" aria-live="polite">Loading real MicroBlocks IDE…</span>
+                </section>
+                <nav class="top-bar">
+
+				<a href="https://microblocks.fun/" target="_blank" class="top-bar__logo" aria-label="MicroBlocks website">
+					<img src="img/microblocks-ide-logo.svg" alt="">
+				</a>
+
+				<div class="top-bar__main-menu" data-ide="main-menu"></div>
+
+				<div class="top-bar__title" data-ide="title"></div>
+
+				<div class="top-bar__controls" data-ide="controls">
+					<div class="top-bar__controls-progress" data-ide="progress"></div>
+				</div>
+
+			</nav>
+            </div>
+
+			<div class="workspace" data-ide="workspace">
+
+				<div class="workspace__left" data-ide="workspace-left">
+					<div class="categories">
+						<div class="categories__list" data-ide="categories-list"></div>
+					</div>
+					<div class="libraries">
+						<h2 class="libraries__title"><l->LIBRARIES</l-></h2>
+						<nav class="libraries__add-button-wrapper">
+							<button class="button-rounded libraries__add-button" onclick="GP.apiCall('ide.showLibraryDialog');">
+								<l->Add Library</l->
+								<span class="libraries__add-button-icon">
+									<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+										<path d="M8 4C8.27614 4 8.5 4.22386 8.5 4.5V7.5H11.5C11.7761 7.5 12 7.72386 12 8C12 8.27614 11.7761 8.5 11.5 8.5H8.5V11.5C8.5 11.7761 8.27614 12 8 12C7.72386 12 7.5 11.7761 7.5 11.5V8.5H4.5C4.22386 8.5 4 8.27614 4 8C4 7.72386 4.22386 7.5 4.5 7.5H7.5V4.5C7.5 4.22386 7.72386 4 8 4Z" fill="currentColor"/>
+									</svg>
+								</span>
+							</button>
+						</nav>
+						<div class="libraries__list" data-ide="libraries-list"></div>
+					</div>
+					<button class="workspace__collapse-left-btn" data-ide="collapse-left-btn" aria-label="Expand and collapse left bar">
+						<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+							<path d="M1 8C1 8.27614 1.22386 8.5 1.5 8.5H13.2929L10.1464 11.6464C9.95118 11.8417 9.95118 12.1583 10.1464 12.3536C10.3417 12.5488 10.6583 12.5488 10.8536 12.3536L14.8536 8.35355C15.0488 8.15829 15.0488 7.84171 14.8536 7.64645L10.8536 3.64645C10.6583 3.45118 10.3417 3.45118 10.1464 3.64645C9.95118 3.84171 9.95118 4.15829 10.1464 4.35355L13.2929 7.5H1.5C1.22386 7.5 1 7.72386 1 8Z" fill="currentColor"/>
+						</svg>
+					</button>
+				</div>
+
+				<div class="emscripten workspace__canvas-wrapper">
+					<canvas id="canvas" class="emscripten" width="100px" height="100px"></canvas>
+					<div class="scripts-pane-controls --can-drag-through" data-ide="scripts-pane-controls"></div>
+				</div>
+
+			</div>
+
+			<div class="bottom-bar" data-ide="bottom-bar">
+				<div class="tips" data-ide="tips-container"></div>
+			</div>
+
+			<div class="menu-container" data-ide="menu-container"></div>
+
+			<div class="overlay" data-ide="overlay">
+				<div class="overlay__contents">
+					<div class="overlay__spinner" data-ide="overlay-spinner"></div>
+					<h2 class="overlay__title" data-ide="overlay-title"></h2>
+					<h3 class="overlay__subtitle" data-ide="overlay-subtitle"></h3>
+					<span class="overlay__note" data-ide="overlay-note"></span>
+				</div>
+			</div>
+
+		</div>
+
+
+		<!-- Functional JS -->
+		<script type="text/javascript" src="emModule.js"></script>
+		<script type="text/javascript" src="gpSupport.js"></script>
+		<script type="text/javascript" src="FileSaver.js"></script>
+		<script src="/erbium.js"></script>
+		<script type="text/javascript" src="gp_wasm.js"></script>
+
+
+		<!-- IDE -->
+		<script type="text/javascript" src="ide.js"></script>
+		<script type="text/javascript" src="menus.js"></script>
+		<script type="text/javascript" src="buttons.js"></script>
+		<script type="text/javascript" src="categories.js"></script>
+
+		<!-- GP Init -->
+		<script>
+			// emitted by GP (MicroBlocksEditor.gp → openMicroBlocksEditor)
+			document.addEventListener('ready', () => { IDE.init(); });
+		</script>
+
+
+	</body>
+</html>
