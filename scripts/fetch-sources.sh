@@ -15,13 +15,7 @@ LINUX_VER=${LINUX_VER:-6.12.48}
 BUSYBOX_DEB=${BUSYBOX_DEB:-http://ports.ubuntu.com/pool/main/b/busybox/busybox-static_1.36.1-6ubuntu3.1_arm64.deb}
 
 git_at() { # dir url sha branch patchdir
-  local dir=$1 url=$2 sha=$3 branch=$4 patches=$5
-  if [ -d "$dir/.git" ]; then echo "$dir: present"; return; fi
-  mkdir -p "$dir"; git -C "$dir" init -q; git -C "$dir" remote add origin "$url"
-  git -C "$dir" fetch -q --depth 1 origin "$sha"
-  git -C "$dir" checkout -q -b "$branch" FETCH_HEAD
-  git -C "$dir" -c user.name=erbium-bootstrap -c user.email=bootstrap@erbium.local am -q "$patches"/*.patch
-  echo "$dir: $(git -C "$dir" log --oneline | wc -l) commits on $branch"
+  "$R/scripts/sync-git-patches.sh" "$@"
 }
 
 git_at "$R/ext/qemu" "$QEMU_URL" "$QEMU_SHA" erbium "$R/qemu-patches"
