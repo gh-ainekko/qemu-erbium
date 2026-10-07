@@ -12,7 +12,7 @@
  *   erbctl reset                        99h chip reset
  *   erbctl hold                       CPU warm-reset hold (preserves MRAM)
  *   erbctl load ELF [--verify] [--start | --check] [--mtd /dev/mtd0]
- *   erbctl console [TTY] [--baud N]     direct UART (default /dev/ttyAMA1)
+ *   erbctl console [TTY] [--baud N] [--load ELF [--mtd PATH]]
  *   erbctl job <word> [timeout_ms]      write Mailbox0, wait for Mailbox1 != 0
  */
 #include <errno.h>
@@ -103,6 +103,7 @@ int main(int argc, char **argv)
 	if (i >= argc) {
 		fprintf(stderr, "usage: erbctl [-d dev] info|reg|mem|memw|mem32|sfdp|rates|reset|job|hold|load|console ...\n"
 			"  console [TTY (default /dev/ttyAMA1)] [--baud N (default 115200)]\n"
+			"          [--load ELF [--mtd PATH]] (attach, verify, then start)\n"
 			"  Direct UART; Ctrl-] exits on terminal stdin (pipe input is binary).\n");
 		return 2;
 	}
@@ -110,7 +111,7 @@ int main(int argc, char **argv)
 	int rem = argc - i;
 	char **a = argv + i;
 	if (!strcmp(cmd, "console"))
-		return erbctl_console(rem, a);
+		return erbctl_console(dev, rem, a);
 	if (!strcmp(cmd, "load"))
 		return erbctl_load(dev, rem, a);
 	if (!strcmp(cmd, "hold") && rem == 0)

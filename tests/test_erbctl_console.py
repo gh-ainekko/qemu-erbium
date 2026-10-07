@@ -22,46 +22,116 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 _build = None
-NATIVE = HARNESS = None
+NATIVE = HARNESS = FAKE = FAKE_HARNESS = None
 
 
 def setUpModule():
-    global _build, NATIVE, HARNESS
+    global _build, NATIVE, HARNESS, FAKE, FAKE_HARNESS
     if not shutil.which("gcc"):
         raise unittest.SkipTest("native gcc required")
     _build = tempfile.TemporaryDirectory(prefix="erbctl-console-build-")
     NATIVE = Path(_build.name) / "erbctl"
     HARNESS = Path(_build.name) / "console-harness"
+    FAKE = Path(_build.name) / "erbctl-fake-loader"
+    FAKE_HARNESS = Path(_build.name) / "console-fake-harness"
     # A tiny same-process caller checks signal dispositions/mask after returning;
     # all UART/terminal work remains in the production console implementation.
     harness = Path(_build.name) / "harness.c"
     harness.write_text(r"""
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "erbium-console.h"
 static void previous(int sig) { (void)sig; }
 int main(int argc, char **argv)
 {
-    const int signals[] = {SIGINT, SIGTERM, SIGHUP, SIGPIPE};
+    const int signals[] = {SIGINT, SIGTERM, SIGHUP, SIGPIPE, SIGCHLD};
     struct sigaction action = {0}, after;
     sigset_t mask, after_mask;
     sigemptyset(&action.sa_mask);
     action.sa_handler = previous;
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 5; i++)
         if (sigaction(signals[i], &action, NULL)) return 90;
+    if (getenv("IGNORE_SIGCHLD") && signal(SIGCHLD, SIG_IGN) == SIG_ERR) return 95;
     sigemptyset(&mask);
     sigaddset(&mask, SIGUSR1);
     if (sigprocmask(SIG_SETMASK, &mask, NULL)) return 91;
-    int result = erbctl_console(argc - 1, argv + 1);
-    for (int i = 0; i < 4; i++) {
+    int result = erbctl_console("/nonexistent-control-no-console-open", argc - 1, argv + 1);
+    for (int i = 0; i < 5; i++) {
+        void (*expected)(int) = signals[i] == SIGCHLD && getenv("IGNORE_SIGCHLD") ?
+            SIG_IGN : previous;
         if (sigaction(signals[i], NULL, &after) ||
-            after.sa_handler != previous) return 92;
+            after.sa_handler != expected) return 92;
     }
     if (sigprocmask(SIG_SETMASK, NULL, &after_mask)) return 93;
     for (int i = 1; i < NSIG; i++)
         if (sigismember(&mask, i) != sigismember(&after_mask, i)) return 94;
     fprintf(stderr, "HARNESS restored signals\n");
     return result;
+}
+""")
+    # Deliberately model only the child lifecycle, not MRAM or a UART protocol.
+    # The native/harness binaries above still link the real production loader.
+    fake_loader = Path(_build.name) / "fake-loader.c"
+    fake_loader.write_text(r"""
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include "erbium-loader.h"
+static volatile sig_atomic_t cancelled;
+static void cancel(int sig) { cancelled = sig; }
+int erbctl_hold(const char *dev) { (void)dev; return 99; }
+int erbctl_load(const char *dev, int argc, char **argv)
+{
+    const char *mode = getenv("FAKE_LOAD_MODE");
+    const char *report_path = getenv("FAKE_LOAD_REPORT");
+    const char *uart_path = getenv("FAKE_UART_PATH");
+    if (!mode) mode = "success";
+    struct stat uart, descriptor;
+    if (!report_path || !uart_path || stat(uart_path, &uart)) return 90;
+    for (int fd = 0; fd < 1024; fd++)
+        if (!fstat(fd, &descriptor) && S_ISCHR(descriptor.st_mode) &&
+            descriptor.st_rdev == uart.st_rdev) return 91;
+    struct sigaction action;
+    sigset_t mask;
+    if (sigprocmask(SIG_SETMASK, NULL, &mask)) return 92;
+    const int signals[] = {SIGINT, SIGTERM, SIGHUP, SIGPIPE, SIGCHLD};
+    for (int i = 0; i < 5; i++) {
+        if (sigaction(signals[i], NULL, &action) || sigismember(&mask, signals[i]))
+            return 93;
+        if (action.sa_handler != (signals[i] == SIGHUP || signals[i] == SIGPIPE ?
+                                 SIG_IGN : SIG_DFL)) return 94;
+    }
+    if (read(STDIN_FILENO, &action, 1) != 0) return 95;
+    if ((argc != 3 && argc != 5) || strcmp(argv[1], "--verify") ||
+        strcmp(argv[2], "--start") || (argc == 5 && strcmp(argv[3], "--mtd")))
+        return 96;
+    signal(SIGTERM, !strcmp(mode, "stuck") ? SIG_IGN : cancel);
+    signal(SIGINT, cancel);
+    FILE *report = fopen(report_path, "w");
+    if (!report) return 97;
+    fprintf(report, "PID %ld\nDEV %s\nUART_CLOSED\n", (long)getpid(), dev);
+    for (int i = 0; i < argc; i++) fprintf(report, "ARG %s\n", argv[i]);
+    fclose(report);
+    puts("FAKE loader progress");
+    fflush(stdout);
+    int delay = getenv("FAKE_LOAD_DELAY_MS") ? atoi(getenv("FAKE_LOAD_DELAY_MS")) : 200;
+    for (int elapsed = 0; (!strcmp(mode, "stuck") || elapsed < delay) && !cancelled;
+         elapsed += 20) usleep(20000);
+    if (cancelled) {
+        report = fopen(report_path, "a");
+        if (report) { fprintf(report, "CANCELLED %d\n", (int)cancelled); fclose(report); }
+        puts("FAKE loader cancelled");
+        return 1;
+    }
+    if (!strcmp(mode, "signal")) raise(SIGKILL);
+    if (!strcmp(mode, "failure")) return 7;
+    puts("FAKE load/start completed");
+    return 0;
 }
 """)
     common = ["gcc", "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror",
@@ -71,7 +141,11 @@ int main(int argc, char **argv)
             (NATIVE, [ROOT / "linux/tools/erbctl.c",
                       ROOT / "linux/tools/erbium-loader.c",
                       ROOT / "linux/tools/erbium-console.c"]),
-            (HARNESS, [harness, ROOT / "linux/tools/erbium-console.c"]),
+            (HARNESS, [harness, ROOT / "linux/tools/erbium-console.c",
+                       ROOT / "linux/tools/erbium-loader.c"]),
+            (FAKE, [ROOT / "linux/tools/erbctl.c",
+                    ROOT / "linux/tools/erbium-console.c", fake_loader]),
+            (FAKE_HARNESS, [harness, ROOT / "linux/tools/erbium-console.c", fake_loader]),
         ):
             subprocess.run(common + [str(p) for p in sources] + ["-o", str(target)],
                            check=True, capture_output=True, text=True, timeout=30)
@@ -89,6 +163,9 @@ class ConsoleTests(unittest.TestCase):
     def setUp(self):
         self.fds = set()
         self.children = []
+        self.temp = tempfile.TemporaryDirectory(prefix="erbctl-console-case-")
+        self.addCleanup(self.temp.cleanup)
+        self.report = Path(self.temp.name) / "loader-report"
         self.addCleanup(self.cleanup)
         self.master, self.slave = self.keep(os.openpty())
         self.path = os.ttyname(self.slave)
@@ -121,7 +198,8 @@ class ConsoleTests(unittest.TestCase):
             os.close(fd)
 
     def start(self, *, interactive=False, output=None, input_fd=None, args=(),
-              harness=False, ready=True):
+              harness=False, fake=False, ready=True, env=None, new_session=False,
+              device="/nonexistent-control-no-console-open"):
         if interactive:
             self.local_master, self.local = self.keep(os.openpty())
             self.original_local = termios.tcgetattr(self.local)
@@ -129,11 +207,13 @@ class ConsoleTests(unittest.TestCase):
             self.input_flags = fcntl.fcntl(input_fd, fcntl.F_GETFL)
         if input_fd is None:
             input_fd = self.input_r
-        argv = ([str(HARNESS)] if harness else
-                [str(NATIVE), "-d", "/nonexistent-control-no-console-open", "console"])
+        binary = (FAKE_HARNESS if fake else HARNESS) if harness else (FAKE if fake else NATIVE)
+        argv = ([str(binary)] if harness else [str(binary), "-d", device, "console"])
         child = subprocess.Popen(
             [*argv, self.path, *args], stdin=input_fd,
-            stdout=self.output_w if output is None else output, stderr=subprocess.PIPE)
+            stdout=self.output_w if output is None else output, stderr=subprocess.PIPE,
+            env=dict(os.environ, FAKE_UART_PATH=self.path, **(env or {})),
+            start_new_session=new_session)
         self.children.append(child)
         if ready:
             text = bytearray()
@@ -194,6 +274,30 @@ class ConsoleTests(unittest.TestCase):
             fcntl.flock(reopened, fcntl.LOCK_EX | fcntl.LOCK_NB)
         finally:
             os.close(reopened)
+
+    def start_fake_load(self, *, mode="success", delay=2000, args=(), env=None, **kwargs):
+        self.report.unlink(missing_ok=True)
+        environment = dict(FAKE_LOAD_MODE=mode, FAKE_LOAD_DELAY_MS=str(delay),
+                           FAKE_LOAD_REPORT=str(self.report))
+        environment.update(env or {})
+        return self.start(fake=True, args=("--load", "/fake/image.elf", *args),
+                          env=environment, **kwargs)
+
+    def loader_pid(self, child):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if self.report.exists():
+                text = self.report.read_text()
+                if "ARG --start\n" in text:
+                    self.assertIn("UART_CLOSED\n", text)
+                    return int(text.splitlines()[0].split()[1])
+            self.assertIsNone(child.poll(), "fake loader failed before reporting startup")
+            time.sleep(0.01)
+        self.fail("fake loader did not start")
+
+    def assert_reaped(self, pid):
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
 
     def test_bidirectional_all_bytes_pipe_and_default_baud(self):
         child = self.start()
@@ -504,7 +608,11 @@ class ConsoleTests(unittest.TestCase):
                      ("--baud", "-9600"), ("--baud", "115200junk"),
                      ("--baud", "999999999999999999999999"),
                      ("--baud", "9600", "--baud", "115200"),
-                     ("--unknown",), ("extra-tty",)):
+                     ("--unknown",), ("extra-tty",), ("--load",),
+                     ("--load", ""), ("--load", "--unknown"), ("--mtd",),
+                     ("--mtd", "/fake/mtd"), ("--load", "one", "--load", "two"),
+                     ("--load", "image", "--mtd", "one", "--mtd", "two"),
+                     ("--load", "image", "--check"), ("--load", "image", "--start")):
             with self.subTest(args=args):
                 child = self.start(args=args, ready=False, harness=True)
                 text = self.finish(child, code=2)
@@ -526,7 +634,175 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn(b"/dev/ttyAMA1", result.stderr)
         self.assertIn(b"115200", result.stderr)
         self.assertIn(b"Ctrl-]", result.stderr)
+        self.assertIn(b"--load ELF", result.stderr)
         self.assertEqual(result.stdout, b"")
+
+    def test_no_implicit_load(self):
+        child = self.start(fake=True, interactive=True,
+                           env={"FAKE_LOAD_REPORT": str(self.report)})
+        time.sleep(0.2)
+        self.assertFalse(self.report.exists())
+        self.send(self.local_master, b"\x1d")
+        self.finish(child)
+        self.restored()
+
+    def test_actual_loader_missing_elf_exits_and_restores(self):
+        child = self.start(interactive=True, harness=True,
+                           args=("--load", str(Path(self.temp.name) / "missing.elf")))
+        text = self.finish(child, code=1)
+        self.assertIn(b"missing.elf", text)
+        self.assertIn(b"load/start failed", text)
+        self.assertIn(b"HARNESS restored signals", text)
+        self.assertFalse(select.select([self.output_r], [], [], 0)[0])
+        self.restored()
+
+    def test_actual_loader_missing_control_routes_validation_to_stderr(self):
+        from test_erbctl_loader import elf
+        image = Path(self.temp.name) / "valid.elf"
+        image.write_bytes(elf())
+        device = str(Path(self.temp.name) / "missing-control")
+        child = self.start(interactive=True, device=device, args=("--load", str(image)))
+        text = self.finish(child, code=1)
+        self.assertIn(b"ELF validated", text)
+        self.assertIn(device.encode(), text)
+        self.assertIn(b"load/start failed", text)
+        self.assertFalse(select.select([self.output_r], [], [], 0)[0])
+        self.restored()
+
+    def test_load_attaches_first_relays_during_load_and_forwards_options(self):
+        child = self.start_fake_load(interactive=True, delay=800,
+                                     device="/chosen/control",
+                                     args=("--mtd", "/chosen/mtd", "--baud", "9600"))
+        pid = self.loader_pid(child)
+        self.assertEqual(termios.tcgetattr(self.slave)[4:6], [termios.B9600] * 2)
+        self.assertFalse(termios.tcgetattr(self.local)[3] & termios.ICANON)
+        report = self.report.read_text()
+        self.assertIn("DEV /chosen/control\n", report)
+        self.assertIn("ARG /fake/image.elf\nARG --verify\nARG --start\n"
+                      "ARG --mtd\nARG /chosen/mtd\n", report)
+        banner = b"very early boot banner\x00\xff\r\n"
+        self.send(self.master, banner)
+        self.assertEqual(self.read_exact(self.output_r, len(banner)), banner)
+        self.send(self.local_master, b"interactive during load\r")
+        self.assertEqual(self.read_exact(self.master, 24), b"interactive during load\r")
+        # Successful loader completion must be reaped without ending console.
+        deadline = time.monotonic() + 2
+        while Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assert_reaped(pid)
+        self.assertIsNone(child.poll())
+        self.send(self.master, b"after release")
+        self.assertEqual(self.read_exact(self.output_r, 13), b"after release")
+        self.send(self.local_master, b"\x1d")
+        text = self.finish(child)
+        self.assertIn(b"FAKE loader progress", text)
+        self.assertIn(b"FAKE load/start completed", text)
+        self.assertFalse(select.select([self.output_r], [], [], 0)[0])
+        self.restored()
+
+    def test_load_pipe_eof_waits_for_loader_then_drains(self):
+        child = self.start_fake_load(delay=3500)
+        pid = self.loader_pid(child)
+        self.close(self.input_w)
+        self.send(self.master, b"early boot\x00\xff")
+        self.assertEqual(self.read_exact(self.output_r, 12), b"early boot\x00\xff")
+        start = time.monotonic()
+        text = self.finish(child, timeout=6)
+        self.assertGreater(time.monotonic() - start, 3.5)
+        self.assertIn(b"FAKE load/start completed", text)
+        self.assert_reaped(pid)
+        self.restored()
+
+    def test_load_failure_and_signaled_child_detected_without_uart_activity(self):
+        for mode in ("failure", "signal"):
+            with self.subTest(mode=mode):
+                child = self.start_fake_load(mode=mode, delay=200, interactive=True)
+                pid = self.loader_pid(child)
+                start = time.monotonic()
+                text = self.finish(child, code=1, timeout=2)
+                self.assertLess(time.monotonic() - start, 1.5)
+                self.assertIn(b"load/start failed", text)
+                self.assertIn(b"FAKE loader progress", text)
+                self.assert_reaped(pid)
+                self.restored()
+
+    def test_load_escape_cancels_and_reaps_child(self):
+        child = self.start_fake_load(delay=10000, interactive=True)
+        pid = self.loader_pid(child)
+        self.send(self.local_master, b"\x1d")
+        text = self.finish(child, code=1, timeout=2)
+        self.assertIn(b"FAKE loader cancelled", text)
+        self.assertIn(f"CANCELLED {signal.SIGTERM}\n", self.report.read_text())
+        self.assert_reaped(pid)
+        self.restored()
+
+    def test_load_signals_cancel_child_and_restore_dispositions(self):
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=sig):
+                child = self.start_fake_load(delay=10000, interactive=True, harness=True)
+                pid = self.loader_pid(child)
+                child.send_signal(sig)
+                text = self.finish(child, code=128 + sig, timeout=2)
+                self.assertIn(b"FAKE loader cancelled", text)
+                self.assertIn(b"HARNESS restored signals", text)
+                self.assert_reaped(pid)
+                self.restored()
+
+    def test_load_process_group_hup_uses_graceful_term_in_child(self):
+        child = self.start_fake_load(delay=10000, interactive=True, new_session=True)
+        pid = self.loader_pid(child)
+        os.killpg(child.pid, signal.SIGHUP)
+        text = self.finish(child, code=128 + signal.SIGHUP, timeout=2)
+        self.assertIn(b"FAKE loader cancelled", text)
+        self.assertIn(f"CANCELLED {signal.SIGTERM}\n", self.report.read_text())
+        self.assert_reaped(pid)
+        self.restored()
+
+    def test_load_stuck_child_gets_kill_after_bounded_term_grace(self):
+        child = self.start_fake_load(mode="stuck", interactive=True)
+        pid = self.loader_pid(child)
+        start = time.monotonic()
+        child.send_signal(signal.SIGTERM)
+        text = self.finish(child, code=128 + signal.SIGTERM, timeout=2)
+        self.assertGreaterEqual(time.monotonic() - start, 0.45)
+        self.assertLess(time.monotonic() - start, 1.5)
+        self.assertIn(b"loader stuck; sending KILL", text)
+        self.assertIn(b"CPU hold not guaranteed", text)
+        self.assert_reaped(pid)
+        self.restored()
+
+    def test_load_uart_hup_cancels_and_reaps_child(self):
+        child = self.start_fake_load(delay=10000, interactive=True)
+        pid = self.loader_pid(child)
+        self.close(self.master)
+        text = self.finish(child, code=1, timeout=2)
+        self.assertIn(b"UART disconnected", text)
+        self.assertIn(b"FAKE loader cancelled", text)
+        self.assert_reaped(pid)
+        self.assertEqual(termios.tcgetattr(self.local), self.original_local)
+        self.assertEqual(fcntl.fcntl(self.local, fcntl.F_GETFL), self.input_flags)
+        self.assertEqual(fcntl.fcntl(self.output_w, fcntl.F_GETFL), self.output_flags)
+
+    def test_load_broken_stdout_cancels_child(self):
+        self.close(self.output_r)
+        child = self.start_fake_load(delay=10000, interactive=True)
+        pid = self.loader_pid(child)
+        self.send(self.master, b"early banner")
+        text = self.finish(child, code=1, timeout=2)
+        self.assertIn(b"stdout write", text)
+        self.assertIn(b"FAKE loader cancelled", text)
+        self.assert_reaped(pid)
+        self.restored()
+
+    def test_load_restores_previously_ignored_sigchld(self):
+        child = self.start_fake_load(delay=200, harness=True, env={"IGNORE_SIGCHLD": "1"})
+        pid = self.loader_pid(child)
+        self.close(self.input_w)
+        text = self.finish(child)
+        self.assertIn(b"HARNESS restored signals", text)
+        self.assertIn(b"FAKE load/start completed", text)
+        self.assert_reaped(pid)
+        self.restored()
 
 
 if __name__ == "__main__":

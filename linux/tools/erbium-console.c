@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Direct physical UART wiring, independent of the xSPI loader/control lock.
- * No RX flush: attaching before a separate `erbctl load --start` retains output.
+ * No RX flush. Optional --load starts a loader child only after UART attachment.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -14,14 +14,17 @@
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
 #include "erbium-console.h"
+#include "erbium-loader.h"
 
 #define QUEUE_SIZE 16384
 #define QUIET_MS 500
 #define DRAIN_MS 3000
+#define CANCEL_MS 500
 
 struct queue {
 	unsigned char bytes[QUEUE_SIZE];
@@ -46,10 +49,14 @@ static int diagnostic(const char *what)
 
 static int usage(void)
 {
-	fprintf(stderr, "usage: erbctl console [TTY (default /dev/ttyAMA1)] [--baud N]\n"
+	fprintf(stderr, "usage: erbctl [-d DEV] console [TTY (default /dev/ttyAMA1)] [--baud N]\n"
+		"               [--load ELF [--mtd PATH]]\n"
 		"  Raw 8N1, default 115200 baud; Ctrl-] exits on terminal stdin.\n"
+		"  --load attaches first, then loads, verifies and starts in a child.\n"
+		"  Cancellation sends TERM, then KILL after 500 ms if stuck;\n"
+		"  CPU hold cannot be guaranteed if loader I/O is stuck.\n"
 		"  Pipe stdin is binary (no escape); EOF drains until 500 ms quiet,\n"
-		"  with a 3 s overall deadline. Attach before load --start if desired.\n");
+		"  with a 3 s deadline (after the optional loader finishes).\n");
 	return 2;
 }
 
@@ -126,15 +133,42 @@ static int write_queue(int fd, struct queue *q)
 	return 0;
 }
 
-int erbctl_console(int argc, char **argv)
+/* Never restore shared terminal state while a loader child is still alive. */
+static void cancel_loader(pid_t *child)
+{
+	if (*child <= 0) return;
+	int status;
+	pid_t n;
+	do { n = waitpid(*child, &status, WNOHANG); } while (n < 0 && errno == EINTR);
+	if (n == 0) {
+		kill(*child, SIGTERM);
+		int64_t end = milliseconds() + CANCEL_MS;
+		do {
+			n = waitpid(*child, &status, WNOHANG);
+			if (n != 0 && !(n < 0 && errno == EINTR)) break;
+			poll(NULL, 0, 20);
+		} while (milliseconds() < end);
+		if (n == 0 || (n < 0 && errno == EINTR)) {
+			fprintf(stderr, "erbctl: console: loader stuck; sending KILL "
+				"(CPU hold not guaranteed)\n");
+			kill(*child, SIGKILL);
+			do { n = waitpid(*child, &status, 0); } while (n < 0 && errno == EINTR);
+		}
+	}
+	if (n < 0) diagnostic("reap loader");
+	*child = -1;
+}
+
+int erbctl_console(const char *device, int argc, char **argv)
 {
 	const char *tty = "/dev/ttyAMA1", *baud = "115200";
+	const char *image = NULL, *mtd = NULL;
 	bool have_tty = false, have_baud = false;
 	speed_t speed;
 	int uart = -1, result = 1, flags[2] = {-1, -1}, handlers = 0;
 	const int streams[2] = {STDIN_FILENO, STDOUT_FILENO};
-	const int signals[] = {SIGINT, SIGTERM, SIGHUP, SIGPIPE};
-	struct sigaction saved[4], action = {0};
+	const int signals[] = {SIGINT, SIGTERM, SIGHUP, SIGPIPE, SIGCHLD};
+	struct sigaction saved[5], action = {0};
 	sigset_t blocked, oldmask;
 	struct termios uart_old, stdin_old, raw;
 	bool exclusive = false, locked = false, uart_saved = false;
@@ -142,6 +176,7 @@ int erbctl_console(int argc, char **argv)
 	struct queue tx = {{0}, 0}, rx = {{0}, 0};
 	bool input_done = false, input_closing = false, uart_done = false, uart_closing = false;
 	int64_t deadline = 0, quiet = 0;
+	pid_t loader = -1;
 
 	/* Reject all arguments before touching any file or terminal. */
 	for (int i = 0; i < argc; i++) {
@@ -150,6 +185,14 @@ int erbctl_console(int argc, char **argv)
 				return usage();
 			baud = argv[i];
 			have_baud = true;
+		} else if (!strcmp(argv[i], "--load")) {
+			if (image || ++i == argc || !*argv[i] || argv[i][0] == '-')
+				return usage();
+			image = argv[i];
+		} else if (!strcmp(argv[i], "--mtd")) {
+			if (mtd || ++i == argc || !*argv[i] || argv[i][0] == '-')
+				return usage();
+			mtd = argv[i];
 		} else if (argv[i][0] == '-' || have_tty) {
 			return usage();
 		} else {
@@ -157,6 +200,7 @@ int erbctl_console(int argc, char **argv)
 			have_tty = true;
 		}
 	}
+	if (mtd && !image) return usage();
 	if (!baud_speed(baud, &speed)) {
 		fprintf(stderr, "erbctl: console: unsupported baud: %s\n", baud);
 		return usage();
@@ -165,14 +209,16 @@ int erbctl_console(int argc, char **argv)
 	/* Block managed signals during acquisition and restoration. A signal
 	 * arriving during setup is delivered to our handler before entering poll. */
 	sigemptyset(&blocked);
-	for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); i++)
+	int signal_count = image ? 5 : 4;
+	for (int i = 0; i < signal_count; i++)
 		sigaddset(&blocked, signals[i]);
 	if (sigprocmask(SIG_BLOCK, &blocked, &oldmask))
 		return diagnostic("block signals");
 	stopped = 0;
 	sigemptyset(&action.sa_mask);
-	for (; handlers < 4; handlers++) {
-		action.sa_handler = signals[handlers] == SIGPIPE ? SIG_IGN : console_signal;
+	for (; handlers < signal_count; handlers++) {
+		action.sa_handler = signals[handlers] == SIGPIPE ? SIG_IGN :
+			signals[handlers] == SIGCHLD ? SIG_DFL : console_signal;
 		if (sigaction(signals[handlers], &action, &saved[handlers])) {
 			diagnostic("install signal handler");
 			goto cleanup;
@@ -231,12 +277,65 @@ int erbctl_console(int argc, char **argv)
 	}
 	fprintf(stderr, "erbctl: console: %s at %s baud; Ctrl-] exits on terminal stdin\n",
 		tty, baud);
+	if (image) {
+		fflush(NULL); /* Do not duplicate pre-fork stdio buffers. */
+		loader = fork();
+		if (loader < 0) { diagnostic("fork loader"); goto cleanup; }
+		if (loader == 0) {
+			close(uart); /* No UART reader, flock reference or output in child. */
+			int nullfd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+			if (nullfd < 0 || dup2(nullfd, STDIN_FILENO) < 0 ||
+			    dup2(STDERR_FILENO, STDOUT_FILENO) < 0) {
+				diagnostic("loader stdio"); _exit(1);
+			}
+			if (nullfd != STDIN_FILENO) close(nullfd);
+			setvbuf(stdout, NULL, _IONBF, 0); /* Loader progress is diagnostic. */
+			/* HUP to the process group is handled by the parent, which sends
+			 * TERM so the existing loader can perform its hold cleanup. */
+			action.sa_handler = SIG_DFL;
+			for (int i = 0; i < signal_count; i++) {
+				action.sa_handler = signals[i] == SIGHUP || signals[i] == SIGPIPE ?
+					SIG_IGN : SIG_DFL;
+				if (sigaction(signals[i], &action, NULL)) _exit(1);
+			}
+			sigset_t childmask = oldmask;
+			for (int i = 0; i < signal_count; i++) sigdelset(&childmask, signals[i]);
+			if (sigprocmask(SIG_SETMASK, &childmask, NULL)) _exit(1);
+			char *load_args[] = {(char *)image, "--verify", "--start",
+				"--mtd", (char *)mtd};
+			int rc = erbctl_load(device, mtd ? 5 : 3, load_args);
+			fflush(NULL);
+			_exit(rc);
+		}
+	}
 	if (sigprocmask(SIG_SETMASK, &oldmask, NULL)) {
 		diagnostic("unblock signals"); goto cleanup;
 	}
 	result = 0;
 	while (!stopped) {
 		int64_t now = milliseconds();
+		if (loader > 0) {
+			int status;
+			pid_t n = waitpid(loader, &status, WNOHANG);
+			if (n < 0 && errno == EINTR) continue;
+			if (n < 0) {
+				result = diagnostic("wait loader");
+				loader = -1;
+				break;
+			}
+			if (n == loader) {
+				loader = -1;
+				if (!WIFEXITED(status) || WEXITSTATUS(status)) {
+					fprintf(stderr, "erbctl: console: load/start failed\n");
+					result = 1;
+					break;
+				}
+				if (input_done || input_closing) {
+					deadline = now + DRAIN_MS;
+					quiet = now + QUIET_MS;
+				}
+			}
+		}
 		struct pollfd p[3] = {
 			{uart, 0, 0}, {-1, POLLIN, 0}, {-1, POLLOUT, 0}
 		};
@@ -250,7 +349,7 @@ int erbctl_console(int argc, char **argv)
 		}
 		if (uart_done && !rx.len)
 			break;
-		bool finished = input_done && !uart_closing && !tx.len && !rx.len &&
+		bool finished = loader <= 0 && input_done && !uart_closing && !tx.len && !rx.len &&
 			!outq && quiet && now >= quiet;
 		/* Empty queues alone do not establish completion: sparse replies
 		 * can keep the quiet deadline in the future. Even when finished,
@@ -297,6 +396,7 @@ int erbctl_console(int argc, char **argv)
 			if (!uart_closing)
 				fprintf(stderr, "erbctl: console: UART disconnected\n");
 			uart_closing = true;
+			cancel_loader(&loader);
 			input_done = true;
 			result = 1;
 			tx.len = 0; /* Disconnected hardware cannot accept pending TX. */
@@ -309,6 +409,7 @@ int erbctl_console(int argc, char **argv)
 				if (input_done) quiet = milliseconds() + QUIET_MS;
 			} else if (!count || (count < 0 && errno == EIO)) {
 				uart_done = true;
+				cancel_loader(&loader);
 				result = 1;
 				if (!deadline) deadline = milliseconds() + DRAIN_MS;
 				if (!uart_closing)
@@ -326,8 +427,9 @@ int erbctl_console(int argc, char **argv)
 		if (input_done && (p[0].revents & POLLOUT))
 			quiet = milliseconds() + QUIET_MS;
 		if (p[1].revents & (POLLHUP | POLLERR)) {
+			if (image && local_tty) { result = 1; break; }
 			input_closing = true;
-			if (!deadline) deadline = milliseconds() + DRAIN_MS;
+			if (!deadline && loader <= 0) deadline = milliseconds() + DRAIN_MS;
 		}
 		if (!input_done && tx.len < QUEUE_SIZE &&
 		    (p[1].revents & (POLLIN | POLLHUP | POLLERR))) {
@@ -338,7 +440,7 @@ int erbctl_console(int argc, char **argv)
 				tx.len += (size_t)count;
 			} else if (!count) {
 				input_done = true;
-				if (!deadline) deadline = milliseconds() + DRAIN_MS;
+				if (!deadline && loader <= 0) deadline = milliseconds() + DRAIN_MS;
 				quiet = milliseconds() + QUIET_MS;
 			} else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
 				result = diagnostic("stdin read"); break;
@@ -353,6 +455,10 @@ int erbctl_console(int argc, char **argv)
 cleanup:
 	/* TCSANOW deliberately avoids both RX flushing and an unbounded drain. */
 	sigprocmask(SIG_BLOCK, &blocked, NULL);
+	if (loader > 0) {
+		cancel_loader(&loader);
+		if (!result) result = 1; /* Escape/EOF before load completion is incomplete. */
+	}
 	if (stdin_saved && tcsetattr(STDIN_FILENO, TCSANOW, &stdin_old))
 		result = diagnostic("restore stdin termios");
 	for (int i = 1; i >= 0; i--)

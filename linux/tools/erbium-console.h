@@ -2,7 +2,7 @@
 #ifndef ERBIUM_CONSOLE_H
 #define ERBIUM_CONSOLE_H
 
-/* Direct physical UART console; never opens the xSPI control device. */
-int erbctl_console(int argc, char **argv);
+/* Direct UART console. Only the optional --load child opens control/MTD. */
+int erbctl_console(const char *device, int argc, char **argv);
 
 #endif
