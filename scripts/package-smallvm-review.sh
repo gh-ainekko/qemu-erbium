@@ -12,6 +12,10 @@ root, build, src, output = map(pathlib.Path, sys.argv[1:])
 manifest_path = build/'results/manifest.json'
 manifest = json.loads(manifest_path.read_text())
 sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+if manifest.get('suite') != 'full':
+    sys.exit('Review packaging requires a full test run, not --host-only')
+for name, digest in manifest['port_sources'].items():
+    if sha(root/name) != digest: sys.exit(f'Port/build/test source changed since tests: {name}')
 actual_tree = subprocess.check_output(['git','-C',str(src),'rev-parse','HEAD^{tree}'],text=True).strip()
 if actual_tree != manifest['source_tree'] or subprocess.check_output(['git','-C',str(src),'status','--porcelain']):
     sys.exit('Source changed since tests; rerun the test suite before packaging')
@@ -32,7 +36,7 @@ for p in (src/'vm').rglob('*'):
     if p.is_file(): paths['sources/smallvm/'+str(p.relative_to(src))] = p
 paths['licenses/SmallVM-MPL-2.0.html'] = src/'Mozilla Public License, version 2.0.html'
 paths['licenses/SmallVM-LICENSE'] = src/'LICENSE'
-paths['licenses/picolibc-copyright'] = build/'deps/usr/share/doc/picolibc-riscv64-unknown-elf/copyright'
+paths['licenses/picolibc-copyright'] = root/'build/smallvm/deps/usr/share/doc/picolibc-riscv64-unknown-elf/copyright'
 paths['licenses/gcc-riscv64-unknown-elf-copyright'] = pathlib.Path('/usr/share/doc/gcc-riscv64-unknown-elf/copyright')
 gcc_notice = pathlib.Path('/usr/share/doc/gcc-riscv64-unknown-elf/copyright-gcc.gz')
 if gcc_notice.is_file(): paths['licenses/gcc-copyright.gz'] = gcc_notice

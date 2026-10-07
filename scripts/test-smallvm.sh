@@ -41,11 +41,16 @@ if ((!host_only)); then
   grep -q 'FAIL timer-calibration' "$B/results/bad-timer/uart.txt"
   echo 'PASS wrong-timer-calibration-rejected'
 fi
-python3 - "$B" "${SMALLVM_SRC:-$R/ext/smallvm}" "$R" <<'PY'
+python3 - "$B" "${SMALLVM_SRC:-$R/ext/smallvm}" "$R" "$host_only" "$legacy" <<'PY'
 import hashlib, json, pathlib, subprocess, sys
-b, src, root = map(pathlib.Path, sys.argv[1:])
+b, src, root = map(pathlib.Path, sys.argv[1:4])
 sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
-manifest = {'smallvm_commit': subprocess.check_output(['git','-C',str(src),'rev-parse','HEAD'],text=True).strip(),
+port_sources = [p for p in (root/'smallvm').rglob('*') if p.is_file() and p.suffix in ('.c','.h','.S','.ld','.py')]
+port_sources += [root/'smallvm/Makefile'] + [root/'scripts'/name for name in ('build-smallvm.sh','fetch-smallvm.sh','test-smallvm.sh')]
+manifest = {'suite': 'host-only' if int(sys.argv[4]) else 'full',
+            'legacy32': bool(int(sys.argv[5])),
+            'port_sources': {str(p.relative_to(root)): sha(p) for p in sorted(port_sources)},
+            'smallvm_commit': subprocess.check_output(['git','-C',str(src),'rev-parse','HEAD'],text=True).strip(),
             'source_tree': subprocess.check_output(['git','-C',str(src),'rev-parse','HEAD^{tree}'],text=True).strip(),
             'patches': {p.name: sha(p) for p in sorted((root/'smallvm/patches').glob('*.patch'))},
             'artifacts': {p.name: sha(p) for p in b.iterdir() if p.is_file() and p.suffix in ('.elf','.map','.dis','.headers')},
