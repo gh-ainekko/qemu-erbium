@@ -514,6 +514,10 @@ async def reset(request):
 
 async def static(request):
     name = request.match_info.get("name", "index.html")
+    if request.path == "/example.ubp":
+        # Fixed, read-only sample; this is not a caller-selected filesystem path.
+        return web.FileResponse(
+            request.app[SESSION].repo / "smallvm/examples/Erbium Showcase.ubp")
     assets = request.path.startswith("/assets/")
     root = request.app[ASSETS_ROOT if assets else WEB_ROOT]
     if not assets and name not in ("index.html", "erbium.js"):
