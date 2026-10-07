@@ -5,60 +5,43 @@ OSPI controller of `xlnx-versal-virt`); the Erbium **CPU subsystem** runs out of
 `erbium_emu` (sw-sysemu). The two share the 16 MiB MRAM through an mmap'd file and talk over a
 UNIX socket that models the xSPI IP's AXI port into the NoC (`docs/protocol.md`).
 
-### xSPI control and shared memory
+### Emulator topology
 
 ```mermaid
 flowchart TB
     subgraph qemu["QEMU process · xlnx-versal-virt"]
-        direction LR
-        linux["ARM Linux guest<br/>erbctl + xSPI driver"]
+        linux["ARM Linux guest<br/>erbctl + xSPI driver + console"]
         ospi["Versal Cadence<br/>OSPI controller"]
         xspi["Erbium xSPI target<br/>SCCR + SFDP"]
+        pl011["PL011 UART1<br/>/dev/ttyAMA1"]
         linux <--> ospi
         ospi <-->|"xSPI transactions"| xspi
+        linux <--> pl011
     end
 
     mram[("16 MiB shared MRAM<br/>Host backing file")]
 
     subgraph sysemu["erbium_emu process · sw-sysemu"]
-        direction LR
         noc["NoC / memory model<br/>System registers · mailbox · PLIC"]
         cpus["Up to 8 RISC-V minions<br/>Erbium firmware"]
-        noc <--> cpus
-    end
-
-    qemu <-->|"UNIX control socket<br/>READ / WRITE / RESET"| sysemu
-    qemu <-->|"mmap"| mram
-    mram <-->|"mmap"| sysemu
-```
-
-The socket connects the xSPI target to the backend's NoC model. Normal MRAM
-accesses use the shared file rather than socket messages. qtests drive the OSPI
-controller directly, without booting Linux.
-
-### Separate UART cable (optional)
-
-```mermaid
-flowchart TB
-    subgraph qemu_uart["QEMU process · Linux host"]
-        direction LR
-        console["erbctl console"]
-        pl011["PL011 UART1<br/>/dev/ttyAMA1"]
-        console <--> pl011
-    end
-
-    subgraph sysemu_uart["erbium_emu process · Erbium target"]
-        direction LR
         uart["Shakti UART"]
-        firmware["RISC-V firmware"]
-        uart <-->|"MMIO"| firmware
+        noc <--> cpus
+        uart <-->|"MMIO"| cpus
     end
 
-    qemu_uart <-->|"Separate raw UNIX socket<br/>Crossed TX / RX"| sysemu_uart
+    xspi <-->|"UNIX control socket<br/>READ / WRITE / RESET"| noc
+    xspi <-->|"mmap"| mram
+    mram <-->|"mmap"| noc
+    pl011 <-.->|"Optional UART socket<br/>Raw bytes · crossed TX / RX"| uart
 ```
 
-ELF loading still uses **xSPI**; interactive serial data uses the **separate UART
-socket**. Linux UART0 (`/dev/ttyAMA0`) remains the guest boot/shell console.
+The control socket connects the xSPI target to the backend's NoC model. Normal
+MRAM accesses use the shared file rather than socket messages. qtests drive the
+OSPI controller directly, without booting Linux.
+
+The **dotted link** is the optional, separate UART connection. ELF loading still
+uses **xSPI**; interactive serial data uses the **UART socket**. Linux UART0
+(`/dev/ttyAMA0`) remains the guest boot/shell console.
 
 ## Layout
 
