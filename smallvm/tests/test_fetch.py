@@ -19,6 +19,7 @@ class FetchSafety(unittest.TestCase):
         self.root = Path(self.temp.name)
         (self.root/'scripts').mkdir()
         shutil.copy2(ROOT/'scripts/fetch-smallvm.sh', self.root/'scripts')
+        shutil.copy2(ROOT/'scripts/sync-git-patches.sh', self.root/'scripts')
         shutil.copytree(ROOT/'smallvm/patches', self.root/'smallvm/patches')
         self.src = self.root/'checkout'
         subprocess.run(['git', 'clone', '-q', '--shared', str(SOURCE), str(self.src)], check=True)
@@ -51,7 +52,12 @@ class FetchSafety(unittest.TestCase):
 
     def test_changed_patch_series_is_detected(self):
         patch = sorted((self.root/'smallvm/patches').glob('*.patch'))[0]
-        patch.write_bytes(patch.read_bytes()+b'\n')
+        lines = patch.read_text().splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            if line.startswith('+') and not line.startswith('+++'):
+                lines[i] = line.rstrip('\n')+' /* changed patch content */\n'
+                break
+        patch.write_text(''.join(lines))
         self.assertNotEqual(self.fetch().returncode, 0)
 
 

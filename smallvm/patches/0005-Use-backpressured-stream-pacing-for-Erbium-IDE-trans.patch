@@ -1,0 +1,27 @@
+From 708574a2402807333f114727aae2ef847c6ddadc Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Wed, 7 Oct 2026 03:14:03 +0000
+Subject: [PATCH] Use backpressured stream pacing for Erbium IDE transfers
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ ide/MicroBlocksRuntime.gp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/ide/MicroBlocksRuntime.gp b/ide/MicroBlocksRuntime.gp
+index 4f6f5bb..6aeb13f 100644
+--- a/ide/MicroBlocksRuntime.gp
++++ b/ide/MicroBlocksRuntime.gp
+@@ -2018,6 +2018,9 @@ method setDefaultSerialDelay SmallRuntime {
+ method setSerialDelay SmallRuntime newDelay {
+ 	if ('reset to default' == newDelay) {
+ 		newDelay = 5
++		// Erbium's reliable virtual UART backpressures rather than dropping data.
++		// Avoid per-word simulated millisecond sleeps during large readbacks.
++		if ('Erbium' == boardType) { newDelay = 1 }
+ 	}
+ 	sendMsg this 'extendedMsg' 1 (list newDelay)
+ }
+-- 
+2.43.0
+

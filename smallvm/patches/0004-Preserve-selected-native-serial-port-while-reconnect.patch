@@ -1,0 +1,28 @@
+From 7e48a6170f7abfb4c8fb4380b470a1091980a280 Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Wed, 7 Oct 2026 03:08:34 +0000
+Subject: [PATCH] Preserve selected native serial port while reconnecting the
+ IDE
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ ide/MicroBlocksRuntime.gp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/ide/MicroBlocksRuntime.gp b/ide/MicroBlocksRuntime.gp
+index f8b83e8..4f6f5bb 100644
+--- a/ide/MicroBlocksRuntime.gp
++++ b/ide/MicroBlocksRuntime.gp
+@@ -1069,7 +1069,9 @@ method tryToConnect SmallRuntime {
+ 
+ method openPortAndSendPing SmallRuntime {
+ 	// Open port and send ping request
++	newPortName = portName
+ 	closePort this // ensure port is closed
++	portName = newPortName // closePort clears the old board identity and port name
+ 	connectionStartTime = (msecsSinceStart)
+ 	ensurePortOpen this // attempt to reopen the port
+ 	if (notNil port) {
+-- 
+2.43.0
+

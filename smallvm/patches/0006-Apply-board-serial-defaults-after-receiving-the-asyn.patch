@@ -1,0 +1,36 @@
+From a2891ddd34ba4e67e3c4dafb5f504788ac9e8604 Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Wed, 7 Oct 2026 03:25:23 +0000
+Subject: [PATCH] Apply board serial defaults after receiving the asynchronous
+ version reply
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ ide/MicroBlocksRuntime.gp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/ide/MicroBlocksRuntime.gp b/ide/MicroBlocksRuntime.gp
+index 6aeb13f..0db9a5d 100644
+--- a/ide/MicroBlocksRuntime.gp
++++ b/ide/MicroBlocksRuntime.gp
+@@ -996,7 +996,6 @@ method justConnected SmallRuntime {
+ 	sendMsgSync this 'getVersionMsg'
+ 	sendStopAll this
+ 	clearRunningHighlights this
+-	setDefaultSerialDelay this
+ 	abortFileTransfer this
+ 	processMessages this // process incoming version message
+ 	if readFromBoard {
+@@ -1158,6 +1157,9 @@ method versionReceived SmallRuntime versionString {
+ 	boardType = (extractBoardType this versionString)
+ 
+ 	if justConnected { // check the version number and load board libraries
++		// The version reply is asynchronous. Select board-specific pacing only
++		// after boardType is known, not while justConnected is still awaiting it.
++		setDefaultSerialDelay this
+ 		checkVmVersion this
+ 		installBoardSpecificBlocks this
+ 		setProperty api 'board.canDoBLE' (boardIsBLECapable this)
+-- 
+2.43.0
+
