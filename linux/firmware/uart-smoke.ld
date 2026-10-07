@@ -13,6 +13,7 @@ SECTIONS
     .riscv.attributes 0 : { *(.riscv.attributes) } :NONE
     /DISCARD/ : { *(.comment) *(.note*) }
     ASSERT(_start == ADDR(.text), "ELF entry must be the real start")
+    ASSERT((uart_trap & 3) == 0, "direct-mode mtvec must be four-byte aligned")
     ASSERT(SIZEOF(.text) < 0x1000, "UART fixture text overlaps stack")
     ASSERT(stack_top <= 0x41000000, "UART fixture must remain MRAM-only")
 }
