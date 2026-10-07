@@ -27,6 +27,7 @@ docker create --name "$NAME-build" --cpus "$J" -e J="$J" \
     python3 tests/test_erbctl_console.py
     python3 tests/test_erbium_uart_client.py
     python3 tests/test_uart_runner.py
+    python3 tests/test_host_share.py
     scripts/test-uart-backend.sh
     python3 tests/test_linux_config.py
     scripts/package-dist.sh pristine

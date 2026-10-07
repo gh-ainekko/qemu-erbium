@@ -3,14 +3,24 @@
 # No backend ELF preload. Default is an interactive Linux shell.
 set -euo pipefail
 R=$(cd "$(dirname "$0")/.." && pwd); . "$R/scripts/env.sh"
-MODE=(); MARKER=
-case "${1:-}" in
-  '') ;;
-  --test) MODE=(--uart-test); MARKER=ERBIUM-UART-TEST-RESULT ;;
-  --kotama-test) MODE=(--kotama-test); MARKER=ERBIUM-KOTAMA-UART-TEST-RESULT ;;
-  *) echo "usage: $0 [--test | --kotama-test] (KEEP_UART_LOGS=1 retains session files)" >&2; exit 2;;
-esac
-[ "$#" -le 1 ] || { echo "Too many arguments" >&2; exit 2; }
+MODE=(); MARKER=; SHARE_DIR=""; SHARE_MODE=""; SHARE_OPTIONS=()
+usage() { echo "usage: $0 [--test | --kotama-test] [--share DIR | --share-rw DIR] (KEEP_UART_LOGS=1 retains session files)" >&2; exit 2; }
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --test|--kotama-test)
+      [ -z "$MARKER" ] || usage
+      if [ "$1" = --test ]; then MODE=(--uart-test); MARKER=ERBIUM-UART-TEST-RESULT
+      else MODE=(--kotama-test); MARKER=ERBIUM-KOTAMA-UART-TEST-RESULT; fi
+      shift;;
+    --share|--share-rw)
+      [ "$#" -ge 2 ] && [ -n "$2" ] && [ -z "$SHARE_MODE" ] || usage
+      SHARE_MODE=ro; [ "$1" != --share-rw ] || SHARE_MODE=rw
+      SHARE_DIR=$2; SHARE_OPTIONS=("$1" "$2"); shift 2;;
+    *) usage;;
+  esac
+done
+prepare_share
+[ -z "$SHARE_MODE" ] || SHARE_OPTIONS=("${SHARE_OPTIONS[0]}" "$SHARE_DIR")
 require_guest
 [ -x "$EMU" ] || { echo "Missing erbium_emu: $EMU" >&2; exit 1; }
 T=$(mktemp -d /tmp/erbium-uart.XXXXXX)
@@ -60,7 +70,7 @@ if [ ! -S "$T/control.sock" ] || [ ! -S "$T/uart.sock" ]; then
   cat "$T/backend.log" >&2
   exit 1
 fi
-ARGS=(--backend "$T/control.sock" --mram "$T/mram.img" --uart-socket "$T/uart.sock")
+ARGS=("${SHARE_OPTIONS[@]}" --backend "$T/control.sock" --mram "$T/mram.img" --uart-socket "$T/uart.sock")
 if [ -z "$MARKER" ]; then
   echo "Fresh held Erbium; Linux ttyAMA1 is connected to its UART (ttyAMA0 remains the host console)."
   echo "In Linux: erbctl console /dev/ttyAMA1 (Ctrl-] exits). See docs/uart-console.md for attach/load steps."

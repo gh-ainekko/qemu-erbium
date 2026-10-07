@@ -118,3 +118,63 @@ attaches raw UART first, then runs the verified ELF loader while relaying output
 Without `--load`, it only opens the tty. Ctrl-] exits an interactive session.
 `--uart-test` and `--kotama-test` runner modes automate binary IRQ/WFI echo/reload
 and real Kotama `info` acceptance respectively, using the actual guest UART1.
+
+## Host shared folders
+
+Source checkouts: build/update both components once (existing configurations
+are upgraded). New binary distributions already contain this support:
+
+```sh
+J=2 scripts/build-all.sh qemu
+J=2 scripts/build-all.sh linux
+```
+
+Export one existing directory to the Linux guest, automatically mounted at
+`/mnt/host`:
+
+```sh
+scripts/run-linux.sh --share /absolute/host/folder   # read-only default
+scripts/run-uart.sh --share /absolute/host/firmware  # UART + xSPI + shared files
+scripts/run-uart.sh --share-rw /absolute/host/folder # explicitly allow writes
+```
+
+Paths containing spaces work; quote them. Relative paths are resolved before
+launch. Commas/newlines and duplicate share options are rejected. Without either
+option no host directory is exported. A failed requested mount powers off rather
+than leaving an apparently shared, writable directory in guest RAM.
+
+For example, build `application.elf` in the exported host directory, then inside
+Linux run:
+
+```sh
+ls /mnt/host
+erbctl console /dev/ttyAMA1 --load /mnt/host/application.elf
+```
+
+No initramfs rebuild is needed when firmware changes. Files are transported by
+virtio-9p over the board's existing virtio-MMIO devices, not Ethernet. The share
+belongs to ARM Linux, not directly to Erbium: the existing xSPI loader still
+uploads/verifies the ELF and the UART remains a separate cable.
+
+Read-only is enforced by QEMU as well as by the guest mount. Read-write exports
+allow guest modification/deletion of files in the directory. Run QEMU as your
+ordinary user and export only a dedicated directory you trust the guest with,
+not your home directory or filesystem root. Shares use `mapped-xattr`: guest
+ownership/mode/symlink metadata is represented using host extended attributes
+(and guest-created symlinks use QEMU's mapped representation). RW exports require
+a filesystem supporting user xattrs; host permissions need not equal the guest's
+virtual permissions. File contents remain ordinary host files. Mounts use
+`nodev,nosuid,cache=none`; host changes are visible, but concurrent writes still
+require coordination. Rebuild ELF outputs completely before starting a load.
+
+`scripts/run-share-test.sh` exercises RO enforcement even after a guest-root
+remount attempt, RW creation/appending visible on the host, paths with spaces,
+and host-side updates visible to an already-mounted guest. It is included in
+E2E and binary-distribution tests.
+
+Shared-folder sessions explicitly use **single-thread TCG**, still exposing both
+ARM guest CPUs. The pinned QEMU/kernel combination showed an intermittent SMP
+queued-spinlock crash/hang under concurrent 9P reads with multithreaded TCG.
+Serialized TCG is a tested mitigation, not a claimed upstream root-cause fix;
+it can reduce parallel guest CPU throughput. Non-shared sessions retain their
+existing accelerator defaults. The Erbium backend remains a separate process.

@@ -14,7 +14,7 @@ docker create --name "$NAME" --cpus "${J:-2}" -w /opt/erbium \
     set -euo pipefail
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-      libglib2.0-0t64 libpixman-1-0 libfdt1 libslirp0 libgcrypt20 zlib1g libstdc++6 libgcc-s1
+      libglib2.0-0t64 libpixman-1-0 libfdt1 libslirp0 libgcrypt20 libattr1 zlib1g libstdc++6 libgcc-s1
     sha256sum -c "$ARCHIVE.sha256"
     tar xzf "$ARCHIVE"
     timeout 180 dist/scripts/run-e2e.sh

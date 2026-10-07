@@ -11,7 +11,7 @@ fail() { echo "preflight: ERROR: $*" >&2; errors=$((errors + 1)); }
 file() { [ -s "$R/$1" ] || fail "Missing or empty file: $R/$1"; }
 tool() { command -v "$1" >/dev/null 2>&1 || fail "Missing command: $1 (Ubuntu package: $2)"; }
 selected() { [ "$target" = all ] || [ "$target" = "$1" ]; }
-for f in bootstrap.sh scripts/env.sh scripts/preflight.sh scripts/fetch-sources.sh scripts/sync-git-patches.sh scripts/build-all.sh scripts/configure-linux.sh scripts/build-load-test.sh scripts/build-uart-test.sh scripts/run-load-test.sh scripts/run-uart.sh scripts/run-uart-test.sh scripts/test-uart-backend.sh scripts/run-e2e.sh scripts/run-linux.sh linux/erbium.config linux/initramfs.list linux/rootfs/init linux/rootfs/erbium-test.sh linux/rootfs/erbium-load-test.sh linux/firmware/loader-smoke.S linux/firmware/loader-smoke.ld linux/tools/erbctl.c linux/tools/erbium-loader.c linux/tools/erbium-loader.h linux/tools/erbium-console.c linux/tools/erbium-console.h linux/tools/erbium-uart-test.c linux/rootfs/erbium-uart-test.sh linux/firmware/uart-smoke.S linux/firmware/uart-smoke.ld linux/tools/erbium-xspi.h; do file "$f"; done
+for f in bootstrap.sh scripts/env.sh scripts/preflight.sh scripts/fetch-sources.sh scripts/sync-git-patches.sh scripts/build-all.sh scripts/configure-linux.sh scripts/build-load-test.sh scripts/build-uart-test.sh scripts/run-load-test.sh scripts/run-uart.sh scripts/run-uart-test.sh scripts/run-share-test.sh scripts/test-uart-backend.sh scripts/run-e2e.sh scripts/run-linux.sh linux/erbium.config linux/initramfs.list linux/rootfs/init linux/rootfs/erbium-share-test.sh linux/rootfs/erbium-test.sh linux/rootfs/erbium-load-test.sh linux/firmware/loader-smoke.S linux/firmware/loader-smoke.ld linux/tools/erbctl.c linux/tools/erbium-loader.c linux/tools/erbium-loader.h linux/tools/erbium-console.c linux/tools/erbium-console.h linux/tools/erbium-uart-test.c linux/rootfs/erbium-uart-test.sh linux/firmware/uart-smoke.S linux/firmware/uart-smoke.ld linux/tools/erbium-xspi.h; do file "$f"; done
 shopt -s nullglob
 for dir in qemu-patches sysemu-patches linux/patches; do
   patches=("$R/$dir/"*.patch)
@@ -31,7 +31,7 @@ if [ "$mode" != fetch ]; then
   if selected qemu; then
     tool ninja ninja-build; tool flex flex; tool bison bison
     tool libgcrypt-config libgcrypt20-dev
-    modules+=(glib-2.0 pixman-1 slirp zlib)
+    modules+=(glib-2.0 pixman-1 slirp zlib libattr)
     if command -v python3 >/dev/null; then
       python3 -c 'import venv, ensurepip' 2>/dev/null || fail 'Python venv/ensurepip missing (Ubuntu package: python3-venv)'
     fi

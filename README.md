@@ -50,7 +50,7 @@ git clone https://github.com/gh-ainekko/qemu-erbium.git && cd qemu-erbium
 
 ```bash
 sudo apt-get update
-sudo apt-get install libglib2.0-0t64 libpixman-1-0 libfdt1 libslirp0 libgcrypt20 zlib1g libstdc++6 libgcc-s1
+sudo apt-get install libglib2.0-0t64 libpixman-1-0 libfdt1 libslirp0 libgcrypt20 libattr1 zlib1g libstdc++6 libgcc-s1
 sha256sum -c erbium-emu-dist-VERSION-ubuntu24.04-x86_64.tar.gz.sha256
 tar xzf erbium-emu-dist-*.tar.gz && cd dist
 scripts/run-e2e.sh          # 15 qtests + Linux guest test against erbium_emu (~30 s)
@@ -71,6 +71,11 @@ before uploading/starting your embedded ELF (Ctrl-] exits). Run
 `scripts/run-uart-test.sh` for the hermetic interrupt-driven echo/reload test or
 `--kotama` for a supplied Kotama payload. See `docs/uart-console.md`, including
 the distinction between functional byte-stream and electrical/baud timing.
+
+**Host shared folders:** add `--share /path/to/folder` to `scripts/run-linux.sh`
+or `scripts/run-uart.sh` to mount it read-only at `/mnt/host`. Use `--share-rw`
+for explicit write access. Load a rebuilt ELF directly from that mount without
+rebuilding the initramfs. See `linux/README.md` for build updates and permissions.
 
 **Pieces** (all driven by `scripts/`):
 

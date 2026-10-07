@@ -41,3 +41,27 @@ require_guest() {
     return 1
   fi
 }
+
+# One explicitly selected host export. Validate before either emulator starts.
+# QEMU keyvals use commas as separators; never let a pathname inject options.
+prepare_share() {
+  SHARE_ARGS=(); SHARE_CMDLINE=""
+  [ -n "${SHARE_MODE:-}" ] || return 0
+  case "$SHARE_MODE" in ro|rw) ;; *) echo 'Invalid share mode' >&2; return 2;; esac
+  case "$SHARE_DIR" in *','*|*$'\n'*|*$'\r'*) echo 'Share paths must not contain commas or newlines' >&2; return 2;; esac
+  [ -d "$SHARE_DIR" ] || { echo "Share directory does not exist: $SHARE_DIR" >&2; return 2; }
+  # Keep filename trailing newlines until validation; command substitution
+  # otherwise strips them and could silently select a different sibling tree.
+  SHARE_DIR=$(CDPATH= cd -- "$SHARE_DIR" && pwd -P && printf '.') || return 2
+  SHARE_DIR=${SHARE_DIR%.}
+  SHARE_DIR=${SHARE_DIR%$'\n'}
+  case "$SHARE_DIR" in *','*|*$'\n'*|*$'\r'*) echo 'Resolved share path must not contain commas or newlines' >&2; return 2;; esac
+  local readonly=on
+  [ "$SHARE_MODE" != rw ] || readonly=off
+  # This pinned kernel/QEMU pair showed a queued-spinlock oops/hang with
+  # concurrent 9P reads under MTTCG. Serialize vCPU execution for shared-folder
+  # sessions; this retains both guest CPUs and does not affect the UART peer.
+  SHARE_ARGS=(-accel tcg,thread=single -fsdev "local,id=hostshare,path=$SHARE_DIR,security_model=mapped-xattr,readonly=$readonly,multidevs=remap"
+              -device virtio-9p-device,fsdev=hostshare,mount_tag=hostshare)
+  SHARE_CMDLINE="erbium.share=$SHARE_MODE"
+}

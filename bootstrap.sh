@@ -13,7 +13,7 @@ if [ -z "${SKIP_APT:-}" ]; then
   "${APT[@]}" apt-get update -qq
   "${APT[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     ca-certificates build-essential git curl patch xz-utils libc6-dev-arm64-cross ninja-build meson pkg-config flex bison python3-venv python3-pip ccache \
-    libglib2.0-dev libpixman-1-dev libfdt-dev libslirp-dev zlib1g-dev libgcrypt20-dev \
+    libglib2.0-dev libpixman-1-dev libfdt-dev libslirp-dev zlib1g-dev libgcrypt20-dev libattr1-dev \
     cmake libgoogle-glog-dev liblz4-dev lz4 \
     gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf \
     gcc-aarch64-linux-gnu libssl-dev libelf-dev bc cpio kmod dwarves device-tree-compiler

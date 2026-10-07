@@ -39,7 +39,17 @@ and connect to the supplied echo fixture:
 erbctl console /dev/ttyAMA1 --load /firmware/uart-smoke.elf
 ```
 
-For your own ELF, first embed it in the **Linux host** initramfs:
+For your own ELF, you can now avoid rebuilding the initramfs:
+
+```sh
+scripts/run-uart.sh --share /absolute/host/firmware-directory
+# Inside Linux:
+erbctl console /dev/ttyAMA1 --load /mnt/host/application.elf
+```
+
+The share is read-only by default. See `linux/README.md` for shared-folder build
+updates, write access and permissions. Alternatively, embed the ELF in the
+**Linux host** initramfs:
 
 ```sh
 ERBIUM_ELF=/absolute/path/application.elf J=2 scripts/build-all.sh linux
