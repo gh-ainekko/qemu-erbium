@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <focus><focusNew>yes</focusNew></focus>
+  <desktops><number>1</number></desktops>
+  <applications>
+    <application name="*"><position force="yes"><x>0</x><y>0</y></position>
+      <decor>no</decor><maximized>yes</maximized>
+    </application>
+  </applications>
+  <!-- No terminal/runner/menu shortcuts in this dedicated desktop. -->
+  <keyboard/>
+  <mouse/>
+</openbox_config>
