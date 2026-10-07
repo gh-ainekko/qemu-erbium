@@ -43,6 +43,13 @@ method menuFor MicroBlocksAPI items callback class {
 	popUpAtHand nativeMenu (global 'page')
 }
 
+// The upstream script-area right-click forwards to its HTML menu. Reuse GP's
+// existing native menu instead; block/input-slot menus already remain native.
+method rightClicked ScriptEditor aHand {
+	popUpAtHand (contextMenuForGP this) (page aHand)
+	return true
+}
+
 // Prompter widgets are still supplied by the GP library, but Page's entry
 // points have been redirected to HTML. Restore those native entry points.
 method prompt Page question default editRule callback details {

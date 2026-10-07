@@ -23,7 +23,8 @@ if ! systemctl is-active --quiet smallvm-ide.service; then
 fi
 sudo apt-get update -qq
 sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  xvfb x11vnc novnc websockify xdotool openbox fonts-dejavu-core x11-utils xauth
+  xvfb x11vnc novnc websockify xdotool openbox fonts-dejavu-core x11-utils xauth \
+  libpangocairo-1.0-0 libcairo2 libasound2t64
 sudo tee /etc/systemd/system/smallvm-ide.service >/dev/null <<EOF
 [Unit]
 Description=Native MicroBlocks IDE + Erbium emulator (authenticated noVNC)

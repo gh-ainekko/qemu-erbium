@@ -19,10 +19,13 @@ class SameOrigin:
         origin = headers.get('Origin')
         if not origin:
             return  # native local clients; remote requests still cross the private proxy
-        parsed = urlsplit(origin)
+        try:
+            parsed = urlsplit(origin)
+        except ValueError:
+            raise AuthenticationError(response_code=403, response_msg='Invalid desktop origin')
         host = headers.get('X-Forwarded-Host', headers.get('Host', '')).lower()
         scheme = headers.get('X-Forwarded-Proto', 'http').lower()
-        if (parsed.scheme != scheme or parsed.netloc.lower() != host
+        if (not host or not parsed.netloc or parsed.scheme != scheme or parsed.netloc.lower() != host
                 or parsed.path not in ('', '/') or parsed.query or parsed.fragment):
             raise AuthenticationError(response_code=403, response_msg='Cross-origin desktop access denied')
 

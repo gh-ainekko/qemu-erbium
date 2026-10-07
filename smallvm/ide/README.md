@@ -21,6 +21,8 @@ The setup script installs `xvfb x11vnc novnc websockify xdotool openbox
 fonts-dejavu-core x11-utils xauth` with apt. `python3-pil` and `scrot` were also
 installed on this VM for shell screenshot validation; they are not required by
 the service. The distro noVNC assets are `/usr/share/novnc`.
+The native GP runtime's direct Pango/Cairo/ALSA dependencies are installed
+explicitly too (`libpangocairo-1.0-0 libcairo2 libasound2t64`).
 
 One supervisor owns one emulator and one desktop session:
 
@@ -51,10 +53,14 @@ Press **Start**, select **Variables**, and click `answer`: the board returns
 Toolbar controls: File, Connect, Start, Stop, Settings, zoom, categories, and
 Libraries. File → Open starts in `smallvm/examples`. Connect includes the
 explicit stable emulator port and a native port-name prompt.
+Open/Save use the **VM's filesystem**, not your laptop's. Save edited projects
+before restarting the entire service; that restarts the desktop and reopens
+the showcase. Refresh the browser after a full service restart.
 
 The pinned GP binary predates the HTML API primitives used by the pinned IDE
 source. `native-compat.gp` restores native toolbar/category/library controls,
-native prompts/save dialogs, and bitmap running highlights/drag shadows.
+native prompts/save dialogs, script-area context menus, and bitmap running
+highlights/drag shadows.
 It provides inert browser-only notifications and local persisted preferences;
 the editor, project parser, compiler, decompiler, bytecode protocol, and serial
 primitives remain the real upstream implementation. It also loads current SVG
