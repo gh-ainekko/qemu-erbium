@@ -1,5 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include <stdint.h>
+#ifdef SMALLVM_SELFTEST
+#include <stdio.h>
+#endif
 #include "mem.h"
 #include "interp.h"
 #include "platform.h"
@@ -109,6 +112,52 @@ void smallvm_platform_diag(const char *text) {
 void test_report(const char *line) {
     smallvm_platform_diag(line);
     smallvm_platform_diag("\n");
+}
+
+static uint64_t timerTicks(void) {
+    return *(volatile uint64_t *)(uintptr_t)ESR_MTIME;
+}
+static uint64_t performanceCycles(void) {
+    uint64_t cycles;
+    __asm__ volatile("csrr %0, 0xb03" : "=r"(cycles) :: "memory");
+    return cycles;
+}
+
+int smallvm_platform_timer_selftest(void) {
+    /*
+     * Standard rdcycle/mcycle are hardwired zero in current sysemu. Minion
+     * mhpmevent3=1 selects CYCLES; mhpmcounter3 then uses the independently
+     * tracked simulator cycle baseline (insns/zicsr.cpp), not MTIME.
+     * Reserve that counter temporarily on this sole running hart.
+     */
+    uint64_t oldEvent;
+    __asm__ volatile("csrr %0, 0x323" : "=r"(oldEvent));
+    __asm__ volatile("csrwi 0x323, 1" ::: "memory");
+    uint64_t cyclesStart = performanceCycles();
+    uint64_t ticksStart = timerTicks();
+    for (unsigned i = 0; i < 20000; ++i) __asm__ volatile("nop");
+    uint64_t ticks = timerTicks() - ticksStart;
+    uint64_t cycles = performanceCycles() - cyclesStart;
+    uint64_t expectedCycles = ticks * (200000000u / ERBIUM_TIMER_HZ);
+    uint64_t error = cycles > expectedCycles ? cycles - expectedCycles : expectedCycles - cycles;
+    /* Sampling skew of the MMIO/CSR reads plus one-percent tolerance. */
+    int failed = !ticks || !cycles || error > 1000u + cycles / 100u;
+    uint64_t delayCycles = 0;
+    if (!failed) {
+        cyclesStart = performanceCycles();
+        delay(1);
+        delayCycles = performanceCycles() - cyclesStart;
+        /* 1ms at 200MHz, allowing microsecond quantization and polling skew. */
+        failed = delayCycles < 194000u || delayCycles > 206000u;
+    }
+    __asm__ volatile("csrw 0x323, %0" :: "r"(oldEvent) : "memory");
+    char report[160];
+    snprintf(report, sizeof(report),
+        "%s timer-calibration cycles=%u ticks=%u ticks_per_us=%u delay_1ms_cycles=%u",
+        failed ? "FAIL" : "PASS", (unsigned)cycles, (unsigned)ticks,
+        ERBIUM_TIMER_HZ / 1000000u, (unsigned)delayCycles);
+    test_report(report);
+    return failed;
 }
 #endif
 

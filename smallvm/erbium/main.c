@@ -7,12 +7,14 @@
 int main(void) {
     /* UART must work before allocation/layout checks can panic. */
     hardwareInit();
-    memInit();
-    primsInit();
-    restoreScripts(); /* upstream unrecognized-platform branch: volatile RAM */
 #ifdef SMALLVM_SELFTEST
     extern int smallvm_selftest(void);
     smallvm_platform_diag("SmallVM selftest BEGIN\n");
+    if (smallvm_platform_timer_selftest()) {
+        smallvm_platform_diag("SMALLVM_SELFTEST FAIL timer calibration\n");
+        smallvm_platform_flush();
+        for (;;) __asm__ volatile("wfi");
+    }
     uint64 start = totalMicrosecs();
     /* A broken timer should fail visibly, not hang inside delay(). */
     for (unsigned spin = 0; spin < 1000000 && totalMicrosecs() == start; ++spin)
@@ -39,8 +41,16 @@ int main(void) {
     restoreScripts();
     /* Drain test-generated frames into the selftest sink before enabling UART. */
     processMessage();
+#else
+    memInit();
+    primsInit();
+    restoreScripts(); /* upstream unrecognized-platform branch: volatile RAM */
 #endif
     smallvm_platform_start_protocol();
+    /* A real binary-protocol readiness frame, never an unframed debug banner.
+     * outputString() intentionally skips output before an IDE has connected. */
+    char started[] = "\002Started MicroBlocks on Erbium";
+    waitAndSendMessage(outputValueMsg, 255, sizeof(started) - 1, started);
     if (boardStartAtBoot()) startAll();
     vmLoop();
     return 0;

@@ -8,6 +8,9 @@ void smallvm_platform_diag(const char *text);
 void smallvm_platform_start_protocol(void);
 void smallvm_platform_flush(void);
 void delay(unsigned long msecs);
+#ifdef SMALLVM_SELFTEST
+int smallvm_platform_timer_selftest(void);
+#endif
 void smallvm_fault(uintptr_t cause, uintptr_t pc, uintptr_t value, uintptr_t sp)
     __attribute__((noreturn));
 #endif
