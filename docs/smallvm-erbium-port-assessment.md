@@ -47,7 +47,8 @@ SmallVM evidence:
   `OBJ *`. GC forwarding fields and pointer-reversal marking store addresses in
   32-bit words. This is not merely a compiler-warning issue.
 - `vm/interp.c:pushLiteral_op` constructs object references directly into the
-  downloaded code/literal store. Primitive-name literals do likewise.
+  downloaded code/literal store. Primitive-name literals do likewise, and
+  `interp.c` also defines a static string object outside the heap.
 - `vm/persist.h` describes 32-bit persistent record words and 16-bit bytecode.
 
 A native x86-64 LP64 probe including upstream `mem.h` reported:
@@ -70,7 +71,9 @@ Separate native C pointers from VM values:
   its MRAM is `0x40000000..0x40ffffff`, below 2 GiB. Reserve both object heap and
   code/literal storage there and enforce their bounds in the linker and tests.
 - Alternatively use offsets in a defined VM arena. If doing so, the arena must
-  cover code literals as well as heap objects, or explicitly distinguish them.
+  cover code literals and static objects as well as heap objects, or explicitly
+  distinguish them. Absolute-address handles likewise need checked placement
+  for static objects; a host regression harness must arrange low-address storage.
 - Audit direct object dereferences, field writes, byte-array access, stack and
   global roots, GC marking/forwarding/compaction, primitive arguments, and
   integer tag conversion (including negative values and shifts).
@@ -112,6 +115,11 @@ point type. Supply a compatible bare-metal libc/libm/compiler runtime, or a
 reviewed minimal subset, plus syscall stubs as required. The tiny local
 `-nostdlib` mailbox worker is not evidence that the VM can link unchanged.
 Check the final ELF/disassembly for unsupported instructions and relocations.
+The independent audit verified the installed GCC's LP64 data model/multilib
+selection, but cross-compiling `mem.c` stopped at missing `stdio.h`: the local
+compiler installation does not currently provide the required C library headers.
+Also audit non-pointer LP64 changes such as the `long`-based integer conversion
+in `miscPrims.c`; scalar handles alone do not fix every data-model assumption.
 
 Startup must establish stack/global-pointer state, initialize data/BSS,
 install useful fault handling, and keep other harts out of VM initialization.
@@ -154,6 +162,9 @@ TamaGo evidence:
   `riscv64/timer.go`. That implies 50 microseconds per tick in this profile,
   **not** one tick per 200 MHz CPU clock. Implement integer conversions to
   wrapping 32-bit VM timers; qualify physical hardware timing separately.
+  In particular, local `docs/trm/cpu_subsystem.txt` section 2.9 describes a
+  prescaled 10 MHz timer. Treat the discrepancy as a configuration/calibration
+  question, not evidence that hardware universally has 50-microsecond ticks.
 - `soc/aifoundry/erbium/erbium.go`: Shakti UART at `0x02004000`, system
   configuration at `0x02000008`.
 - `soc/aifoundry/uart/shakti.go`: enable system-config bit 6; TX/RX/status
@@ -189,6 +200,11 @@ the VM protocol itself need not change. This has higher scope than UART.
 
 ## 4. Persistent scripts in MRAM
 
+For the very first executable milestone, the fallback in `vm/persist.c`
+already provides a 40 KiB RAM code store with no filesystem dependency.
+Use it to prove scripts and IDE communication before adding durability; its
+BSS-backed contents must not be advertised as surviving normal firmware boots.
+
 `vm/persist.c` already has a platform porting boundary: `START`, `HALF_SPACE`,
 `flashErase`, `flashWriteData`, and `flashWriteWord`. Add an Erbium branch with
 two reserved MRAM half-spaces. Erase can fill the expected erased pattern
@@ -199,6 +215,10 @@ Verify initialization, saved-program readback, automatic start, delete,
 compaction, and interrupted updates. Persistent MRAM does not by itself make
 the existing multiword update protocol power-fail safe. Retain the MRAM backing
 file across emulator restarts; ensure boot/load/reset never clears this region.
+Validate stored record lengths before traversal and test live references into
+code storage during compaction. Initially stop tasks and clear stale literal
+references when moving code; unrestricted live-update correctness needs explicit
+tests, not just a successful upload.
 Do not confuse script/code persistence with automatically saving all live
 heap objects or variables. A filesystem is not required for this milestone.
 
