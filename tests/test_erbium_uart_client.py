@@ -19,6 +19,12 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 BANNER = b"ERBIUM-UART-SMOKE-v1\r\n"
 BINARY = b"\x00\r\n\x11\x13\xff"
+KOTAMA_BOOT = b"\r\ntamago/riscv64 (go1.27.1) \xe2\x80\xa2 Kotama\r\n"
+KOTAMA_PROMPT = b"\x1b[31m> \x1b[0m"
+KOTAMA_INFO = (b"SoC ..........: Erbium (eb680000) @ 200 MHz (rv64cfimsux)\r\n"
+               b"Minions ......: 1\r\n"
+               b"Runtime ......: go1.27.1 tamago/riscv64 thread 0\r\n"
+               b"RAM ..........: 0x40000000-0x41000000 (16 MiB)\r\n")
 
 
 class UartGuestClient(unittest.TestCase):
@@ -29,12 +35,20 @@ class UartGuestClient(unittest.TestCase):
         subprocess.run(
             ["gcc", "-O2", "-Wall", "-Wextra", "-Werror", "-o", str(cls.binary),
              str(ROOT / "linux/tools/erbium-uart-test.c")], check=True)
+        cls.wrapper = Path(cls.directory.name) / "uart-test.sh"
+        cls.wrapper.write_text(
+            (ROOT / "linux/rootfs/erbium-uart-test.sh").read_text().replace(
+                "/usr/bin/erbium-uart-test", str(cls.binary)))
+        cls.wrapper.chmod(0o755)
 
     @classmethod
     def tearDownClass(cls):
         cls.directory.cleanup()
 
-    def exercise(self, mode="echo"):
+    def exercise(self, mode="echo", elf_override=None, wrapper=False):
+        kotama = mode.startswith("kotama")
+        expected_elf = elf_override or (
+            "/firmware/host-payload.elf" if kotama else "/firmware/uart-smoke.elf")
         with tempfile.TemporaryDirectory() as d:
             event = Path(d) / "releases"
             event.write_text("")
@@ -42,7 +56,7 @@ class UartGuestClient(unittest.TestCase):
             fake.write_text("""#!/usr/bin/env python3
 import json, os, sys, time
 from pathlib import Path
-assert sys.argv[1:] == ["-d", "/dev/erbium0", "load", "/firmware/uart-smoke.elf",
+assert sys.argv[1:] == ["-d", "/dev/erbium0", "load", os.environ["TEST_ELF"],
                         "--mtd", "/dev/mtd0", "--verify", "--start"]
 # A descriptor leaked to erbctl could steal the banner.
 for p in Path("/proc/self/fd").iterdir():
@@ -68,10 +82,16 @@ if os.environ["TEST_MODE"] == "loader-hang":
                 os.write(master, b"\x00")
             os.set_blocking(master, False)
             env = dict(os.environ, TEST_TTY=tty_name, TEST_RELEASES=str(event),
-                       TEST_MODE=mode)
+                       TEST_MODE=mode, TEST_ELF=expected_elf)
+            args = [str(self.wrapper if wrapper else self.binary),
+                    "--tty", tty_name, "--erbctl", str(fake),
+                    "--timeout-ms", "1000"]
+            if elf_override:
+                args += ["--elf", elf_override]  # Must survive subsequent --kotama.
+            if kotama:
+                args += ["--kotama"]
             process = subprocess.Popen(
-                [str(self.binary), "--tty", tty_name, "--erbctl", str(fake),
-                 "--timeout-ms", "1000"],
+                args,
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, env=env)
             traffic = bytearray()
@@ -79,6 +99,7 @@ if os.environ["TEST_MODE"] == "loader-hang":
             pending = bytearray()
             signal_sent = False
             exclusive_seen = False
+            response_sent = False
             deadline = time.monotonic() + 6
             try:
                 while process.poll() is None and time.monotonic() < deadline:
@@ -107,6 +128,18 @@ if os.environ["TEST_MODE"] == "loader-hang":
                         elif mode == "signal" and not signal_sent:
                             os.kill(process.pid, signal.SIGTERM)
                             signal_sent = True
+                        elif mode == "kotama-signal":
+                            os.kill(process.pid, signal.SIGTERM)
+                        elif kotama:
+                            pending += (b"\r\nnot-TamaGo\r\n" if mode == "kotama-no-banner"
+                                        else KOTAMA_BOOT)
+                            if mode == "kotama-boot-info-only":
+                                pending += KOTAMA_INFO
+                            pending += b"\x1b[36minfo\t # device information\r\n\x1b[0m\r\n"
+                            if mode != "kotama-no-prompt":
+                                pending += KOTAMA_PROMPT
+                            if mode == "kotama-prequeued-info":
+                                pending += KOTAMA_INFO + KOTAMA_PROMPT
                     r, w, _ = select.select(
                         [master], [master] if pending else [], [], 0.005)
                     if r:
@@ -119,6 +152,16 @@ if os.environ["TEST_MODE"] == "loader-hang":
                             pending += data
                         elif mode == "wrong-echo" and data:
                             pending += bytes([data[0] ^ 1]) + data[1:]
+                        elif kotama and len(traffic) >= 5 and not response_sent:
+                            self.assertEqual(traffic, b"info\r")
+                            response_sent = True
+                            pending += b"info\r\n"
+                            if mode not in ("kotama-echo-only", "kotama-boot-info-only",
+                                            "kotama-no-response"):
+                                pending += (KOTAMA_INFO.replace(b"0x41000000", b"0x42000000")
+                                            if mode == "kotama-wrong-ram" else KOTAMA_INFO)
+                            if mode != "kotama-no-response":
+                                pending += b"\r\n" + KOTAMA_PROMPT
                     if w:
                         # Fragment banners/echo to exercise partial reads.
                         n = os.write(master, pending[:7])
@@ -210,6 +253,84 @@ if os.environ["TEST_MODE"] == "loader-hang":
         finally:
             os.close(slave)
             os.close(master)
+
+    def test_kotama_info_requires_real_response_and_one_guest_load(self):
+        rc, stdout, stderr, releases, traffic = self.exercise("kotama")
+        self.assertEqual(rc, 0, stderr.decode())
+        self.assertEqual(stdout, b"ALL KOTAMA UART TESTS PASSED\n")
+        self.assertEqual(releases, 1)
+        self.assertEqual(traffic, b"info\r")
+
+    def test_kotama_explicit_elf_override_survives_mode_selection(self):
+        rc, _, stderr, _, traffic = self.exercise("kotama", "/firmware/custom.elf")
+        self.assertEqual(rc, 0, stderr.decode())
+        self.assertEqual(traffic, b"info\r")
+
+    def test_wrapper_kotama_selects_real_payload_default(self):
+        rc, stdout, stderr, releases, traffic = self.exercise("kotama", wrapper=True)
+        self.assertEqual(rc, 0, stderr.decode())
+        self.assertEqual(stdout, b"ALL KOTAMA UART TESTS PASSED\n")
+        self.assertEqual(releases, 1)
+        self.assertEqual(traffic, b"info\r")
+
+    def test_wrapper_default_remains_hermetic(self):
+        rc, stdout, stderr, releases, _ = self.exercise(wrapper=True)
+        self.assertEqual(rc, 0, stderr.decode())
+        self.assertEqual(stdout, b"ALL UART TESTS PASSED\n")
+        self.assertEqual(releases, 2)
+
+    def test_kotama_echo_alone_is_not_success(self):
+        rc, stdout, stderr, _, traffic = self.exercise("kotama-echo-only")
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(traffic, b"info\r")
+        self.assertIn(b"fresh info response missing SoC: Erbium", stderr)
+
+    def test_kotama_boot_info_cannot_satisfy_command_response(self):
+        rc, _, stderr, _, _ = self.exercise("kotama-boot-info-only")
+        self.assertNotEqual(rc, 0)
+        self.assertIn(b"fresh info response missing SoC: Erbium", stderr)
+
+    def test_kotama_prequeued_info_fails_before_command(self):
+        rc, _, stderr, _, traffic = self.exercise("kotama-prequeued-info")
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(traffic, b"")
+        self.assertIn(b"unexpected/stale text after initial Kotama prompt", stderr)
+
+    def test_kotama_wrong_ram_fails(self):
+        rc, _, stderr, _, _ = self.exercise("kotama-wrong-ram")
+        self.assertNotEqual(rc, 0)
+        self.assertIn(b"missing RAM: 0x40000000-0x41000000", stderr)
+
+    def test_kotama_missing_boot_banner_fails(self):
+        rc, _, stderr, _, traffic = self.exercise("kotama-no-banner")
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(traffic, b"")
+        self.assertIn(b"without tamago/riscv64 boot banner", stderr)
+
+    def test_kotama_missing_prompt_times_out_before_command(self):
+        rc, _, stderr, _, traffic = self.exercise("kotama-no-prompt")
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(traffic, b"")
+        self.assertIn(b"wall-clock timeout", stderr)
+
+    def test_kotama_missing_response_times_out(self):
+        rc, _, stderr, _, traffic = self.exercise("kotama-no-response")
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(traffic, b"info\r")
+        self.assertIn(b"wall-clock timeout", stderr)
+
+    def test_kotama_signal_restores_terminal(self):
+        rc, stdout, stderr, _, traffic = self.exercise("kotama-signal")
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(traffic, b"")
+        self.assertIn(b"interrupted", stderr)
+
+    def test_kotama_rejects_fixture_rounds_option(self):
+        r = subprocess.run([str(self.binary), "--kotama", "--rounds", "2"],
+                           capture_output=True)
+        self.assertEqual(r.returncode, 2)
 
 
 if __name__ == "__main__":

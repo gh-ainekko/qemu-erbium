@@ -8,6 +8,8 @@
  * Open/configure before fork+exec erbctl load --verify --start. Keep the same
  * TTY open through repeated loads. No input flush, banner search/resync, or
  * mailbox console shortcut: stale/extra bytes are failures.
+ * Optional --kotama instead loads /firmware/host-payload.elf and requires
+ * TamaGo's boot banner, shell prompt, and a fresh Erbium/MRAM info response.
  * Handled SIGINT/SIGTERM/SIGHUP/SIGQUIT restore termios; SIGKILL/power loss
  * cannot be caught. Do not run a getty or another already-open peer client.
  *
@@ -47,6 +49,7 @@ static const char *elf = "/firmware/uart-smoke.elf";
 static const char *erbctl = "erbctl";
 static const char *device = "/dev/erbium0", *mtd = "/dev/mtd0";
 static int timeout_ms = 30000, rounds = 2;
+static bool kotama;
 
 static void on_signal(int sig) { interrupted = sig; }
 
@@ -322,6 +325,188 @@ static int echo_case(const unsigned char *data, size_t length)
     return assert_quiet(100);
 }
 
+/* The known Kotama shell uses ANSI CSI colors around a line-leading "> ".
+ * Strip CSI incrementally, including sequences fragmented across reads. Bound
+ * both raw traffic and normalized text, so chatter cannot defer the deadline.
+ * Reading one byte at a time leaves the prompt's trailing color reset queued;
+ * consume/check that decoration separately before issuing the info command. */
+#define KOTAMA_TEXT_LIMIT 65536
+struct kotama_text {
+    char text[KOTAMA_TEXT_LIMIT + 1];
+    size_t used, raw_bytes;
+    unsigned escape;
+};
+
+static int kotama_char(struct kotama_text *capture, unsigned char byte)
+{
+    if (++capture->raw_bytes > KOTAMA_TEXT_LIMIT)
+        return fail("Kotama output exceeded 64 KiB limit");
+    if (capture->escape == 1) {
+        if (byte != '[')
+            return fail("unsupported escape in Kotama output (expected ANSI CSI)");
+        capture->escape = 2;
+        return 0;
+    }
+    if (capture->escape == 2) {
+        if (byte >= 0x40 && byte <= 0x7e)
+            capture->escape = 0;
+        else if (byte < 0x20 || byte > 0x3f)
+            return fail("malformed ANSI CSI in Kotama output");
+        return 0;
+    }
+    if (byte == 0x1b) {
+        capture->escape = 1;
+        return 0;
+    }
+    if (byte == '\r')
+        return 0;
+    if (byte < 0x20 && byte != '\n' && byte != '\t')
+        return fail("unexpected control byte in Kotama output");
+    capture->text[capture->used++] = (char)byte;
+    capture->text[capture->used] = '\0';
+    return 1;
+}
+
+static int kotama_prompt(struct kotama_text *capture, int64_t deadline)
+{
+    for (;;) {
+        if (wait_tty(POLLIN, deadline) < 0)
+            return -1;
+        unsigned char byte;
+        ssize_t n = read(tty, &byte, 1);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN))
+            continue;
+        if (n < 0)
+            return syserr("read Kotama shell");
+        if (!n)
+            continue;
+        int visible = kotama_char(capture, byte);
+        if (visible < 0)
+            return -1;
+        size_t used = capture->used;
+        if (visible && used >= 2 && capture->text[used - 2] == '>' &&
+            capture->text[used - 1] == ' ' &&
+            (used == 2 || capture->text[used - 3] == '\n'))
+            return 0;
+    }
+}
+
+/* Do not allow queued boot text to masquerade as a response to info. Accept
+ * only the initial prompt's ANSI suffix/whitespace until a short quiet period;
+ * no flush, no arbitrary dropped bytes, no stale SoC/RAM response accepted. */
+static int kotama_prompt_tail(struct kotama_text *capture)
+{
+    int64_t deadline = now_ms() + 100;
+    capture->used = 0;
+    capture->text[0] = '\0';
+    for (;;) {
+        if (interrupted)
+            return fail("interrupted; restoring TTY");
+        int64_t ms = deadline - now_ms();
+        if (ms <= 0)
+            break;
+        struct pollfd p = { .fd = tty, .events = POLLIN };
+        int n = poll(&p, 1, (int)ms);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0)
+            return syserr("poll Kotama prompt decoration");
+        if (n == 0)
+            break;
+        if (p.revents & (POLLERR | POLLHUP | POLLNVAL))
+            return fail("TTY disconnected/error after Kotama prompt");
+        if (p.revents & POLLIN) {
+            unsigned char byte;
+            ssize_t r = read(tty, &byte, 1);
+            if (r < 0 && (errno == EINTR || errno == EAGAIN))
+                continue;
+            if (r < 0)
+                return syserr("read Kotama prompt decoration");
+            if (!r)
+                continue;
+            int visible = kotama_char(capture, byte);
+            if (visible < 0)
+                return -1;
+            if (visible && byte != ' ' && byte != '\n' && byte != '\t')
+                return fail("unexpected/stale text after initial Kotama prompt");
+        }
+    }
+    if (capture->escape)
+        return fail("incomplete ANSI decoration after Kotama prompt");
+    return 0;
+}
+
+/* Match a line's field/value, not a command echo or a substring in boot help.
+ * Dot/space label padding matches the pinned Kotama info command's output. */
+static bool kotama_field(const char *text, const char *field, const char *value)
+{
+    size_t field_len = strlen(field), value_len = strlen(value);
+    const char *line = text;
+    while (*line) {
+        if (!strncmp(line, field, field_len)) {
+            const char *p = line + field_len;
+            while (*p == ' ' || *p == '.')
+                ++p;
+            if (*p == ':') {
+                ++p;
+                while (*p == ' ' || *p == '\t')
+                    ++p;
+                if (!strncmp(p, value, value_len) &&
+                    (p[value_len] == '\n' || p[value_len] == '\0' ||
+                     p[value_len] == ' ' || p[value_len] == '('))
+                    return true;
+            }
+        }
+        const char *next = strchr(line, '\n');
+        if (!next)
+            break;
+        line = next + 1;
+    }
+    return false;
+}
+
+static int test_kotama(void)
+{
+    fprintf(stderr, "== Kotama UART test: guest load/start %s, peer %s\n", elf, tty_path);
+    phase = "Kotama before release (no stale bytes)";
+    if (assert_quiet(200) < 0)
+        return -1;
+    int64_t deadline = now_ms() + timeout_ms;
+    phase = "Kotama load/start, tamago/riscv64 banner and initial prompt";
+    if (start_firmware(deadline) < 0)
+        return -1;
+    struct kotama_text capture = {0};
+    if (kotama_prompt(&capture, deadline) < 0)
+        return -1;
+    if (!strstr(capture.text, "tamago/riscv64"))
+        return fail("initial shell prompt appeared without tamago/riscv64 boot banner");
+    if (kotama_prompt_tail(&capture) < 0)
+        return -1;
+
+    phase = "Kotama info command and fresh Erbium/MRAM response";
+    deadline = now_ms() + timeout_ms;
+    static const char command[] = "info\r";
+    size_t sent = 0;
+    while (sent < sizeof(command) - 1) {
+        if (wait_tty(POLLOUT, deadline) < 0)
+            return -1;
+        ssize_t n = write(tty, command + sent, sizeof(command) - 1 - sent);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN))
+            continue;
+        if (n < 0)
+            return syserr("write Kotama info command");
+        sent += (size_t)n;
+    }
+    capture = (struct kotama_text){0}; /* Boot evidence cannot satisfy info. */
+    if (kotama_prompt(&capture, deadline) < 0)
+        return -1;
+    if (!kotama_field(capture.text, "SoC", "Erbium"))
+        return fail("fresh info response missing SoC: Erbium (echo alone is not success)");
+    if (!kotama_field(capture.text, "RAM", "0x40000000-0x41000000"))
+        return fail("fresh info response missing RAM: 0x40000000-0x41000000");
+    return 0;
+}
+
 static int number(const char *arg, int limit)
 {
     char *end;
@@ -336,12 +521,18 @@ static void usage(const char *name)
 {
     fprintf(stderr, "usage: %s [--tty /dev/ttyAMA1] [--elf /firmware/uart-smoke.elf]\n"
             "       [--erbctl erbctl] [--device /dev/erbium0] [--mtd /dev/mtd0]\n"
-            "       [--timeout-ms 30000] [--rounds 2 (minimum 2)]\n", name);
+            "       [--timeout-ms 30000] [--rounds 2 (minimum 2, fixture only)]\n"
+            "       [--kotama] (one real load; default ELF /firmware/host-payload.elf)\n", name);
 }
 
 int main(int argc, char **argv)
 {
+    bool elf_set = false, rounds_set = false;
     for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--kotama")) {
+            kotama = true;
+            continue;
+        }
         if (!strcmp(argv[i], "--help")) {
             usage(argv[0]);
             return 0;
@@ -352,18 +543,20 @@ int main(int argc, char **argv)
         }
         const char *key = argv[i++], *value = argv[i];
         if (!strcmp(key, "--tty")) tty_path = value;
-        else if (!strcmp(key, "--elf")) elf = value;
+        else if (!strcmp(key, "--elf")) { elf = value; elf_set = true; }
         else if (!strcmp(key, "--erbctl")) erbctl = value;
         else if (!strcmp(key, "--device")) device = value;
         else if (!strcmp(key, "--mtd")) mtd = value;
         else if (!strcmp(key, "--timeout-ms")) timeout_ms = number(value, 600000);
-        else if (!strcmp(key, "--rounds")) rounds = number(value, 100);
+        else if (!strcmp(key, "--rounds")) { rounds = number(value, 100); rounds_set = true; }
         else { usage(argv[0]); return 2; }
     }
-    if (timeout_ms < 0 || rounds < 2) {
+    if (timeout_ms < 0 || rounds < 2 || (kotama && rounds_set)) {
         usage(argv[0]); /* Repeat load is mandatory acceptance, not optional. */
         return 2;
     }
+    if (kotama && !elf_set)
+        elf = "/firmware/host-payload.elf";
     if (atexit(cleanup) != 0)
         return 1;
     struct sigaction sa = { .sa_handler = on_signal };
@@ -376,6 +569,11 @@ int main(int argc, char **argv)
     int result = 1;
     if (open_peer() < 0)
         goto out;
+    if (kotama) {
+        if (test_kotama() == 0)
+            result = 0;
+        goto out;
+    }
     for (int round = 0; round < rounds; ++round) {
         fprintf(stderr, "== UART test: load/start %d/%d, same open %s\n",
                 round + 1, rounds, tty_path);
@@ -404,6 +602,6 @@ out:
     if (restore_tty() < 0 || interrupted)
         result = 1;
     if (!result)
-        puts("ALL UART TESTS PASSED");
+        puts(kotama ? "ALL KOTAMA UART TESTS PASSED" : "ALL UART TESTS PASSED");
     return result;
 }
