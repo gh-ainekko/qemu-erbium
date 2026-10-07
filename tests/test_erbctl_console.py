@@ -272,6 +272,24 @@ class ConsoleTests(unittest.TestCase):
         self.assertLess(elapsed, 2)
         self.restored()
 
+    def test_sparse_replies_near_eof_deadline_report_incomplete_quiet_period(self):
+        child = self.start()
+        self.close(self.input_w)
+        start = time.monotonic()
+        # Keep the peer active without leaving bytes in the local queues.
+        # The final byte at 2.75 s needs until 3.25 s to establish quiet,
+        # beyond the advertised 3 s hard drain deadline.
+        for i in range(19):
+            time.sleep(max(0, start + 0.05 + i * 0.15 - time.monotonic()))
+            self.send(self.master, bytes((i,)))
+            self.assertEqual(self.read_exact(self.output_r, 1), bytes((i,)))
+        last_reply = time.monotonic()
+        text = self.finish(child, code=1, timeout=2)
+        self.assertIn(b"drain timed out", text)
+        self.assertLess(time.monotonic() - last_reply, 0.5)
+        self.assertLess(time.monotonic() - start, 3.5)
+        self.restored()
+
     def test_pipe_eof_drains_queued_transmit_before_reply_grace(self):
         child = self.start()
         payload = bytes(range(256)) * 128

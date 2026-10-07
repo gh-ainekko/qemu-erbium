@@ -248,17 +248,18 @@ int erbctl_console(int argc, char **argv)
 			}
 			if (outq) quiet = now + QUIET_MS;
 		}
-		if (deadline && now >= deadline) {
-			if (tx.len || rx.len || outq || (!input_done && !uart_done)) {
-				fprintf(stderr, "erbctl: console: drain timed out\n");
-				result = 1;
-			}
-			break;
-		}
 		if (uart_done && !rx.len)
 			break;
 		bool finished = input_done && !uart_closing && !tx.len && !rx.len &&
 			!outq && quiet && now >= quiet;
+		/* Empty queues alone do not establish completion: sparse replies
+		 * can keep the quiet deadline in the future. Even when finished,
+		 * retain the final readiness probe before reporting success. */
+		if (deadline && now >= deadline && !finished) {
+			fprintf(stderr, "erbctl: console: drain timed out\n");
+			result = 1;
+			break;
+		}
 		if (!uart_done && rx.len < QUEUE_SIZE)
 			p[0].events |= POLLIN;
 		if (!uart_done && tx.len)
