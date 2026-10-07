@@ -49,6 +49,23 @@ checkout, not a missing apt package. Do not continue to `make` after an earlier
 step fails. `scripts/preflight.sh checkout` checks tracked inputs without
 installing anything; `scripts/preflight.sh deps` also checks tools and libraries.
 
+## Host ELF loading
+
+`erbctl load ELF [--verify] [--start | --check] [--mtd /dev/mtd0]` validates a
+static MRAM-only RISC-V ELF, uploads it, zeroes BSS and verifies readback. Default:
+leave CPUs held; `--start` releases minion 0 at `e_entry`; `--check` only validates.
+`erbctl hold` asserts CPU warm reset while preserving MRAM. Source updates include
+required backend reset semantics; do not use an older backend that merely stores
+the SoftReset field. See `../docs/host-elf-loading.md` for device pairing, limits,
+advisory-lock requirements and the full launch sequence.
+
+`scripts/run-load-test.sh` runs the embedded two-segment smoke ELF from empty
+MRAM with no emulator preload. To place a user-supplied ELF in the guest, build
+with `ERBIUM_ELF=/absolute/path/image.elf J=2 scripts/build-all.sh linux`; it appears
+at `/firmware/host-payload.elf` and is **not** automatically loaded into Erbium.
+The Linux build now also needs the stock RISC-V cross compiler to build the small
+loader fixture. UART transport remains unchanged.
+
 ## Run
 
 ```bash

@@ -1,0 +1,770 @@
+From 081af71388b3ab9d28a8615ffb5933afcfaec47a Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Wed, 7 Oct 2026 02:20:36 +0000
+Subject: [PATCH] erbium: model CPU warm-reset hold and host-controlled startup
+
+Wire SoftReset warm hold to execution gating and defer CPU-originated resets to safe cycle boundaries. Resample MINION_BOOT and hart reset state at release without reapplying CLI configuration or touching memory/peripherals. Keep CPU cold pulses and whole-system POR distinct.
+
+Add --start-held as an explicit startup/POR profile, including no-ELF socket service. Exercise held masks, changed boot PC, repeated socket uploads, preserved MRAM/SRAM and mailboxes, CPU CSR reset, WFI/reconnection, CPU-originated hold, cold pulses, xSPI-only reset, and default running launches with a standalone stdlib Python test.
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ sw-sysemu/devices/sysregs_er.cpp              |  18 +-
+ sw-sysemu/devices/sysregs_er.h                |   4 +
+ sw-sysemu/memory/erbium/main_memory.cpp       |   5 +
+ sw-sysemu/memory/erbium/main_memory.h         |   1 +
+ sw-sysemu/processor.cpp                       |   1 +
+ sw-sysemu/sys_emu/sys_emu.cpp                 |  19 +
+ sw-sysemu/sys_emu/sys_emu.h                   |   2 +
+ sw-sysemu/sys_emu/sys_emu_parse_args.cpp      |   6 +
+ sw-sysemu/system.cpp                          |  83 +++-
+ sw-sysemu/system.h                            |  14 +
+ sw-sysemu/tests/erbium/host/test_cpu_reset.py | 403 ++++++++++++++++++
+ 11 files changed, 551 insertions(+), 5 deletions(-)
+ create mode 100644 sw-sysemu/tests/erbium/host/test_cpu_reset.py
+
+diff --git a/sw-sysemu/devices/sysregs_er.cpp b/sw-sysemu/devices/sysregs_er.cpp
+index 9374788..9d7d595 100644
+--- a/sw-sysemu/devices/sysregs_er.cpp
++++ b/sw-sysemu/devices/sysregs_er.cpp
+@@ -154,9 +154,23 @@ void SysregsEr<Base>::write_register(const Agent& agent, uint64_t offset, uint32
+             }
+             break;
+ 
+-        case SOFT_RESET:
+-            soft_reset = value;
++        case SOFT_RESET: {
++            value &= SYSTEM_SOFTRESET_WRITE_MASK;
++            const uint32_t old = soft_reset;
++            // Bit 3 is a self-clearing CPU cold pulse. Bit 1 is a level
++            // hold; bit 2 is the independent active-low MRAM reset pin.
++            // MRAM reset never erases nonvolatile array contents. Controller
++            // reset timing is not modeled here.
++            const bool cold = SYSTEM_SOFTRESET_CPU_SOFT_RESET_GET(value);
++            const bool whole = SYSTEM_SOFTRESET_SOFT_RESET_GET(value);
++            const bool held = SYSTEM_SOFTRESET_CPU_WARM_RESET_GET(value);
++            soft_reset = value & ~SYSTEM_SOFTRESET_CPU_SOFT_RESET_FIELD_MASK;
++            if (cold || whole ||
++                ((old ^ value) & SYSTEM_SOFTRESET_CPU_WARM_RESET_FIELD_MASK)) {
++                agent.chip->request_erbium_reset(held, cold, whole);
++            }
+             break;
++        }
+ 
+         case POWER_DOMAIN_REQ:
+             power_domain_req = value;
+diff --git a/sw-sysemu/devices/sysregs_er.h b/sw-sysemu/devices/sysregs_er.h
+index e50565f..3ad0061 100644
+--- a/sw-sysemu/devices/sysregs_er.h
++++ b/sw-sysemu/devices/sysregs_er.h
+@@ -114,6 +114,10 @@ private:
+ 
+ public:
+     void reset(ResetCause cause = ResetCause::NONE);
++    // Startup strap/profile only; normal writes take the deferred CPU path.
++    void set_cpu_warm_reset(bool held) {
++        soft_reset = SYSTEM_SOFTRESET_CPU_WARM_RESET_MODIFY(soft_reset, held);
++    }
+ private:
+ 
+     // Static watchdog timeout handler, triggers cold reset
+diff --git a/sw-sysemu/memory/erbium/main_memory.cpp b/sw-sysemu/memory/erbium/main_memory.cpp
+index f9f458b..b1b5ba0 100644
+--- a/sw-sysemu/memory/erbium/main_memory.cpp
++++ b/sw-sysemu/memory/erbium/main_memory.cpp
+@@ -64,6 +64,11 @@ void MainMemory::por_reset()
+     dynamic_cast<SccrEr<region_bases[sccr_idx]>*>(regions[sccr_idx].get())->reset();
+ }
+ 
++void MainMemory::set_cpu_warm_reset(bool held)
++{
++    dynamic_cast<SysregsEr<region_bases[erbreg_idx]>*>(regions[erbreg_idx].get())->set_cpu_warm_reset(held);
++}
++
+ void MainMemory::wdt_clock_tick(const Agent& agent, uint64_t cycle)
+ {
+     auto ptr = dynamic_cast<SysregsEr<region_bases[erbreg_idx]>*>(regions[erbreg_idx].get());
+diff --git a/sw-sysemu/memory/erbium/main_memory.h b/sw-sysemu/memory/erbium/main_memory.h
+index 43f0047..08077e3 100644
+--- a/sw-sysemu/memory/erbium/main_memory.h
++++ b/sw-sysemu/memory/erbium/main_memory.h
+@@ -110,6 +110,7 @@ public:
+     // Power-on reset of the register blocks (system registers, SCCR stub)
+     // without touching memory contents (ROM, SRAM, MRAM survive).
+     void por_reset();
++    void set_cpu_warm_reset(bool held);
+ 
+     void read(const Agent& agent, addr_type addr, size_type n, void* result) {
+         const auto elem = search(addr, n);
+diff --git a/sw-sysemu/processor.cpp b/sw-sysemu/processor.cpp
+index 6c7c2c4..4d784b0 100644
+--- a/sw-sysemu/processor.cpp
++++ b/sw-sysemu/processor.cpp
+@@ -1804,6 +1804,7 @@ void Hart::warm_reset()
+         waits = Hart::Waiting::none;
+         links.unlink();
+     }
++    pending_unlink = false;
+ 
+     // Check if in program buffer
+     if (in_progbuf()) {
+diff --git a/sw-sysemu/sys_emu/sys_emu.cpp b/sw-sysemu/sys_emu/sys_emu.cpp
+index f4477c1..af9269d 100644
+--- a/sw-sysemu/sys_emu/sys_emu.cpp
++++ b/sw-sysemu/sys_emu/sys_emu.cpp
+@@ -541,8 +541,16 @@ void sys_emu::reset_chip()
+ #endif
+ 
+     // Reset the warm-reset part of the system
++#if EMU_ERBIUM
++    chip.memory.set_cpu_warm_reset(cmd_options.start_held);
++#endif
+     for (unsigned shire = 0; shire < EMU_NUM_SHIRES; ++shire) {
+         chip.begin_warm_reset(shire);
++#if EMU_ERBIUM
++        if (cmd_options.start_held) {
++            continue;
++        }
++#endif
+         chip.end_warm_reset(shire);
+     }
+ }
+@@ -631,6 +639,12 @@ int sys_emu::main_internal() {
+             }
+         }
+ 
++        // Safe boundary for resets requested by host MMIO or by an
++        // instruction in the preceding cycle; never unlink under a hart loop.
++#if EMU_ERBIUM
++        chip.process_erbium_reset();
++#endif
++
+         // Update peripherals/devices
+         chip.tick_peripherals(emu_cycle);
+ 
+@@ -779,6 +793,11 @@ int sys_emu::main_internal() {
+             }
+         }
+ 
++#if EMU_ERBIUM
++        // CPU-originated reset writes must also complete before evaluating
++        // the next iteration's liveness condition (even without a host API).
++        chip.process_erbium_reset();
++#endif
+         ++emu_cycle;
+     }
+ 
+diff --git a/sw-sysemu/sys_emu/sys_emu.h b/sw-sysemu/sys_emu/sys_emu.h
+index ab913e2..40fb28f 100644
+--- a/sw-sysemu/sys_emu/sys_emu.h
++++ b/sw-sysemu/sys_emu/sys_emu.h
+@@ -178,6 +178,8 @@ struct sys_emu_cmd_options {
+     std::string mram_file;
+     // UNIX socket path served by SocketAgent; empty: no host API
+     std::string api_socket_path;
++    // Explicit host-loader startup profile, reapplied on every whole-chip POR.
++    bool start_held = false;
+ #endif
+ };
+ 
+diff --git a/sw-sysemu/sys_emu/sys_emu_parse_args.cpp b/sw-sysemu/sys_emu/sys_emu_parse_args.cpp
+index 981b8b2..b13490f 100644
+--- a/sw-sysemu/sys_emu/sys_emu_parse_args.cpp
++++ b/sw-sysemu/sys_emu/sys_emu_parse_args.cpp
+@@ -61,6 +61,7 @@ static const char * help_msg =
+ "     --api-socket <path>      Listen on UNIX socket <path> and serve host READ/WRITE/RESET/PING requests\n"
+ "                              (see docs/protocol.md). Implies keep-alive with no active harts and, unless\n"
+ "                              -max_cycles is given, no cycle limit\n"
++"     --start-held             Hold CPU warm reset on startup and each POR; host releases SoftReset bit 1\n"
+ #endif
+ #ifndef SDK_RELEASE
+ "     -mem_reset <byte>        Reset value of main memory (default: 0)\n"
+@@ -205,6 +206,7 @@ sys_emu::parse_command_line_arguments(int argc, char* argv[])
+         {"mram_file",              required_argument, nullptr, 0},
+         {"api-socket",             required_argument, nullptr, 0},
+         {"api_socket",             required_argument, nullptr, 0},
++        {"start-held",             no_argument,       nullptr, 0},
+ #endif
+ #ifndef SDK_RELEASE
+         {"mem_reset",              required_argument, nullptr, 0},
+@@ -319,6 +321,10 @@ sys_emu::parse_command_line_arguments(int argc, char* argv[])
+         {
+             cmd_options.api_socket_path = optarg;
+         }
++        else if (!strcmp(name, "start-held"))
++        {
++            cmd_options.start_held = true;
++        }
+ #endif
+         else if (!strcmp(name, "l"))
+         {
+diff --git a/sw-sysemu/system.cpp b/sw-sysemu/system.cpp
+index fbdb728..9350001 100644
+--- a/sw-sysemu/system.cpp
++++ b/sw-sysemu/system.cpp
+@@ -70,6 +70,7 @@ void System::debug_reset(unsigned shire)
+ void System::begin_warm_reset(unsigned shire)
+ {
+     unsigned s = shireindex(shire);
++    m_warm_reset_held[s] = true;
+     unsigned ncount = shireindex_neighs(s);
+     unsigned hcount = shireindex_harts(s);
+ 
+@@ -92,13 +93,79 @@ void System::begin_warm_reset(unsigned shire)
+ 
+ void System::end_warm_reset(unsigned shire)
+ {
+-    // We have already reset the Minions in begin_warm_reset(), where
+-    // they were set to 'unavailable', so now we just need to ensure that
+-    // enabled Minion become running or halted.
++    unsigned s = shireindex(shire);
++    // MINION_BOOT can be programmed while reset is asserted. Resample it
++    // (and discard any stale fetch/interrupt state) at the release edge,
++    // without resetting the ESRs programmed by the host during the hold.
++    // Debug's per-hart reset release also calls this helper, without an
++    // intervening begin_warm_reset(). Do not reset unrelated harts there.
++    if (m_warm_reset_held[s]) {
++        for (unsigned h = 0; h < shireindex_harts(s); ++h) {
++            cpu[h + s * EMU_THREADS_PER_SHIRE].warm_reset();
++        }
++    }
++    m_warm_reset_held[s] = false;
+     recalculate_thread0_enable(shire);
+     recalculate_thread1_enable(shire);
+ }
+ 
++#if EMU_ERBIUM
++void System::request_erbium_reset(bool held, bool cold, bool whole)
++{
++    m_reset_pending = true;
++    m_reset_hold = held;
++    m_reset_assertion_pending |= held;
++    m_reset_cold |= cold;
++    m_reset_whole |= whole;
++    // Gate mask writes even before the deferred reset is serviced.
++    m_warm_reset_held.fill(true);
++    for (auto& hart : cpu) {
++        if (!hart.is_nonexistent() && !hart.is_unavailable()) {
++            hart.become_unavailable();
++        }
++    }
++}
++
++
++void System::process_erbium_reset()
++{
++    if (!m_reset_pending) {
++        return;
++    }
++    const bool held = m_reset_hold;
++    const bool asserted = m_reset_assertion_pending;
++    const bool cold = m_reset_cold;
++    const bool whole = m_reset_whole;
++    m_reset_pending = m_reset_assertion_pending = m_reset_cold = m_reset_whole = false;
++
++    if (whole) {
++#ifdef SYS_EMU
++        if (m_emu) {
++            // Whole-system reset reapplies the selected startup profile.
++            m_emu->por_reset();
++            return;
++        }
++#endif
++        memory.por_reset();
++    }
++    if (cold || whole) {
++        // CPU cold pulse resets ESRs, but not memory/peripherals, and does
++        // NOT reapply CLI boot PC or thread masks.
++        cold_reset();
++    }
++    for (unsigned s = 0; s < EMU_NUM_SHIRES; ++s) {
++        // A release alone must not reset ESRs programmed during an existing
++        // hold. Retain an assertion edge if hold/release arrived in one batch.
++        if (asserted || cold || whole) {
++            begin_warm_reset(s);
++        }
++        if (!held || whole) {
++            end_warm_reset(s);
++        }
++    }
++}
++#endif
++
+ void System::cold_reset_shire(unsigned shire)
+ {
+     unsigned s = shireindex(shire);
+@@ -120,6 +187,10 @@ void System::cold_reset_shire(unsigned shire)
+ 
+ void System::cold_reset(void)
+ {
++#if EMU_ERBIUM
++    // A POR supersedes any queued SoftReset write.
++    m_reset_pending = m_reset_assertion_pending = m_reset_cold = m_reset_whole = false;
++#endif
+     for (unsigned shire = 0; shire < EMU_NUM_SHIRES; ++shire) {
+         cold_reset_shire(shire);
+     }
+@@ -469,6 +540,9 @@ void System::write_fcc_credinc(unsigned index, uint64_t shire, uint64_t minion_m
+ 
+ void System::recalculate_thread0_enable(unsigned shire)
+ {
++    if (m_warm_reset_held[shire]) {
++        return;
++    }
+     uint32_t value = shire_other_esrs[shire].thread0_disable;
+ 
+     unsigned mcount = shireindex_minions(shire);
+@@ -492,6 +566,9 @@ void System::recalculate_thread0_enable(unsigned shire)
+ 
+ void System::recalculate_thread1_enable(unsigned shire)
+ {
++    if (m_warm_reset_held[shire]) {
++        return;
++    }
+     if (shireindex_is_ioshire(shire)) {
+         return;
+     }
+diff --git a/sw-sysemu/system.h b/sw-sysemu/system.h
+index d941a50..09a4fdf 100644
+--- a/sw-sysemu/system.h
++++ b/sw-sysemu/system.h
+@@ -124,6 +124,12 @@ public:
+     void begin_warm_reset(unsigned shire);
+     void end_warm_reset(unsigned shire);
+     void cold_reset(void);
++#if EMU_ERBIUM
++    // SoftReset writes may originate inside a running hart. Stop execution
++    // immediately, but defer intrusive-list/reset work to a cycle boundary.
++    void request_erbium_reset(bool held, bool cold, bool whole);
++    void process_erbium_reset();
++#endif
+ 
+     uint64_t get_csr(unsigned thread, uint16_t cnum);
+     void set_csr(unsigned thread, uint16_t cnum, uint64_t data);
+@@ -337,6 +343,14 @@ private:
+     // Simulation control
+     bool m_emu_done {false};
+     bool m_emu_fail {false};
++    std::array<bool, EMU_NUM_SHIRES> m_warm_reset_held {};
++#if EMU_ERBIUM
++    bool m_reset_pending {false};
++    bool m_reset_hold {false};
++    bool m_reset_assertion_pending {false};
++    bool m_reset_cold {false};
++    bool m_reset_whole {false};
++#endif
+ 
+     // Minionshire debug module
+     uint32_t dmctrl;
+diff --git a/sw-sysemu/tests/erbium/host/test_cpu_reset.py b/sw-sysemu/tests/erbium/host/test_cpu_reset.py
+new file mode 100644
+index 0000000..c4cd5a3
+--- /dev/null
++++ b/sw-sysemu/tests/erbium/host/test_cpu_reset.py
+@@ -0,0 +1,403 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 Ainekko, Co.
++# SPDX-License-Identifier: Apache-2.0
++"""Standalone reset/start regressions; only Python's standard library is needed.
++
++python3 test_cpu_reset.py --emu /path/to/built/erbium_emu
++
++No ELF, cross compiler, QEMU, UART, or pytest required. Small RV64 instruction
++streams are uploaded through the existing backend socket client, never through
++the MRAM backing file. The file is used only to exercise the shared-MRAM profile.
++"""
++
++import argparse
++import contextlib
++from pathlib import Path
++
++import struct
++import subprocess
++import sys
++import tempfile
++import time
++
++sys.dont_write_bytecode = True
++sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tools"))
++from erb_client import ErbClient  # noqa: E402
++
++SOFT_RESET = 0x02000028
++MAILBOX0 = 0x02000068
++MAILBOX1 = 0x02000070
++MINION_BOOT = 0x80D00018
++IPI_REDIRECT_PC = 0x80100040
++THREAD0_DISABLE = 0x80F40240
++THREAD1_DISABLE = 0x80F40010
++MTIME = 0x80F40200
++SRAM = 0x0200C000
++BOOTROM = 0x02008000
++PC_A = 0x40001000
++PC_B = 0x40002000
++DATA_A = 0x40010000
++DATA_B = 0x40011000
++SENTINEL = 0x40030000
++DEADLINE = 5
++
++
++def check(condition, message):
++    if not condition:
++        raise AssertionError(message)
++
++
++def read(client, addr, size):
++    status, data = client.read(addr, size)
++    check(status == 0, f"read 0x{addr:x}: status {status}")
++    check(len(data) == size, f"short read at 0x{addr:x}")
++    return data
++
++
++def write(client, addr, data):
++    check(client.write(addr, data) == 0, f"write 0x{addr:x} failed")
++
++
++def u32(client, addr):
++    return struct.unpack("<I", read(client, addr, 4))[0]
++
++
++def u64(client, addr):
++    return struct.unpack("<Q", read(client, addr, 8))[0]
++
++
++def w32(client, addr, value):
++    write(client, addr, struct.pack("<I", value))
++
++
++def w64(client, addr, value):
++    write(client, addr, struct.pack("<Q", value))
++
++
++def ping(client):
++    status, info = client.ping()
++    check(status == 0 and info["name"] == "erbium_emu", "PING failed")
++
++
++def until(predicate, description):
++    deadline = time.monotonic() + DEADLINE
++    while time.monotonic() < deadline:
++        if predicate():
++            return
++        time.sleep(0.005)
++    raise AssertionError(f"timeout: {description}")
++
++
++def masks(client, t0, t1):
++    w64(client, THREAD0_DISABLE, t0)
++    w64(client, THREAD1_DISABLE, t1)
++
++
++def counts(client, base):
++    return struct.unpack("<4Q", read(client, base, 32))
++
++
++def stable(client, base, description):
++    before = read(client, base, 32)
++    # Multiple round trips also force service beyond the reset-write cycle.
++    for _ in range(5):
++        ping(client)
++        time.sleep(0.01)
++        check(read(client, base, 32) == before, description)
++
++
++def incrementing(client, base, selected=(0,)):
++    before = counts(client, base)
++    until(lambda: all(counts(client, base)[h] > before[h] for h in selected),
++          f"harts {selected} executing at data 0x{base:x}")
++
++
++def sd(rs, offset, base=5):
++    return ((offset >> 5) << 25) | (rs << 20) | (base << 15) | (3 << 12) | ((offset & 31) << 7) | 0x23
++
++
++def counter_code(base, step=1, sleep=False):
++    # t0 = data + 8*mhartid. Record the reset MIE before deliberately dirtying
++    # it, then increment a separate counter for each hart. No shared atomics.
++    insns = [
++        (base & 0xFFFFF000) | (5 << 7) | 0x37,          # lui t0, data>>12
++        (0xF14 << 20) | (2 << 12) | (6 << 7) | 0x73,  # csrr t1, mhartid
++        (3 << 20) | (6 << 15) | (1 << 12) | (6 << 7) | 0x13,
++        (6 << 20) | (5 << 15) | (5 << 7) | 0x33,       # add t0,t0,t1
++        (0x304 << 20) | (2 << 12) | (28 << 7) | 0x73, # csrr t3,mie
++        sd(28, 128),                                 # sd t3,128(t0)
++        (0x304 << 20) | (8 << 15) | (5 << 12) | 0x73, # csrrwi zero,mie,8
++        (5 << 15) | (3 << 12) | (7 << 7) | 0x03,      # ld t2,0(t0)
++        (step << 20) | (7 << 15) | (7 << 7) | 0x13,   # addi t2,t2,step
++        sd(7, 0),
++    ]
++    if sleep:
++        insns += [0x10500073, 0xFFDFF06F]             # wfi; j -4
++    else:
++        insns += [0xFF5FF06F]                        # j -12 (ld/addi/sd)
++    return struct.pack("<" + "I" * len(insns), *insns)
++
++
++def self_hold_code():
++    # CPU-originated MMIO must not unlink the active-list iterator mid-loop.
++    # The final store is forbidden while held and proves execution stopped.
++    return struct.pack("<6I",
++                       0x020002B7,                   # lui t0,0x02000
++                       0x00600313,                   # li t1,6
++                       0x0262A423,                   # sw t1,0x28(t0)
++                       0x400103B7,                   # lui t2,0x40010
++                       sd(6, 0, 7),                  # sd t1,0(t2)
++                       0x0000006F)                   # j .
++
++
++@contextlib.contextmanager
++def backend(emu, held, extra=()):
++    with tempfile.TemporaryDirectory(prefix="erbium-reset-") as tmp:
++        sock = str(Path(tmp) / "api.sock")
++        log_path = Path(tmp) / "emu.log"
++        args = [str(emu), "-minions", "0x3", "-reset_pc", hex(PC_A),
++                "--api-socket", sock, "--mram-file", str(Path(tmp) / "mram.img")]
++        if held:
++            args.append("--start-held")
++        args += list(extra)
++        with log_path.open("wb") as log:
++            proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
++            client = None
++            try:
++                deadline = time.monotonic() + DEADLINE
++                while time.monotonic() < deadline:
++                    check(proc.poll() is None, "backend exited before socket connection")
++                    try:
++                        client = ErbClient(sock)
++                        client.sock.settimeout(DEADLINE)
++                        break
++                    except (FileNotFoundError, ConnectionRefusedError):
++                        time.sleep(0.01)
++                check(client is not None, "backend never accepted a connection")
++                yield client, sock
++                check(proc.poll() is None, "backend exited during test")
++            except BaseException:
++                log.flush()
++                print(log_path.read_text(errors="replace")[-12000:], file=sys.stderr)
++                raise
++            finally:
++                if client:
++                    client.close()
++                proc.terminate()
++                try:
++                    proc.wait(timeout=DEADLINE)
++                except subprocess.TimeoutExpired:
++                    proc.kill()
++                    proc.wait()
++                log.flush()
++                text = log_path.read_text(errors="replace")
++                check("FATAL" not in text and "fatal error in chip model" not in text,
++                      "backend encountered a fatal CPU/model error:\n" + text[-8000:])
++
++
++def test_held(emu):
++    with backend(emu, True) as (client, sock):
++        ping(client)
++        check(u32(client, SOFT_RESET) == 6, "startup must expose warm hold + MRAM rst_b")
++        # Bit 2 is active-low and independent: changing it must not release
++        # the warm hold or be mistaken for a CPU/whole-system reset.
++        w32(client, SOFT_RESET, 2)
++        check(u32(client, SOFT_RESET) == 2, "MRAM rst_b polarity/value lost")
++        w32(client, SOFT_RESET, 6)
++        w32(client, SOFT_RESET, 0xFFFFFFF6)
++        check(u32(client, SOFT_RESET) == 6, "reserved SoftReset bits not masked")
++        check(u64(client, MINION_BOOT) == PC_A, "CLI boot PC not initialized")
++        write(client, PC_A, counter_code(DATA_A))
++        write(client, PC_B, counter_code(DATA_B))
++        write(client, DATA_A, bytes(256))
++        write(client, DATA_B, bytes(256))
++        # Enable both threads on both instantiated minions while held.
++        for _ in range(3):
++            masks(client, 0xFF, 0xFF)
++            masks(client, 0xFC, 0xFC)
++        stable(client, DATA_A, "mask changes executed old PC under startup hold")
++        stable(client, DATA_B, "mask changes executed new PC under startup hold")
++        # The peripheral clock and API must continue while CPUs cannot execute.
++        before = u64(client, MTIME)
++        until(lambda: u64(client, MTIME) > before, "timer progress while held")
++        write(client, SENTINEL, b"persistent MRAM!")
++        write(client, SRAM, b"persistent SRAM!")
++        w32(client, MAILBOX0, 0x12345678)
++        w32(client, MAILBOX1, 0x87654321)
++        w64(client, MINION_BOOT, PC_B)
++        w64(client, IPI_REDIRECT_PC, PC_B)
++        masks(client, 0xFE, 0xFF)
++        w32(client, SOFT_RESET, 4)
++        incrementing(client, DATA_B)
++        check(u64(client, IPI_REDIRECT_PC) == PC_B, "release reset an ESR programmed while held")
++        stable(client, DATA_A, "release sampled assertion/CLI PC rather than new MINION_BOOT")
++        check(counts(client, DATA_B)[1:] == (0, 0, 0), "release ignored disabled threads")
++        check(u64(client, DATA_B + 128) == 0, "MIE not reset on first release")
++
++        # A boot-register write alone must not redirect an executing hart.
++        w64(client, MINION_BOOT, PC_A)
++        incrementing(client, DATA_B)
++        stable(client, DATA_A, "MINION_BOOT redirected CPU without a reset")
++
++        # xSPI-only reset must not change CPU state, ESRs, or system registers.
++        check(client.reset(1) == 0, "xSPI-only RESET failed")
++        check(u32(client, SOFT_RESET) == 4, "xSPI-only RESET changed SoftReset")
++        check(u64(client, MINION_BOOT) == PC_A, "xSPI-only RESET changed boot PC")
++        check(u64(client, THREAD0_DISABLE) == 0xFE, "xSPI-only RESET changed masks")
++        check(u32(client, MAILBOX1) == 0x87654321, "xSPI-only RESET cleared peripheral")
++        incrementing(client, DATA_B)
++
++        # Repeat upload/start at the SAME PC: changed code must not use a stale
++        # fetch buffer, dirty MIE must reset, and memory/peripherals must survive.
++        for step in (7, 11, 3):
++            w32(client, SOFT_RESET, 6)
++            stable(client, DATA_B, "CPU continued executing under warm hold")
++            check(read(client, SENTINEL, 16) == b"persistent MRAM!", "warm reset erased MRAM")
++            check(read(client, SRAM, 16) == b"persistent SRAM!", "warm reset erased SRAM")
++            check(u32(client, MAILBOX0) == 0x12345678, "warm reset cleared Mailbox0")
++            check(u32(client, MAILBOX1) == 0x87654321, "warm reset cleared Mailbox1")
++            check(client.reset(1) == 0, "xSPI-only RESET while held failed")
++            check(u32(client, SOFT_RESET) == 6, "xSPI-only RESET released hold")
++            masks(client, 0xFF, 0xFF)
++            write(client, PC_B, counter_code(DATA_B, step))
++            write(client, DATA_B, bytes(128) + b"\xff" * 32)
++            w64(client, MINION_BOOT, PC_B)
++            masks(client, 0xFC, 0xFC)
++            # Reasserting the level does not release or wipe host configuration.
++            w32(client, SOFT_RESET, 6)
++            stable(client, DATA_B, "enabled threads escaped warm hold")
++            check(u64(client, MINION_BOOT) == PC_B, "hold reapplied CLI boot PC")
++            w32(client, SOFT_RESET, 4)
++            incrementing(client, DATA_B, (0, 1, 2, 3))
++            values = counts(client, DATA_B)
++            check(all(v > 0 and v % step == 0 for v in values),
++                  f"reloaded instruction stream not executed: {values}, step={step}")
++            check(read(client, DATA_B + 128, 32) == bytes(32), "warm release retained dirty MIE")
++
++        # Warm reset and restart from a sleeping WFI hart, with live socket.
++        w32(client, SOFT_RESET, 6)
++        masks(client, 0xFE, 0xFF)
++        write(client, DATA_B, bytes(256))
++        write(client, PC_B, counter_code(DATA_B, sleep=True))
++        w32(client, SOFT_RESET, 4)
++        until(lambda: counts(client, DATA_B)[0] == 1, "WFI payload executed once")
++        stable(client, DATA_B, "WFI payload did not stay asleep")
++        ping(client)
++        client.close()
++        client = ErbClient(sock)
++        client.sock.settimeout(DEADLINE)
++        try:
++            ping(client)
++            w32(client, SOFT_RESET, 6)
++            stable(client, DATA_B, "sleeping CPU escaped hold")
++            write(client, PC_B, counter_code(DATA_B))
++            w32(client, SOFT_RESET, 4)
++            incrementing(client, DATA_B)
++
++            # A CPU cold pulse is NOT whole-system POR. Cold ESR defaults, no
++            # CLI boot-PC reapplication; still held if bit 1 was requested.
++            w32(client, SOFT_RESET, 0xE)
++            until(lambda: u64(client, MINION_BOOT) != PC_B, "CPU cold pulse serviced")
++            check(u32(client, SOFT_RESET) == 6, "CPU cold pulse not self-clearing/hold lost")
++            check(u64(client, MINION_BOOT) != PC_A, "CPU cold pulse reapplied CLI boot PC")
++            check(u64(client, THREAD0_DISABLE) == 0xFE, "CPU cold ESR masks not reset")
++            check(u64(client, THREAD1_DISABLE) == 0xFF, "CPU cold thread1 masks not reset")
++            check(u32(client, MAILBOX1) == 0x87654321, "CPU cold reset cleared system peripheral")
++            check(read(client, SENTINEL, 16) == b"persistent MRAM!", "CPU cold reset erased MRAM")
++            stable(client, DATA_B, "CPU cold pulse released persistent warm hold")
++
++            # Protocol kind 0 is what QEMU's RESET sends. It reapplies this
++            # explicit startup profile, even after previous releases/reloads.
++            for reset in (lambda: client.reset(0),
++                          lambda: w32(client, SOFT_RESET, 5)):
++                reset()
++                until(lambda: u64(client, MINION_BOOT) == PC_A, "whole reset serviced")
++                check(u32(client, SOFT_RESET) == 6, "POR did not restore --start-held")
++                check(u64(client, THREAD0_DISABLE) == 0xFC, "POR did not restore CLI masks")
++                check(u64(client, THREAD1_DISABLE) == 0xFC, "POR did not restore CLI thread1 masks")
++                check(u32(client, MAILBOX1) == 0, "whole reset did not reset peripheral")
++                check(read(client, SENTINEL, 16) == b"persistent MRAM!", "POR erased MRAM")
++                stable(client, DATA_A, "POR profile ran old image")
++                stable(client, DATA_B, "POR profile ran previous loaded image")
++                ping(client)
++                # Release each time so the next POR must actively reassert hold.
++                masks(client, 0xFE, 0xFF)
++                w64(client, MINION_BOOT, PC_B)
++                w32(client, SOFT_RESET, 4)
++                incrementing(client, DATA_B)
++
++            # A CPU instruction can assert persistent hold too.
++            w32(client, SOFT_RESET, 6)
++            write(client, DATA_A, bytes(256))
++            write(client, PC_A, self_hold_code())
++            w64(client, MINION_BOOT, PC_A)
++            w32(client, SOFT_RESET, 4)
++            until(lambda: u32(client, SOFT_RESET) == 6, "CPU-originated hold")
++            stable(client, DATA_A, "instruction after CPU-originated hold executed")
++            w64(client, MINION_BOOT, PC_B)
++            w32(client, SOFT_RESET, 4)
++            incrementing(client, DATA_B)
++        finally:
++            client.close()
++
++
++def test_default(emu):
++    # Existing standalone/mailbox launches remain running by default. A raw
++    # preload keeps this regression independent of an ELF or cross compiler.
++    with tempfile.TemporaryDirectory(prefix="erbium-preload-") as tmp:
++        payload = Path(tmp) / "counter.bin"
++        payload.write_bytes(counter_code(DATA_A))
++        with backend(emu, False, ("-file_load", f"{PC_A:#x},{payload}",
++                                 "-single_thread", "-minions", "0x1")) as (client, _):
++            check(u32(client, SOFT_RESET) == 4, "default launch unexpectedly held")
++            incrementing(client, DATA_A)
++            for _ in range(2):
++                check(client.reset(0) == 0, "default POR failed")
++                check(u32(client, SOFT_RESET) == 4, "default POR unexpectedly held")
++                incrementing(client, DATA_A)
++
++
++def test_cold_pulse(emu):
++    with tempfile.TemporaryDirectory(prefix="erbium-cold-") as tmp:
++        initial = Path(tmp) / "initial.bin"
++        rom = Path(tmp) / "bootrom.bin"
++        initial.write_bytes(counter_code(DATA_A))
++        rom.write_bytes(counter_code(DATA_B))
++        extra = ("-file_load", f"{PC_A:#x},{initial}",
++                 "-file_load", f"{BOOTROM:#x},{rom}",
++                 "-single_thread", "-minions", "0x1")
++        with backend(emu, False, extra) as (client, _):
++            incrementing(client, DATA_A)
++            w32(client, MAILBOX1, 0xABCD1234)
++            write(client, SENTINEL, b"persistent MRAM!")
++            w32(client, SOFT_RESET, 0xC)
++            until(lambda: u64(client, MINION_BOOT) == BOOTROM, "unheld cold pulse serviced")
++            check(u32(client, SOFT_RESET) == 4, "unheld cold pulse retained pulse/hold")
++            incrementing(client, DATA_B)
++            stable(client, DATA_A, "cold pulse used CLI PC rather than reset ESR PC")
++            check(u32(client, MAILBOX1) == 0xABCD1234, "cold pulse reset system peripheral")
++            check(read(client, SENTINEL, 16) == b"persistent MRAM!", "cold pulse erased MRAM")
++            # Whole reset is deliberately different: initial CLI PC and profile.
++            check(client.reset(0) == 0, "POR after cold pulse failed")
++            check(u64(client, MINION_BOOT) == PC_A, "whole reset did not restore CLI PC")
++            check(u32(client, MAILBOX1) == 0, "whole reset did not clear Mailbox1")
++            incrementing(client, DATA_A)
++            stable(client, DATA_B, "POR continued CPU-cold boot-ROM stream")
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--emu", required=True, type=Path, help="built erbium_emu executable")
++    args = parser.parse_args()
++    emu = args.emu.resolve()
++    check(emu.is_file(), f"emulator not found: {emu}")
++    test_held(emu)
++    print("PASS: held startup, masks, boot-PC resampling, repeat loads, warm/cold/POR, socket/WFI")
++    test_default(emu)
++    print("PASS: default running startup and repeat POR")
++    test_cold_pulse(emu)
++    print("PASS: self-clearing CPU cold pulse boots reset ESR PC, not CLI/POR profile")
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+

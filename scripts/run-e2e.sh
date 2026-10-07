@@ -45,4 +45,5 @@ if [ -z "${NO_LINUX:-}" ]; then
   fi
   echo "$out" | grep -E 'erbium-xspi spi|==|crc32|FAIL|ALL TESTS|RESULT'
   echo "$out" | grep -q 'ERBIUM-TEST-RESULT 0'
+  "$R/scripts/run-load-test.sh"
 fi

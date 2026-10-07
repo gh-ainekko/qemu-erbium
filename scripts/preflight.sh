@@ -11,7 +11,7 @@ fail() { echo "preflight: ERROR: $*" >&2; errors=$((errors + 1)); }
 file() { [ -s "$R/$1" ] || fail "Missing or empty file: $R/$1"; }
 tool() { command -v "$1" >/dev/null 2>&1 || fail "Missing command: $1 (Ubuntu package: $2)"; }
 selected() { [ "$target" = all ] || [ "$target" = "$1" ]; }
-for f in bootstrap.sh scripts/env.sh scripts/preflight.sh scripts/fetch-sources.sh scripts/build-all.sh scripts/configure-linux.sh scripts/run-e2e.sh scripts/run-linux.sh linux/erbium.config linux/initramfs.list linux/rootfs/init linux/rootfs/erbium-test.sh linux/tools/erbctl.c linux/tools/erbium-xspi.h; do file "$f"; done
+for f in bootstrap.sh scripts/env.sh scripts/preflight.sh scripts/fetch-sources.sh scripts/sync-git-patches.sh scripts/build-all.sh scripts/configure-linux.sh scripts/build-load-test.sh scripts/run-load-test.sh scripts/run-e2e.sh scripts/run-linux.sh linux/erbium.config linux/initramfs.list linux/rootfs/init linux/rootfs/erbium-test.sh linux/rootfs/erbium-load-test.sh linux/firmware/loader-smoke.S linux/firmware/loader-smoke.ld linux/tools/erbctl.c linux/tools/erbium-loader.c linux/tools/erbium-loader.h linux/tools/erbium-xspi.h; do file "$f"; done
 shopt -s nullglob
 for dir in qemu-patches sysemu-patches linux/patches; do
   patches=("$R/$dir/"*.patch)
@@ -39,7 +39,7 @@ if [ "$mode" != fetch ]; then
   if selected sysemu; then tool cmake cmake; tool ninja ninja-build; modules+=(liblz4); fi
   if selected firmware; then tool riscv64-unknown-elf-gcc gcc-riscv64-unknown-elf; fi
   if selected linux; then
-    for pair in 'aarch64-linux-gnu-gcc:gcc-aarch64-linux-gnu' 'flex:flex' 'bison:bison' 'bc:bc' 'cpio:cpio'; do tool "${pair%%:*}" "${pair#*:}"; done
+    for pair in 'aarch64-linux-gnu-gcc:gcc-aarch64-linux-gnu' 'riscv64-unknown-elf-gcc:gcc-riscv64-unknown-elf' 'riscv64-unknown-elf-ld:binutils-riscv64-unknown-elf' 'riscv64-unknown-elf-readelf:binutils-riscv64-unknown-elf' 'flex:flex' 'bison:bison' 'bc:bc' 'cpio:cpio'; do tool "${pair%%:*}" "${pair#*:}"; done
     modules+=(openssl libelf)
     if command -v aarch64-linux-gnu-gcc >/dev/null; then
       printf 'int main(void) {return 0;}\n' | aarch64-linux-gnu-gcc -static -x c -o /dev/null - 2>/dev/null || fail 'Cannot link static arm64 executable (install libc6-dev-arm64-cross and gcc-aarch64-linux-gnu)'

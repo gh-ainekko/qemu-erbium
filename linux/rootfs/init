@@ -4,7 +4,14 @@ mount -t sysfs none /sys
 mount -t debugfs none /sys/kernel/debug 2>/dev/null
 mount -t devtmpfs none /dev
 echo "erbium guest up"
-if [ -f /etc/erbium-test.sh ] && grep -q erbium.autotest /proc/cmdline; then
+if grep -q erbium.loadtest /proc/cmdline; then
+    sh /etc/erbium-load-test.sh
+    RC=$?
+    echo "ERBIUM-LOAD-TEST-RESULT $RC"
+    if grep -q erbium.poweroff /proc/cmdline; then
+        poweroff -f
+    fi
+elif [ -f /etc/erbium-test.sh ] && grep -q erbium.autotest /proc/cmdline; then
     sh /etc/erbium-test.sh
     RC=$?
     echo "ERBIUM-TEST-RESULT $RC"

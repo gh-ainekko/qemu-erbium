@@ -5,3 +5,4 @@ build/
 linux/rootfs/busybox
 dist/
 out/
+__pycache__/

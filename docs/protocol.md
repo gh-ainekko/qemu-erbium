@@ -50,3 +50,17 @@ Rules:
 * If the client disconnects the server keeps running and accepts a new connection.
 * Future (not v1): `ERB_OP_EVENT` (server->client, out-of-band completion line, see TODO), `ERB_OP_STEP`
   (deterministic co-simulation).
+
+## Host-controlled CPU boot (backend reset/start extension)
+
+No new socket opcode is needed. Use ordinary register writes to System
+SoftReset (`0x02000028` in this CPU-addressed protocol), MINION_BOOT and the
+thread-disable ESRs. `SoftReset=0x6` holds CPU warm reset with MRAM out of reset;
+`0x4` releases it using the host-programmed boot PC. Host-facing xSPI SoftReset
+is instead `0x40000028`. See `host-elf-loading.md` for the complete sequence.
+
+`--start-held` makes the backend assert CPU warm hold on startup and each
+whole-chip POR (including QEMU device reset). The listener remains usable with
+no ELF and no running harts. Kind 0 resets boot configuration/reapplies the CLI
+startup profile; kind 1 continues to leave CPU/hold/boot configuration unchanged.
+A CPU-only warm release does not reapply CLI settings or erase MRAM.

@@ -1,0 +1,231 @@
+From df19905fba7b8212de44050433a5fea9d21cf253 Mon Sep 17 00:00:00 2001
+From: "exe.dev user" <exedev@erbium-qemu.exe.xyz>
+Date: Wed, 7 Oct 2026 02:54:08 +0000
+Subject: [PATCH 7/7] erbium: defer guest debug resets until hart iteration
+ completes
+
+CPU-originated DMCTRL ndmreset and selected-hart reset used to synchronously unlink the already-advanced next hart iterator, permanently wedging socket service. Track the CPU iteration phase in the driver and defer full-shire, per-hart, and release reset work through the core reset helpers.
+
+Assert execution gating immediately without unlinking harts. Drain reset callbacks at the safe end-of-iteration boundary; host MMIO continues to apply reset synchronously outside that phase.
+
+Add the exact seven-word guest DMCTRL=3 probe with four active harts, plus HASEL-selected hartreset. Require 500ms PING responsiveness and successful host recovery to loaded counter firmware. The regression times out against the prior binary; the exact review probe, standalone suite, 15 qtests, Linux mailbox, and ELF-loader e2e pass with this fix.
+
+Co-authored-by: Shelley <shelley@exe.dev>
+---
+ sw-sysemu/processor.cpp                       |  9 ++++
+ sw-sysemu/sys_emu/sys_emu.cpp                 |  7 +++
+ sw-sysemu/system.cpp                          | 34 ++++++++++++++
+ sw-sysemu/system.h                            |  7 +++
+ sw-sysemu/tests/erbium/host/test_cpu_reset.py | 46 +++++++++++++++++++
+ 5 files changed, 103 insertions(+)
+
+diff --git a/sw-sysemu/processor.cpp b/sw-sysemu/processor.cpp
+index e320caa..6afc0f9 100644
+--- a/sw-sysemu/processor.cpp
++++ b/sw-sysemu/processor.cpp
+@@ -1806,6 +1806,15 @@ void Hart::debug_reset()
+ 
+ void Hart::warm_reset()
+ {
++    if (chip->cpu_iteration_active()) {
++        // DMCTRL.hartreset can select another hart, including the driver's
++        // already-advanced next iterator. Do not unlink it inside a CPU step.
++        chip->defer_cpu_reset([this] { warm_reset(); });
++        if (!is_nonexistent()) {
++            become_unavailable();
++        }
++        return;
++    }
+     // Become unavailable
+     if (state != State::nonexistent) {
+         state = State::unavailable;
+diff --git a/sw-sysemu/sys_emu/sys_emu.cpp b/sw-sysemu/sys_emu/sys_emu.cpp
+index 2cac8dd..ef879aa 100644
+--- a/sw-sysemu/sys_emu/sys_emu.cpp
++++ b/sw-sysemu/sys_emu/sys_emu.cpp
+@@ -650,6 +650,7 @@ int sys_emu::main_internal() {
+ 
+         chip.active.splice(chip.active.cend(), chip.awaking);
+ 
++        chip.set_cpu_iteration_active(true);
+         auto current_hart = chip.active.begin();
+         while (current_hart != chip.active.end()) {
+             auto hart = current_hart++;
+@@ -775,6 +776,12 @@ int sys_emu::main_internal() {
+             }
+         }
+ 
++        chip.set_cpu_iteration_active(false);
++        // Includes CPU-originated debug ndmreset and selected-hart reset.
++        // Their assertions gated execution immediately; only now may they
++        // reset hart state and mutate intrusive links.
++        chip.process_deferred_cpu_resets();
++
+         // Process deferred unlinks
+         for (auto it = chip.active.begin(); it != chip.active.end(); ) {
+             if (it->pending_unlink) {
+diff --git a/sw-sysemu/system.cpp b/sw-sysemu/system.cpp
+index d585cc4..c8a55ff 100644
+--- a/sw-sysemu/system.cpp
++++ b/sw-sysemu/system.cpp
+@@ -73,6 +73,18 @@ void System::begin_warm_reset(unsigned shire)
+     m_warm_reset_held[s] = true;
+     unsigned ncount = shireindex_neighs(s);
+     unsigned hcount = shireindex_harts(s);
++    if (m_cpu_iteration_active) {
++        defer_cpu_reset([this, shire] { begin_warm_reset(shire); });
++        // Block execution immediately, but keep all links intact until the
++        // driver has finished walking the current cycle's active-hart list.
++        for (unsigned h = 0; h < hcount; ++h) {
++            auto& hart = cpu[h + s * EMU_THREADS_PER_SHIRE];
++            if (!hart.is_nonexistent() && !hart.is_unavailable()) {
++                hart.become_unavailable();
++            }
++        }
++        return;
++    }
+ 
+     for (unsigned n = 0; n < ncount; ++n) {
+         unsigned neigh = n + s * EMU_NEIGH_PER_SHIRE;
+@@ -105,6 +117,10 @@ void System::end_warm_reset(unsigned shire)
+     if ((dmctrl & 3) == 3 && !shireindex_is_ioshire(s)) {
+         return;
+     }
++    if (m_cpu_iteration_active) {
++        defer_cpu_reset([this, shire] { end_warm_reset(shire); });
++        return;
++    }
+     // MINION_BOOT can be programmed while reset is asserted. Resample it
+     // (and discard any stale fetch/interrupt state) at the release edge,
+     // without resetting the ESRs programmed by the host during the hold.
+@@ -129,6 +145,22 @@ bool System::cpu_reset_held(unsigned shire) const
+     return held;
+ }
+ 
++void System::defer_cpu_reset(std::function<void()> reset)
++{
++    m_deferred_cpu_resets.push_back(std::move(reset));
++}
++
++
++void System::process_deferred_cpu_resets()
++{
++    assert(!m_cpu_iteration_active);
++    std::vector<std::function<void()>> resets;
++    resets.swap(m_deferred_cpu_resets);
++    for (auto& reset : resets) {
++        reset();
++    }
++}
++
+ #if EMU_ERBIUM
+ void System::set_erbium_startup_hold(bool held)
+ {
+@@ -216,6 +248,8 @@ void System::cold_reset_shire(unsigned shire)
+ 
+ void System::cold_reset(void)
+ {
++    // Whole-system/CPU cold reset supersedes older queued debug reset work.
++    m_deferred_cpu_resets.clear();
+ #if EMU_ERBIUM
+     // A POR supersedes any queued SoftReset write.
+     m_reset_pending = m_reset_assertion_pending = m_reset_cold = m_reset_whole = false;
+diff --git a/sw-sysemu/system.h b/sw-sysemu/system.h
+index 4dfedc1..bbba827 100644
+--- a/sw-sysemu/system.h
++++ b/sw-sysemu/system.h
+@@ -125,6 +125,11 @@ public:
+     void end_warm_reset(unsigned shire);
+     void cold_reset(void);
+     bool cpu_reset_held(unsigned shire) const;
++    // Intrusive-list reset work must not run under the driver's hart iterator.
++    bool cpu_iteration_active() const { return m_cpu_iteration_active; }
++    void set_cpu_iteration_active(bool active) { m_cpu_iteration_active = active; }
++    void defer_cpu_reset(std::function<void()> reset);
++    void process_deferred_cpu_resets();
+ #if EMU_ERBIUM
+     // SoftReset writes may originate inside a running hart. Stop execution
+     // immediately, but defer intrusive-list/reset work to a cycle boundary.
+@@ -346,6 +351,8 @@ private:
+     bool m_emu_done {false};
+     bool m_emu_fail {false};
+     std::array<bool, EMU_NUM_SHIRES> m_warm_reset_held {};
++    bool m_cpu_iteration_active {false};
++    std::vector<std::function<void()>> m_deferred_cpu_resets;
+ #if EMU_ERBIUM
+     // The physical SoftReset hold is independent of debug reset requests.
+     bool m_cpu_warm_reset_pin {false};
+diff --git a/sw-sysemu/tests/erbium/host/test_cpu_reset.py b/sw-sysemu/tests/erbium/host/test_cpu_reset.py
+index 56c3b41..286ee37 100644
+--- a/sw-sysemu/tests/erbium/host/test_cpu_reset.py
++++ b/sw-sysemu/tests/erbium/host/test_cpu_reset.py
+@@ -186,6 +186,19 @@ def self_hold_code():
+                        0x0000006F)                   # j .
+ 
+ 
++def guest_debug_reset_code(value):
++    # Exact address materialization from erbium-guest-debug-review.py.
++    # DMCTRL is above 2 GiB: zero-extend the sign-extended LUI/ADDI result.
++    insns = [0x80B602B7, 0xF8828293, 0x02029293, 0x0202D293]
++    if value == 3:
++        insns.append(0x00300313)  # li t1,3 (the reviewer's exact seven-word probe)
++    else:
++        insns += [((value + 0x800) & 0xFFFFF000) | (6 << 7) | 0x37,
++                  ((value & 0xFFF) << 20) | (6 << 15) | (6 << 7) | 0x13]
++    insns += [sd(6, 0), 0x0000006F]  # sd t1,0(t0); j .
++    return struct.pack("<" + "I" * len(insns), *insns)
++
++
+ @contextlib.contextmanager
+ def backend(emu, held, extra=()):
+     with tempfile.TemporaryDirectory(prefix="erbium-reset-") as tmp:
+@@ -542,6 +555,37 @@ def test_debug_cannot_release_hold(emu):
+         incrementing(client, DATA_B, (0, 1, 2, 3))
+ 
+ 
++def test_guest_debug_reset_liveness(emu):
++    # These requests execute *inside* a CPU instruction while four harts are
++    # active, not through safe host MMIO. Both reset paths formerly unlinked
++    # the already-advanced next hart iterator and wedged the backend forever.
++    for value in (3, 0x24000001):  # ndmreset; HASEL-selected hartreset (all four)
++        with backend(emu, True) as (client, _):
++            write(client, PC_A, guest_debug_reset_code(value))
++            write(client, PC_B, counter_code(DATA_B))
++            w64(client, HACTRL, 0xF)
++            masks(client, 0xFC, 0xFC)
++            w32(client, SOFT_RESET, 4)
++            client.sock.settimeout(0.5)
++            time.sleep(0.05)  # counterpart of the reviewer's exact probe
++            for _ in range(3):
++                ping(client)  # MUST respond within the bounded socket timeout
++            check(u64(client, DMCTRL) == value, "guest debug reset did not execute")
++            check(u32(client, SOFT_RESET) == 4, "debug reset altered the physical reset pin")
++            stable(client, DATA_B, "guest debug reset unexpectedly ran recovery firmware")
++            check(u64(client, HASTATUS0) & 0xFFFFFFFF == 0, "guest reset left active harts")
++
++            # A wedged backend cannot perform this recovery. Assert a physical
++            # hold, release the debug source, redirect boot, then start all harts.
++            w32(client, SOFT_RESET, 6)
++            w64(client, DMCTRL, 1)
++            w64(client, MINION_BOOT, PC_B)
++            masks(client, 0xFC, 0xFC)
++            w32(client, SOFT_RESET, 4)
++            incrementing(client, DATA_B, (0, 1, 2, 3))
++            ping(client)
++
++
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--emu", required=True, type=Path, help="built erbium_emu executable")
+@@ -558,6 +602,8 @@ def main():
+     print("PASS: pipelined warm/cold/whole reset writes complete before ACK and later programming")
+     test_debug_cannot_release_hold(emu)
+     print("PASS: physical warm hold overrides debug reset/release/resume and program-buffer paths")
++    test_guest_debug_reset_liveness(emu)
++    print("PASS: four-hart CPU-originated ndmreset/hartreset keep PING responsive and permit recovery")
+ 
+ 
+ if __name__ == "__main__":
+-- 
+2.43.0
+

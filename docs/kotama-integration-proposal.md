@@ -1,7 +1,10 @@
 # Proposal: host-loaded Kotama, xSPI boot control, separate UART console
 
-Status: **proposal**, with a built/booted standalone baseline; host-loaded Kotama
-and the proposed new commands/options below are **not implemented**.
+Implementation update (2026-10-07): CPU hold/start and `erbctl` ELF loading /
+verification are now implemented and tested, including a host-loaded Kotama boot.
+See [host ELF loading](host-elf-loading.md). UART transport/console changes remain
+future work. The text below preserves the original proposal and study results;
+its proposed `erbctl console` and `--uart-socket` options are not implemented.
 Study date: 2026-10-06.
 
 ## Recommendation

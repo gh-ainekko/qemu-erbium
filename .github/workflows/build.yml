@@ -32,6 +32,11 @@ jobs:
             gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf \
             gcc-aarch64-linux-gnu libssl-dev libelf-dev bc cpio kmod dwarves device-tree-compiler
 
+      - name: Offline ELF loader and source-update tests
+        run: |
+          python3 -m unittest discover -s tests -p 'test_erbctl_loader.py'
+          python3 -m unittest discover -s tests -p 'test_fetch_sources.py'
+
       - name: ccache
         uses: actions/cache@v4
         with:
@@ -53,6 +58,9 @@ jobs:
 
       - name: Build erbium_emu (sw-sysemu backend)
         run: scripts/build-all.sh sysemu
+
+      - name: CPU reset and host-start regression tests
+        run: python3 et-platform/sw-sysemu/tests/erbium/host/test_cpu_reset.py --emu build/sw-sysemu/erbium_emu
 
       - name: Build minion firmware
         run: scripts/build-all.sh firmware

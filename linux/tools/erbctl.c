@@ -10,6 +10,8 @@
  *   erbctl sfdp [<off> <len>]           SFDP dump
  *   erbctl rates <cmd> <addr> <data>    52h Set Rate (0=S1 2=S4 3=D4 6=S8 7=D8)
  *   erbctl reset                        99h chip reset
+ *   erbctl hold                       CPU warm-reset hold (preserves MRAM)
+ *   erbctl load ELF [--verify] [--start | --check] [--mtd /dev/mtd0]
  *   erbctl job <word> [timeout_ms]      write Mailbox0, wait for Mailbox1 != 0
  */
 #include <errno.h>
@@ -19,9 +21,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 #include <time.h>
 #include <unistd.h>
 #include "erbium-xspi.h"
+#include "erbium-loader.h"
 
 static int fd;
 
@@ -95,16 +99,21 @@ int main(int argc, char **argv)
 		i = 3;
 	}
 	if (i >= argc) {
-		fprintf(stderr, "usage: erbctl [-d dev] info|reg|mem|memw|mem32|sfdp|rates|reset|job ...\n");
+		fprintf(stderr, "usage: erbctl [-d dev] info|reg|mem|memw|mem32|sfdp|rates|reset|job|hold|load ...\n");
 		return 2;
 	}
-	fd = open(dev, O_RDWR);
-	if (fd < 0)
-		die(dev);
-
 	const char *cmd = argv[i++];
 	int rem = argc - i;
 	char **a = argv + i;
+	if (!strcmp(cmd, "load"))
+		return erbctl_load(dev, rem, a);
+	if (!strcmp(cmd, "hold") && rem == 0)
+		return erbctl_hold(dev);
+	fd = open(dev, O_RDWR);
+	if (fd < 0)
+		die(dev);
+	if (flock(fd, LOCK_EX | LOCK_NB))
+		die("device busy (another cooperating erbctl process?)");
 
 	if (!strcmp(cmd, "info")) {
 		struct erbium_info in;
@@ -161,7 +170,7 @@ int main(int argc, char **argv)
 			die("SFDP_READ");
 		hexdump(x.offset, buf, x.len);
 	} else if (!strcmp(cmd, "rates") && rem >= 3) {
-		struct erbium_rates r = { num(a[0]), num(a[1]), num(a[2]) };
+		struct erbium_rates r = { .cmd = num(a[0]), .addr = num(a[1]), .data = num(a[2]) };
 
 		if (ioctl(fd, ERBIUM_IOC_SET_RATES, &r))
 			die("SET_RATES");

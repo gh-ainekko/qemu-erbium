@@ -20,6 +20,9 @@ docker create --name "$NAME-build" --cpus "$J" -e J="$J" \
     set -euo pipefail
     ./bootstrap.sh
     python3 tests/test_preflight.py
+    python3 -m unittest discover -s tests -p "test_erbctl_loader.py"
+    python3 -m unittest discover -s tests -p "test_fetch_sources.py"
+    python3 et-platform/sw-sysemu/tests/erbium/host/test_cpu_reset.py --emu build/sw-sysemu/erbium_emu
     python3 tests/test_linux_config.py
     scripts/package-dist.sh pristine
   ' >/dev/null

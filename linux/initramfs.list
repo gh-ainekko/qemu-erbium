@@ -35,3 +35,6 @@ slink /sbin/reboot /bin/busybox 0777 0 0
 file /init @R@/linux/rootfs/init 0755 0 0
 file /etc/erbium-test.sh @R@/linux/rootfs/erbium-test.sh 0755 0 0
 file /bin/erbctl @R@/build/erbctl 0755 0 0
+dir /firmware 0755 0 0
+file /firmware/loader-smoke.elf @R@/build/loader-smoke.elf 0644 0 0
+file /etc/erbium-load-test.sh @R@/linux/rootfs/erbium-load-test.sh 0755 0 0

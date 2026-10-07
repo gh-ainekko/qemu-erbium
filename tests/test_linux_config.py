@@ -1,5 +1,6 @@
 """Exercise real Kconfig in an isolated checkout (no kernel Image compilation)."""
 from pathlib import Path
+import os
 import shutil
 import subprocess
 import tempfile
@@ -22,20 +23,23 @@ class LinuxConfigTests(unittest.TestCase):
             for name in ('erbium.config', 'initramfs.list'):
                 shutil.copy(ROOT / 'linux' / name, root / 'linux')
 
-            def configure():
+            def configure(payload=""):
+                env = dict(os.environ, ERBIUM_ELF=str(payload))
                 result = subprocess.run(['bash', str(root / 'scripts/configure-linux.sh')],
-                                        cwd='/', text=True, capture_output=True)
+                                        cwd='/', env=env, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 for name in ('erbium.config', 'initramfs.list', 'linux/.config',
                              'linux/include/config/auto.conf'):
                     text = (root / 'build' / name).read_text()
                     self.assertNotIn('@R@', text)
                     self.assertIn(str(root), text)
+                self.assertIn("CONFIG_FILE_LOCKING=y", (root / "build/linux/.config").read_text())
 
             configure()
             config = root / 'build/linux/.config'
             # Reproduce the bad input, including Kconfig's generated cache.
-            config.write_text(config.read_text().replace(str(root), '@R@'))
+            config.write_text(config.read_text().replace(str(root), '@R@').replace(
+                "CONFIG_FILE_LOCKING=y", "# CONFIG_FILE_LOCKING is not set"))
             result = subprocess.run(['make', '-s', '-C', str(KERNEL),
                                      f'O={root}/build/linux', 'ARCH=arm64',
                                      'CROSS_COMPILE=aarch64-linux-gnu-', 'syncconfig'],
@@ -43,6 +47,15 @@ class LinuxConfigTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('@R@', (root / 'build/linux/include/config/auto.conf').read_text())
             configure()
+            payload = root / 'user image.elf'
+            payload.write_bytes(b'optional payload')
+            configure(payload)
+            self.assertEqual((root / 'build/host-payload.elf').read_bytes(), payload.read_bytes())
+            manifest = (root / 'build/initramfs.list').read_text()
+            self.assertIn('/firmware/host-payload.elf', manifest)
+            self.assertNotIn('user image.elf', manifest)
+            configure()
+            self.assertNotIn('/firmware/host-payload.elf', (root / 'build/initramfs.list').read_text())
 
 
 if __name__ == '__main__':

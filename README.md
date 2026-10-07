@@ -22,7 +22,8 @@ UNIX socket that models the xSPI IP's AXI port into the NoC (`docs/protocol.md`)
 | `docs/qemu-ospi-notes.md` | how the Versal OSPI model frames transactions; build notes |
 | `docs/sysemu-notes.md` | building/running `erbium_emu`, test ELFs, socket backend |
 | `docs/protocol.md` | QEMU <-> erbium_emu socket protocol v1 |
-| `docs/kotama-integration-proposal.md` | proposed host ELF loading, CPU warm-reset boot, and separate UART console; standalone Kotama baseline verified |
+| `docs/kotama-integration-proposal.md` | original Kotama integration proposal; UART transport remains future work |
+| `docs/host-elf-loading.md` | implemented ELF upload/readback verification and CPU hold/start; usage and tests |
 | `docs/erbium-qemu-TODO.md` | open questions |
 | `docs/sfdp-rtl.hex`, `tools/gen_sfdp_from_trm.py` | SFDP image from RTL / generator from TRM |
 | `scripts/run-e2e.sh` | start erbium_emu with the mailbox worker and run the qtests end-to-end |
@@ -54,6 +55,13 @@ tar xzf erbium-emu-dist-*.tar.gz && cd dist
 scripts/run-e2e.sh          # 15 qtests + Linux guest test against erbium_emu (~30 s)
 scripts/run-linux.sh        # interactive guest shell; try: erbctl info, cat /proc/mtd, erbctl job 0x01000040
 ```
+
+**Host-load an ELF:** `scripts/run-load-test.sh` boots Linux against an empty,
+held backend and tests upload/verify/start/reload through xSPI (no emulator ELF
+preload). To use your own ELF, rebuild with
+`ERBIUM_ELF=/path/image.elf J=2 scripts/build-all.sh linux`, start the backend with
+`--start-held`, and run `erbctl load /firmware/host-payload.elf --verify --start`
+inside Linux. See `docs/host-elf-loading.md` for the complete sequence and limits.
 
 **Pieces** (all driven by `scripts/`):
 

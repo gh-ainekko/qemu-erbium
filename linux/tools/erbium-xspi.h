@@ -10,8 +10,7 @@
 #ifndef _UAPI_LINUX_ERBIUM_XSPI_H
 #define _UAPI_LINUX_ERBIUM_XSPI_H
 
-#include <stdint.h>
-typedef uint8_t __u8; typedef uint32_t __u32; typedef uint64_t __u64;
+#include <linux/types.h>
 #include <sys/ioctl.h>
 
 /* xSPI address map (Erbium xSPI slave, see TRM "xSPI address translation") */
