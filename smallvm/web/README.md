@@ -5,6 +5,43 @@ or a browser-side Erbium emulator**. Its GP interpreter and GUI run in WASM in
 the browser. Its original MicroBlocks compiler produces bytecode for the
 SmallVM firmware running in the backend's real `erbium_emu` process.
 
+## Live service and use
+
+Open `https://erbium-qemu.exe.xyz/`. Click **Load example**, accept replacing
+the current project, then **Connect** and the yellow **Start** triangle.
+Choose **Variables** and click **answer**: it reports **41** from the board.
+Use the project menu's **Save** to download a `.ubp` file to your computer;
+open/import your own project with that menu or drag the file into the editor.
+Disconnect or close the tab before connecting from a second tab.
+
+After building the emulator, firmware and browser assets:
+
+```sh
+scripts/setup-smallvm-web.sh
+# Explicitly migrate an existing native/noVNC installation:
+scripts/setup-smallvm-web.sh --replace-desktop
+systemctl status smallvm-web.service
+curl http://localhost:8000/api/status
+sudo journalctl -u smallvm-web.service -n 50
+```
+
+The enabled `smallvm-web.service` runs only Python/aiohttp and sysemu, not
+Xvfb, a native GP process, VNC or websockify. It listens on loopback port 8000
+behind the **private authenticated exe.dev proxy**. Keep that proxy private:
+origin checks are not authentication. Local shell users are trusted.
+Static navigation from other sites is allowed; cross-origin UART/API control
+is rejected. The unit restricts filesystem writes to its state directory.
+Rotating diagnostic/UART logs live in `/var/lib/smallvm-web/current/` and are
+not served as web assets. Fatal backend I/O errors stop/reap the emulator and
+exit unsuccessfully so systemd can restart the service.
+
+**Reset board** restarts the firmware and reconnects the current editor;
+ordinary Disconnect leaves the emulator running. Neither operation saves a
+project durably on the board. To stop the service:
+`sudo systemctl disable --now smallvm-web.service`.
+The old `smallvm-ide.service` is stopped and disabled on this VM; its optional
+implementation and saved files have not been deleted.
+
 ## Build and provenance
 
 From the repository root, on Ubuntu 24.04:

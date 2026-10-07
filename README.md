@@ -103,6 +103,17 @@ qemu-system-aarch64 -M xlnx-versal-virt,ospi-flash=erbium-xspi \
   the in-guest end-to-end test including a minion mailbox job. See `linux/README.md`.
 * HyperBus profile: not implemented (logged as unimplemented).
 
+## MicroBlocks / SmallVM IDE (opt-in)
+
+`smallvm/README.md` documents the LP64 C port, bare-metal Erbium firmware, and
+the real browser MicroBlocks IDE connected to sysemu through a private
+WebSocket-to-UART bridge (no VNC or remote desktop).
+After building the emulator, firmware and pinned browser assets,
+`scripts/setup-smallvm-web.sh`
+installs/enables the dedicated service on port 8000.
+`scripts/test-smallvm-web.sh` exercises the browser/compiler/firmware path
+using an isolated emulator. Device-side program storage remains volatile.
+
 ## Pristine-container validation
 
 With Docker installed, run `J=2 scripts/test-pristine-docker.sh`. It tests **HEAD**

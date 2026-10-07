@@ -1,5 +1,11 @@
 # Native MicroBlocks IDE on the VM
 
+**Historical alternative, not the deployed service.** The live port 8000 now
+hosts the actual browser IDE described in `../web/README.md`;
+`smallvm-ide.service` is stopped and disabled. The following instructions
+describe the optional native experiment and its regression tools. Do not run
+both services on port 8000.
+
 This is the **real pinned Linux GP MicroBlocks executable**, not the web IDE.
 noVNC remotely displays its SDL window. Serial communication happens entirely
 on the VM, so browser WebSerial is neither required nor used.

@@ -30,7 +30,9 @@ for name in ('smallvm.elf','smallvm-selftest.elf'):
 paths = {}
 tracked = subprocess.check_output(['git','-C',str(root),'ls-files','smallvm'],text=True).splitlines()
 for name in tracked: paths['repo/'+name] = root/name
-for name in ('fetch-smallvm.sh','build-smallvm.sh','test-smallvm.sh','package-smallvm-review.sh'):
+for name in ('fetch-smallvm.sh','sync-git-patches.sh','build-smallvm.sh','test-smallvm.sh','package-smallvm-review.sh',
+             'setup-smallvm-ide.sh','test-smallvm-ide.sh',
+             'fetch-smallvm-web.sh','setup-smallvm-web.sh','test-smallvm-web.sh'):
     paths['repo/scripts/'+name] = root/'scripts'/name
 for p in (src/'vm').rglob('*'):
     if p.is_file(): paths['sources/smallvm/'+str(p.relative_to(src))] = p
